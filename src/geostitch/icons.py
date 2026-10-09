@@ -149,6 +149,45 @@ def _draw_eye_off(p: QPainter) -> None:
     p.drawLine(QPointF(8, 40), QPointF(40, 8))
 
 
+def _small_eye(p: QPainter, off: bool) -> None:
+    """Eye in the top-left corner; the caller draws a badge in the bottom-right."""
+    p.save()
+    p.scale(0.8, 0.8)
+    if off:
+        _draw_eye_off(p)
+    else:
+        _draw_eye(p)
+    p.restore()
+
+
+def _badge_pen(off: bool) -> QPen:
+    return QPen(QColor("#6f7c78") if off else _COLOR, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+
+
+def _draw_eye_canvas(p: QPainter, off: bool = False) -> None:
+    _small_eye(p, off)
+    p.setPen(_badge_pen(off))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRect(QRectF(26, 30, 17, 13))
+
+
+def _draw_eye_canvas_off(p: QPainter) -> None:
+    _draw_eye_canvas(p, True)
+
+
+def _draw_eye_map(p: QPainter, off: bool = False) -> None:
+    _small_eye(p, off)
+    p.setPen(_badge_pen(off))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QPointF(35, 37), 8, 8)
+    p.drawLine(QPointF(27, 37), QPointF(43, 37))
+    p.drawEllipse(QPointF(35, 37), 3.5, 8)
+
+
+def _draw_eye_map_off(p: QPainter) -> None:
+    _draw_eye_map(p, True)
+
+
 def _draw_alignment(p: QPainter) -> None:
     dashed = QPen(_COLOR, 3, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap)
     p.setPen(dashed)
@@ -190,6 +229,10 @@ _GLYPHS = {
     "lasso": _draw_lasso,
     "eye": _draw_eye,
     "eye_off": _draw_eye_off,
+    "eye_canvas": _draw_eye_canvas,
+    "eye_canvas_off": _draw_eye_canvas_off,
+    "eye_map": _draw_eye_map,
+    "eye_map_off": _draw_eye_map_off,
     "alignment": _draw_alignment,
     "aligned": _draw_aligned,
     "georeference": _draw_georeference,
@@ -203,6 +246,31 @@ def app_icon() -> QIcon:
     path = next((item for item in sorted(assets.glob("app_icon.*")) if item.suffix.lower() in {".png", ".ico", ".jpg", ".jpeg"}), None)
     return QIcon(str(path)) if path else QIcon()
 
+
+KIND_COLORS = {
+    "image": "#4aa3ff",
+    "point": "#4cd37b",
+    "link": "#c78bff",
+    "geojson": "#f2b84b",
+}
+_KIND_ICONS: dict[str, QIcon] = {}
+
+
+def kind_icon(kind: str) -> QIcon:
+    """Narrow vertical bar in the item type's colour, for the start of a row."""
+    if kind not in _KIND_ICONS:
+        pixmap = QPixmap(8, 16)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.fillRect(2, 0, 4, 16, QColor(KIND_COLORS[kind]))
+        painter.end()
+        _KIND_ICONS[kind] = QIcon(pixmap)
+    return _KIND_ICONS[kind]
+
+
+def kind_bar_html(kind: str) -> str:
+    """Rich-text equivalent of `kind_icon` for labels."""
+    return f'<span style="color:{KIND_COLORS[kind]};">&#9612;</span>'
 
 def make_icon(name: str) -> QIcon:
     """Return a monochrome vector-style icon; `redo` is the mirrored `undo`."""

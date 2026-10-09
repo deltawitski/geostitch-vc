@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import contextmanager
+from html import escape
 from math import atan2, ceil, cos, degrees, hypot, isfinite, radians, sin, sqrt
 from pathlib import Path
 
@@ -49,14 +50,15 @@ from PySide6.QtWidgets import (
 
 from geostitch.canvas import ImageCanvas
 from geostitch.export import FORMATS as EXPORT_FORMATS, export_project_images
-from geostitch.icons import app_icon, make_icon
+from geostitch.icons import app_icon, kind_bar_html, kind_icon, make_icon
 from geostitch.default_layout import DEFAULT_DOCK_STATE, DEFAULT_GEOMETRY
-from geostitch.layers import IMAGE_KIND, POINT_KIND, LayerItem, LayerTree
+from geostitch.layers import IMAGE_KIND, POINT_KIND, VECTOR_KIND, LayerItem, LayerTree
 from geostitch.image_view import ImageViewer
 from geostitch.masking import masked_pixmap
-from geostitch.models import GroundControlPoint, PointConstraint, Project
+from geostitch.models import GroundControlPoint, PointConstraint, Project, VectorLayer
 from geostitch.project_io import load_project, save_project
 from geostitch.status_bar import ScrollingStatusBar
+from geostitch.vector_loader import VectorLoader
 
 
 class ShortcutSettingsDialog(QDialog):
@@ -174,6 +176,7 @@ class MainWindow(QMainWindow):
         "select_all": ("Select all", "Ctrl+A"),
         "deselect_all": ("Deselect all", "Ctrl+D"),
         "import_images": ("Import images", "Ctrl+I"),
+        "import_geojson": ("Import GeoJSON layers", ""),
         "export_images": ("Export georeferenced images", "Ctrl+E"),
         "fit_images": ("Fit current view", "Ctrl+Shift+F"),
         "arrange_images": ("Arrange images", "Ctrl+Shift+A"),
@@ -215,6 +218,15 @@ class MainWindow(QMainWindow):
         self._masked_pixmaps: dict[str, tuple[tuple, QPixmap, QPixmap]] = {}
         self.current_image_id: str | None = None
         self._layers_signature: list | None = None
+        self._vector_cache: dict[tuple, object] = {}
+        self._vector_progress: dict[tuple, tuple[int, int]] = {}
+        self._vector_failed: set[tuple] = set()
+        self._vector_progress_visible = False
+        self._fit_vector_ids: set[str] = set()
+        self._vector_loader = VectorLoader(self)
+        self._vector_loader.progress.connect(self._on_vector_progress)
+        self._vector_loader.loaded.connect(self._on_vector_loaded)
+        self._vector_loader.failed.connect(self._on_vector_failed)
         self.pending_point_id: str | None = None
         self.add_points_mode = False
         self.link_points_mode = False
@@ -252,6 +264,7 @@ class MainWindow(QMainWindow):
             ("select_all", "Select all", self.select_all),
             ("deselect_all", "Deselect all", self.deselect_all),
             ("import_images", "Import images", self.import_images),
+            ("import_geojson", "Import GeoJSON layers", self.import_geojson),
             ("export_images", "Export georeferenced images", self.export_georeferenced_images),
         ):
             self._register_shortcut_action(key, label, callback)
@@ -321,7 +334,7 @@ class MainWindow(QMainWindow):
         self.canvas.point_observation_interaction_finished.connect(lambda *_args: self._refresh_image_view())
         self.canvas.point_observation_interaction_finished.connect(lambda *_args: self._refresh_map_points())
         self.canvas.point_marker_missed.connect(self._on_constraint_point_missed)
-        self.canvas.files_dropped.connect(self._import_image_paths)
+        self.canvas.files_dropped.connect(self._import_dropped_paths)
         self.canvas.image_selected.connect(self._on_canvas_image_selected)
         self.canvas.image_toggled.connect(self._on_canvas_image_toggled)
         self.canvas.area_selected.connect(self._on_canvas_area_selected)
@@ -365,6 +378,12 @@ class MainWindow(QMainWindow):
         )
         self.map_points_checkbox.toggled.connect(lambda _checked: self._refresh_map_points())
         map_toolbar.addWidget(self.map_points_checkbox)
+        self.map_dark_checkbox = QCheckBox("Dark map")
+        self.map_dark_checkbox.setToolTip("Show the OpenStreetMap tiles in a dark colour scheme")
+        self.map_dark_checkbox.setChecked(self._settings.value("map/dark", False, type=bool))
+        self.world_map.set_dark_mode(self.map_dark_checkbox.isChecked())
+        self.map_dark_checkbox.toggled.connect(self._on_map_dark_toggled)
+        map_toolbar.addWidget(self.map_dark_checkbox)
         map_toolbar.addStretch(1)
         self.map_crs_combo = QComboBox()
         self.map_crs_combo.setEditable(True)
@@ -403,6 +422,10 @@ class MainWindow(QMainWindow):
         ):
             signal.connect(lambda *_args: self._update_hints())
         self.statusBar().showMessage("Import images to begin a project.")
+
+    def _on_map_dark_toggled(self, enabled: bool) -> None:
+        self._settings.setValue("map/dark", enabled)
+        self.world_map.set_dark_mode(enabled)
 
     def _build_details_panel(self) -> QWidget:
         self.details_stack = QStackedWidget()
@@ -569,6 +592,7 @@ class MainWindow(QMainWindow):
             file_menu.addAction(self.shortcut_actions[key])
         file_menu.addSeparator()
         file_menu.addAction(self.shortcut_actions["import_images"])
+        file_menu.addAction(self.shortcut_actions["import_geojson"])
         file_menu.addAction(self.shortcut_actions["export_images"])
         file_menu.addAction(self.shortcut_actions["remove_image"])
         file_menu.addSeparator()
@@ -684,6 +708,7 @@ class MainWindow(QMainWindow):
         point = self._selected_point()
         constraint = self._selected_constraint()
         has_image_selection = bool(self._selected_image_ids())
+        has_vector_selection = bool(self._selected_vector_ids())
         has_geographic_points = any(
             item.geographic_x is not None and item.geographic_y is not None and item.observations
             for item in project.control_points
@@ -698,11 +723,14 @@ class MainWindow(QMainWindow):
             "toggle_alignment": any(item.has_alignment for item in project.images),
             "create_constraint": point is not None and linkable,
             "remove_constraint": bool(self._selected_constraint_ids()),
-            "delete_point": bool(self._selected_constraint_ids()) or bool(self._selected_point_ids()) or has_image_selection,
+            "delete_point": (
+                bool(self._selected_constraint_ids()) or bool(self._selected_point_ids())
+                or has_image_selection or has_vector_selection
+            ),
             "toggle_lock": bool(self._selected_point_ids()),
             "pick_gcp": point is not None,
             "update_point": point is not None,
-            "remove_image": has_image_selection,
+            "remove_image": has_image_selection or has_vector_selection,
             "arrange_images": has_images,
             "fit_images": has_images,
             "export_images": any(item.world_x is not None and item.world_y is not None for item in project.images),
@@ -1013,10 +1041,16 @@ class MainWindow(QMainWindow):
         except Exception as error:
             self.statusBar().showMessage(f"Cannot display world map for CRS '{self.project.crs}': {error}")
             self.world_map.set_world_images([])
+            self.world_map.set_world_vectors([])
             self.world_map.set_selected_coordinate(None, None)
             return
 
+        self._refresh_world_vectors()
+
+        stack_order = {item_id: index for index, item_id in enumerate(self.project.stacked_layer_ids())}
         for image in self.project.images:
+            if not image.map_visible:
+                continue
             pixmap, _error = self._display_pixmap_for_image(image)
             corners = None
             if pixmap and not pixmap.isNull() and image.world_x is not None and image.world_y is not None:
@@ -1038,6 +1072,7 @@ class MainWindow(QMainWindow):
                 "id": image.id,
                 "pixmap": pixmap,
                 "mercator_corners": corners,
+                "order": stack_order[image.id],
             })
         self.world_map.set_world_images(world_images, fit=fit)
         point = self._selected_point()
@@ -1048,6 +1083,66 @@ class MainWindow(QMainWindow):
             self.world_map.set_selected_coordinate(None, None)
         self.world_map_dock.setWindowTitle(f"World Map · {self.project.crs}")
         self._refresh_map_points()
+
+    def _vector_key(self, layer: VectorLayer) -> tuple:
+        try:
+            modified = Path(layer.path).stat().st_mtime_ns
+        except OSError:
+            modified = 0
+        return (layer.path, modified, self.project.crs)
+
+    def _refresh_world_vectors(self) -> None:
+        """Show cached layers now and load missing ones on worker threads."""
+        shown = []
+        wanted = set()
+        stack_order = {item_id: index for index, item_id in enumerate(self.project.stacked_layer_ids())}
+        for layer in self.project.vector_layers:
+            key = self._vector_key(layer)
+            wanted.add(key)
+            if key not in self._vector_cache and key not in self._vector_failed and not self._vector_loader.is_pending(key):
+                self._vector_progress[key] = (0, 1)
+                self._vector_loader.request(key, layer.path, self.project.crs)
+            if layer.visible and key in self._vector_cache:
+                shown.append({"id": layer.id, "data": self._vector_cache[key], "order": stack_order[layer.id]})
+        for key in [key for key in self._vector_cache if key not in wanted]:
+            del self._vector_cache[key]
+        self.world_map.set_world_vectors(shown)
+        self._update_vector_progress()
+
+    def _update_vector_progress(self) -> None:
+        bar = self.statusBar()
+        if not self._vector_progress:
+            if self._vector_progress_visible:
+                bar.end_progress()
+                self._vector_progress_visible = False
+            return
+        done = sum(item[0] for item in self._vector_progress.values())
+        total = sum(item[1] for item in self._vector_progress.values())
+        if not self._vector_progress_visible:
+            bar.showMessage("Loading GeoJSON layers for the world map…")
+            bar.begin_progress(1000)
+            self._vector_progress_visible = True
+        bar.set_progress(int(1000 * done / max(1, total)), 1000)
+
+    def _on_vector_progress(self, key: tuple, done: int, total: int) -> None:
+        if key in self._vector_progress:
+            self._vector_progress[key] = (done, max(1, total))
+            self._update_vector_progress()
+
+    def _on_vector_loaded(self, key: tuple, prepared) -> None:
+        self._vector_progress.pop(key, None)
+        self._vector_cache[key] = prepared
+        self._refresh_world_vectors()
+        for layer in self.project.vector_layers:
+            if self._vector_key(layer) == key and layer.id in self._fit_vector_ids:
+                self._fit_vector_ids.discard(layer.id)
+                self.world_map.fit_world()
+
+    def _on_vector_failed(self, key: tuple, message: str) -> None:
+        self._vector_progress.pop(key, None)
+        self._vector_failed.add(key)
+        self._update_vector_progress()
+        self.statusBar().showMessage(f"Could not load '{Path(key[0]).name}' for the world map: {message}")
 
     def _image_world_point(self, image, pixel_x: float, pixel_y: float) -> tuple[float, float]:
         angle = radians(image.world_rotation)
@@ -1075,6 +1170,9 @@ class MainWindow(QMainWindow):
         overlay = []
         for point in self.project.control_points:
             observation = point.observations[0] if point.observations else None
+            hidden_image = observation is not None and not images[observation.image_id].map_visible
+            if not point.map_visible or hidden_image:
+                continue
             georeferenced = point.geographic_x is not None and point.geographic_y is not None
             if georeferenced:
                 world = (point.geographic_x, point.geographic_y)
@@ -1138,11 +1236,19 @@ class MainWindow(QMainWindow):
         for point in self.project.control_points:
             if point.image_id:
                 points_by_image.setdefault(point.image_id, []).append(point)
-        # Top row is the front-most layer, so the tree lists images in reverse z-order.
-        images = list(reversed(self.project.images))
+        # Top row is the front-most layer, so the tree lists the stack in reverse.
+        images_by_id = {image.id: image for image in self.project.images}
+        vectors_by_id = {layer.id: layer for layer in self.project.vector_layers}
+        stack = [
+            images_by_id.get(item_id) or vectors_by_id[item_id]
+            for item_id in reversed(self.project.stacked_layer_ids())
+        ]
         signature = [
-            (image.id, image.name, image.visible, [(p.id, p.name, p.visible) for p in points_by_image.get(image.id, [])])
-            for image in images
+            (
+                layer.id, layer.name, layer.visible, getattr(layer, "map_visible", None),
+                [(p.id, p.name, p.visible, p.map_visible) for p in points_by_image.get(layer.id, [])],
+            )
+            for layer in stack
         ]
         if not force and signature == self._layers_signature:
             return
@@ -1153,15 +1259,28 @@ class MainWindow(QMainWindow):
             if tree.topLevelItem(row).isExpanded()
         }
         selected_images = set(self._selected_image_ids())
+        selected_vectors = set(self._selected_vector_ids())
         tree.blockSignals(True)
         tree.clear()
-        for image in images:
+        for layer in stack:
+            if layer.id in vectors_by_id:
+                row = LayerItem(VECTOR_KIND, layer.id, layer.name)
+                row.setToolTip(0, layer.path)
+                self._style_layer_item(row, None, layer.visible)
+                tree.addTopLevelItem(row)
+                row.setSelected(layer.id in selected_vectors)
+                continue
+            image = layer
             top = LayerItem(IMAGE_KIND, image.id, image.name)
             top.setToolTip(0, image.path)
-            self._style_layer_item(top, image.visible, image.visible)
+            self._style_layer_item(top, image.visible, image.map_visible)
             for point in points_by_image.get(image.id, []):
                 child = LayerItem(POINT_KIND, point.id, point.name)
-                self._style_layer_item(child, point.visible, point.visible and image.visible)
+                self._style_layer_item(
+                    child,
+                    point.visible and image.visible,
+                    point.map_visible and image.map_visible,
+                )
                 top.addChild(child)
             tree.addTopLevelItem(top)
             top.setExpanded(image.id in expanded)
@@ -1170,10 +1289,14 @@ class MainWindow(QMainWindow):
         self._sync_tree_points()
 
     @staticmethod
-    def _style_layer_item(item: LayerItem, visible: bool, shown: bool) -> None:
-        item.setIcon(LayerTree.EYE_COLUMN, make_icon("eye" if visible else "eye_off"))
-        item.setToolTip(LayerTree.EYE_COLUMN, "Hide on canvas" if visible else "Show on canvas")
-        if not shown:
+    def _style_layer_item(item: LayerItem, canvas_visible: bool | None, map_visible: bool) -> None:
+        """`canvas_visible` is None for layers that are never drawn on the canvas."""
+        if canvas_visible is not None:
+            item.setIcon(LayerTree.EYE_COLUMN, make_icon("eye_canvas" if canvas_visible else "eye_canvas_off"))
+            item.setToolTip(LayerTree.EYE_COLUMN, "Hide on canvas" if canvas_visible else "Show on canvas")
+        item.setIcon(LayerTree.MAP_COLUMN, make_icon("eye_map" if map_visible else "eye_map_off"))
+        item.setToolTip(LayerTree.MAP_COLUMN, "Hide on world map" if map_visible else "Show on world map")
+        if not (canvas_visible or map_visible):
             item.setForeground(0, QBrush(QColor("#6f7c78")))
 
     def _sync_tree_points(self) -> None:
@@ -1190,35 +1313,51 @@ class MainWindow(QMainWindow):
                     top.setExpanded(True)
         tree.blockSignals(False)
 
-    def _on_layer_visibility_toggled(self, item: LayerItem) -> None:
+    def _on_layer_visibility_toggled(self, item: LayerItem, column: int) -> None:
+        on_map = column == LayerTree.MAP_COLUMN
         if item.kind == IMAGE_KIND:
             target = next((image for image in self.project.images if image.id == item.item_id), None)
+        elif item.kind == VECTOR_KIND:
+            if not on_map:
+                return
+            target = next((layer for layer in self.project.vector_layers if layer.id == item.item_id), None)
         else:
             target = self.project.point_by_id(item.item_id)
         if target is None:
             return
+        attribute = "map_visible" if on_map and item.kind != VECTOR_KIND else "visible"
         before = self.project.to_dict()
-        target.visible = not target.visible
-        self._record_project_edit(before, "Show layer" if target.visible else "Hide layer")
+        setattr(target, attribute, not getattr(target, attribute))
+        shown = getattr(target, attribute)
+        target_name = "map layer" if on_map else "layer"
+        self._record_project_edit(before, f"Show {target_name}" if shown else f"Hide {target_name}")
         self._refresh_canvas()
+        if on_map:
+            self._refresh_world_map()
         self._refresh_details()
 
     def _on_layers_reordered(self, top_to_bottom: list) -> None:
-        by_id = {image.id: image for image in self.project.images}
-        ordered = [by_id[image_id] for image_id in reversed(top_to_bottom) if image_id in by_id]
-        if len(ordered) != len(self.project.images):
+        images = {image.id: image for image in self.project.images}
+        vectors = {layer.id: layer for layer in self.project.vector_layers}
+        if set(top_to_bottom) != set(images) | set(vectors) or len(top_to_bottom) != len(images) + len(vectors):
+            return
+        stack = list(reversed(top_to_bottom))
+        if stack == self.project.stacked_layer_ids():
             return
         before = self.project.to_dict()
-        self.project.images = ordered
+        self.project.layer_order = stack
+        self.project.images = [images[item_id] for item_id in stack if item_id in images]
+        self.project.vector_layers = [vectors[item_id] for item_id in stack if item_id in vectors]
         self._record_project_edit(before, "Reorder layers")
         self._refresh_images()
+        self._refresh_world_map()
         self.statusBar().showMessage("Layer order updated. Top layers are drawn in front.")
 
     def _refresh_images(self) -> None:
         self._refresh_layers(force=True)
         if self.current_image_id not in {image.id for image in self.project.images}:
             self.current_image_id = self.project.images[0].id if self.project.images else None
-        if not self._selected_image_ids() and self.current_image_id is not None:
+        if not self._selected_image_ids() and not self._selected_vector_ids() and self.current_image_id is not None:
             current = next(
                 (self.image_list.item(row) for row in range(self.image_list.count())
                  if self.image_list.item(row).item_id == self.current_image_id),
@@ -1253,6 +1392,11 @@ class MainWindow(QMainWindow):
         if not isValid(self.image_list):
             return []
         return [item.data(Qt.ItemDataRole.UserRole) for item in self.image_list.selectedItems()]
+
+    def _selected_vector_ids(self) -> list[str]:
+        if not isValid(self.image_list):
+            return []
+        return [item.item_id for item in self.image_list.selected_vector_items()]
 
     def _selected_point_id(self) -> str | None:
         point_ids = self._selected_point_ids()
@@ -1637,19 +1781,23 @@ class MainWindow(QMainWindow):
         if total > 1:
             titles = {0: f"{len(image_ids)} IMAGES", 1: f"{len(point_ids)} CONTROL POINTS", 2: f"{len(constraint_ids)} LINKS"}
             only_kind = next(index for index, ids in enumerate((image_ids, point_ids, constraint_ids)) if ids) if kinds == 1 else None
-            self.details_title.setText(titles[only_kind] if only_kind is not None else f"{total} ITEMS SELECTED")
+            if only_kind is None:
+                self.details_title.setText(f"{total} ITEMS SELECTED")
+            else:
+                bar = kind_bar_html(("image", "point", "link")[only_kind])
+                self.details_title.setText(f"{bar} {titles[only_kind]}")
             self.details_stack.setCurrentIndex(4)
             self._show_multi_selection_details(image_ids, point_ids, constraint_ids)
         elif constraint is not None:
-            self.details_title.setText("LINK")
+            self.details_title.setText(f"{kind_bar_html('link')} LINK")
             self.details_stack.setCurrentIndex(3)
             self._show_constraint_details(constraint)
         elif point is not None:
-            self.details_title.setText(f"CONTROL POINT · {point.name}")
+            self.details_title.setText(f"{kind_bar_html('point')} CONTROL POINT · {escape(point.name)}")
             self.details_stack.setCurrentIndex(2)
             self._show_point_details(point)
         elif image is not None:
-            self.details_title.setText(f"IMAGE · {image.name}")
+            self.details_title.setText(f"{kind_bar_html('image')} IMAGE · {escape(image.name)}")
             self.details_stack.setCurrentIndex(1)
             self._show_image_details(image)
         else:
@@ -1826,6 +1974,7 @@ class MainWindow(QMainWindow):
             if point.geographic_x is not None and point.geographic_y is not None:
                 parts.append(f"map ({point.geographic_x:g}, {point.geographic_y:g})")
             item = QListWidgetItem("  ·  ".join(parts))
+            item.setIcon(kind_icon("point"))
             item.setData(Qt.ItemDataRole.UserRole, point.id)
             widget.addItem(item)
 
@@ -1834,6 +1983,7 @@ class MainWindow(QMainWindow):
         point_names = {point.id: point.name for point in self.project.control_points}
         for constraint in constraints:
             item = QListWidgetItem(self._link_text(constraint, point_names))
+            item.setIcon(kind_icon("link"))
             item.setData(Qt.ItemDataRole.UserRole, constraint.id)
             widget.addItem(item)
 
@@ -1888,11 +2038,13 @@ class MainWindow(QMainWindow):
         point_names = {point.id: point.name for point in self.project.control_points}
         self.selection_list.clear()
         for image in images:
-            self.selection_list.addItem(f"Image  ·  {image.name}")
+            self.selection_list.addItem(QListWidgetItem(kind_icon("image"), f"Image  ·  {image.name}"))
         for point in points:
-            self.selection_list.addItem(f"Point  ·  {point.name}  ·  {image_names.get(point.image_id, '?')}")
+            self.selection_list.addItem(QListWidgetItem(
+                kind_icon("point"), f"Point  ·  {point.name}  ·  {image_names.get(point.image_id, '?')}"
+            ))
         for link in links:
-            self.selection_list.addItem(f"Link  ·  {self._link_text(link, point_names)}")
+            self.selection_list.addItem(QListWidgetItem(kind_icon("link"), f"Link  ·  {self._link_text(link, point_names)}"))
 
     def _show_image_details(self, image) -> None:
         self.image_info_label.setText(self._image_info_text(image))
@@ -1924,6 +2076,7 @@ class MainWindow(QMainWindow):
             if item_observation.locked:
                 text += "  [locked]"
             item = QListWidgetItem(text)
+            item.setIcon(kind_icon("image"))
             item.setData(Qt.ItemDataRole.UserRole, item_observation.image_id)
             self.point_observations_list.addItem(item)
         self._fill_link_list(
@@ -1936,7 +2089,7 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)
             combo.clear()
             for point in self.project.control_points:
-                combo.addItem(point.name, point.id)
+                combo.addItem(kind_icon("point"), point.name, point.id)
         self.constraint_first_edit.setCurrentIndex(self.constraint_first_edit.findData(constraint.first_point_id))
         self.constraint_second_edit.setCurrentIndex(self.constraint_second_edit.findData(constraint.second_point_id))
         self.constraint_first_edit.blockSignals(False)
@@ -1947,11 +2100,13 @@ class MainWindow(QMainWindow):
         for point_id in (constraint.first_point_id, constraint.second_point_id):
             point = self.project.point_by_id(point_id)
             if point is not None:
-                where = ", ".join(image_names.get(item.image_id, "?") for item in point.observations) or "no images"
-                lines.append(f"{point.name}: {where}")
+                where = ", ".join(
+                    f"{kind_bar_html('image')} {escape(image_names.get(item.image_id, '?'))}" for item in point.observations
+                ) or "no images"
+                lines.append(f"{kind_bar_html('point')} {escape(point.name)}: {where}")
         if self._alignment_result is not None and constraint.id in self._alignment_result.constraint_residuals:
             lines.append(f"Alignment residual: {self._alignment_result.constraint_residuals[constraint.id]:.4f}")
-        self.constraint_info_label.setText("\n".join(lines))
+        self.constraint_info_label.setText("<br>".join(lines))
 
     def _on_detail_point_clicked(self, item: QListWidgetItem) -> None:
         self._select_point(item.data(Qt.ItemDataRole.UserRole))
@@ -2332,6 +2487,11 @@ class MainWindow(QMainWindow):
     def delete_selected(self) -> None:
         point_ids = self._selected_point_ids()
         constraint_ids = self._selected_constraint_ids()
+        if self._selected_vector_ids():
+            if not self.remove_selected_vectors() and not self._selected_image_ids():
+                return
+            self.selected_point_ids = point_ids
+            self.selected_constraint_ids = constraint_ids
         if self._selected_image_ids():
             if not self.remove_selected_image():
                 return
@@ -2443,6 +2603,52 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
         self._finish_project_edit()
 
+    GEOJSON_EXTENSIONS = {".geojson", ".json"}
+
+    def import_geojson(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Import GeoJSON layers",
+            self._last_directory(),
+            "GeoJSON (*.geojson *.json);;All files (*)",
+        )
+        if not paths:
+            return
+        self._remember_directory(paths[0])
+        self._import_geojson_paths(paths)
+
+    def _import_dropped_paths(self, paths: list[str]) -> None:
+        vectors = [path for path in paths if Path(path).suffix.lower() in self.GEOJSON_EXTENSIONS]
+        images = [path for path in paths if path not in vectors]
+        if images:
+            self._import_image_paths(images)
+        if vectors:
+            self._import_geojson_paths(vectors)
+
+    def _import_geojson_paths(self, paths: list[str]) -> None:
+        before = self._begin_project_edit("Import GeoJSON layers")
+        added = 0
+        failures = []
+        for path in paths:
+            if not Path(path).is_file():
+                failures.append(f"{Path(path).name}: file not found")
+                continue
+            layer = VectorLayer.from_path(path)
+            self.project.vector_layers.append(layer)
+            self._fit_vector_ids.add(layer.id)
+            added += 1
+        if not added:
+            self.statusBar().showMessage("No GeoJSON imported. " + "; ".join(failures[:3]))
+            self._finish_project_edit()
+            return
+        self._refresh_layers(force=True)
+        self._refresh_world_map(fit=True)
+        message = f"Imported {added} GeoJSON layer(s) to the world map."
+        if failures:
+            message += " Skipped: " + "; ".join(failures[:3])
+        self.statusBar().showMessage(message)
+        self._finish_project_edit()
+
     @classmethod
     def _local_file_paths(cls, mime_data) -> list[str]:
         return [
@@ -2466,12 +2672,31 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event) -> None:
         paths = self._local_file_paths(event.mimeData())
         if paths:
-            self._import_image_paths(paths)
+            self._import_dropped_paths(paths)
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def remove_selected_vectors(self) -> bool:
+        vector_ids = set(self._selected_vector_ids())
+        layers = [item for item in self.project.vector_layers if item.id in vector_ids]
+        if not layers:
+            return False
+        names = f"'{layers[0].name}'" if len(layers) == 1 else f"{len(layers)} GeoJSON layers"
+        answer = QMessageBox.question(self, "Remove GeoJSON layer", f"Remove {names}?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        before = self.project.to_dict()
+        self.project.vector_layers = [item for item in self.project.vector_layers if item.id not in vector_ids]
+        self._record_project_edit(before, "Remove GeoJSON layer")
+        self._refresh_all()
+        return True
+
     def remove_selected_image(self) -> bool:
+        if self._selected_vector_ids():
+            removed_vectors = self.remove_selected_vectors()
+            if not self._selected_image_ids():
+                return removed_vectors
         image_ids = set(self._selected_image_ids())
         images = [item for item in self.project.images if item.id in image_ids]
         if not images:
@@ -2533,6 +2758,7 @@ class MainWindow(QMainWindow):
     def _remember_directory(self, path: str | Path) -> None:
         directory = Path(path).parent
         self._settings.setValue("last_directory", str(directory))
+        self._settings.sync()
 
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2560,6 +2786,8 @@ class MainWindow(QMainWindow):
         self.selected_point_id = None
         self.selected_constraint_id = None
         self._refresh_all()
+        self._clear_image_selection()
+        self._refresh_points()
         self._restore_views()
         self.statusBar().showMessage(f"Opened {path}")
 

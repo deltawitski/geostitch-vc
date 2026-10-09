@@ -29,6 +29,7 @@ class ImageRecord:
     aligned_rotation: float = 0.0
     aligned_scale: float = 1.0
     visible: bool = True
+    map_visible: bool = True
 
     @property
     def has_alignment(self) -> bool:
@@ -40,6 +41,21 @@ class ImageRecord:
 
     @classmethod
     def from_path(cls, path: str | Path) -> ImageRecord:
+        resolved = Path(path).expanduser().resolve()
+        return cls(id=str(uuid4()), path=str(resolved), name=resolved.name)
+
+
+@dataclass
+class VectorLayer:
+    """GeoJSON file shown on the world map only; `visible` controls its map visibility."""
+
+    id: str
+    path: str
+    name: str
+    visible: bool = True
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> VectorLayer:
         resolved = Path(path).expanduser().resolve()
         return cls(id=str(uuid4()), path=str(resolved), name=resolved.name)
 
@@ -61,6 +77,7 @@ class GroundControlPoint:
     observations: list[Observation] = field(default_factory=list)
     label: str | None = None
     visible: bool = True
+    map_visible: bool = True
 
     @property
     def image_id(self) -> str | None:
@@ -115,6 +132,8 @@ class Project:
     images: list[ImageRecord] = field(default_factory=list)
     control_points: list[GroundControlPoint] = field(default_factory=list)
     constraints: list[PointConstraint] = field(default_factory=list)
+    vector_layers: list[VectorLayer] = field(default_factory=list)
+    layer_order: list[str] = field(default_factory=list)
     views: dict[str, Any] = field(default_factory=dict)
     canvas_state: str = "rest"
 
@@ -126,6 +145,14 @@ class Project:
         image = ImageRecord.from_path(resolved)
         self.images.append(image)
         return image
+
+    def stacked_layer_ids(self) -> list[str]:
+        """Image and GeoJSON layer ids from bottom to top; unlisted layers go on top, vectors above new images."""
+        known = [image.id for image in self.images] + [layer.id for layer in self.vector_layers]
+        valid = set(known)
+        order = [item for item in dict.fromkeys(self.layer_order) if item in valid]
+        listed = set(order)
+        return order + [item for item in known if item not in listed]
 
     def point_by_id(self, point_id: str) -> GroundControlPoint | None:
         return next((point for point in self.control_points if point.id == point_id), None)
@@ -179,7 +206,7 @@ class Project:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 11,
+            "version": 12,
             "name": self.name,
             "crs": self.crs,
             "images": [json.loads(json.dumps(vars(image))) for image in self.images],
@@ -189,6 +216,7 @@ class Project:
                     "name": point.name,
                     "label": point.label,
                     "visible": point.visible,
+                    "map_visible": point.map_visible,
                     "geographic_x": point.geographic_x,
                     "geographic_y": point.geographic_y,
                     "observations": [vars(observation).copy() for observation in point.observations],
@@ -196,16 +224,23 @@ class Project:
                 for point in self.control_points
             ],
             "constraints": [vars(constraint).copy() for constraint in self.constraints],
+            "vector_layers": [vars(layer).copy() for layer in self.vector_layers],
+            "layer_order": self.stacked_layer_ids(),
             "views": json.loads(json.dumps(self.views)),
             "canvas_state": self.canvas_state,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
-        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
             raise ValueError("This project uses an unsupported file version.")
         project = cls(name=data.get("name", "Untitled project"), crs=data.get("crs", "EPSG:4326"))
         project.images = [ImageRecord(**image) for image in data.get("images", [])]
+        project.vector_layers = [
+            VectorLayer(id=layer["id"], path=layer["path"], name=layer["name"], visible=bool(layer.get("visible", True)))
+            for layer in data.get("vector_layers", [])
+        ]
+        project.layer_order = [str(item) for item in data.get("layer_order", [])]
         views = data.get("views", {})
         project.views = views if isinstance(views, dict) else {}
         project.canvas_state = "aligned" if data.get("canvas_state") == "aligned" else "rest"
@@ -215,6 +250,7 @@ class Project:
                 name=point["name"],
                 label=point.get("label"),
                 visible=bool(point.get("visible", True)),
+                map_visible=bool(point.get("map_visible", True)),
                 geographic_x=point.get("geographic_x"),
                 geographic_y=point.get("geographic_y"),
                 observations=[Observation(**observation) for observation in point.get("observations", [])],
