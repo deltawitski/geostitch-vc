@@ -49,6 +49,10 @@ Instead of stitching pixels, you work **virtually**:
 
 ---
 
+The window appears before automatically reopening the last project. Saved-project images decode on background workers and appear progressively; the layer tree is available while they load. SciPy's optimizer and image-export dependencies load only when those commands are used. GeoJSON loading already runs on background workers.
+
+Open **File > Settings > Appearance** (also available under **Settings**) to choose an installed Qt style, the GeoStitch dark scheme or Qt's default palette, and symbol colors for images, control points, links, and GeoJSON layers. Color swatches open a color picker. Apply updates the views immediately; OK applies and closes; Cancel discards changes not yet applied. Restore Defaults resets the dialog to Fusion, the dark scheme, and the original symbol colors. Appearance preferences are saved independently of projects.
+
 ## 🔄 Workflow
 
 ```mermaid
@@ -71,14 +75,16 @@ Use **File → Import images** (`Ctrl+I`) or drag files into the window. New lay
 - Drag a layer to move it.
 - Select a layer to show handles: drag a **corner** to scale proportionally, or the **handle above the image** to rotate.
 - **Arrange images** (`Ctrl+Shift+A`) rebuilds the grid; **Fit current view** (`Ctrl+Shift+F`) zooms to the selection or everything.
+- The Layers panel shows a padlock beside each image and control point. Click it to lock or unlock that row without changing selection: images lock their rest transform, while points lock their pixel position. Open padlocks are unlocked; closed padlocks are locked. GeoJSON rows have no lock control.
 
 ### 3. 📍 Add control points
 
-Toggle **Add points** (`P`) and click features. Every click creates one point belonging to the clicked image, auto-named per image (`survey-001`, `survey-002`, …). The tool stays active until you toggle it off. Give points optional labels, edit pixel positions, or **lock** them (`K`) to prevent accidental drags.
+Toggle **Add points** (`P`) and click features. Every click creates one point belonging to the clicked image, auto-named per image (`survey-001`, `survey-002`, …). The tool stays active until you toggle it off. Give points optional labels, edit pixel positions, or **lock** them (`K`) to prevent accidental drags. Select images and press `K` to lock their canvas rest position, rotation, and scale, including against Arrange. Image locks are saved with the project and do not lock point observations or solver-aligned and geographic transforms. For a mixed selection, `K` locks all selected image transforms and point positions unless all are already locked, in which case it unlocks them.
 
 ### 4. 🔗 Link matching points
 
 Toggle **Link points** (`L`), click a marker, then click its match in a **different** image. The tool stays active for successive pairs. You can also select a point and choose **Link selected point to...** (`Ctrl+Shift+L`). Links appear as dashed lines in the scene.
+In the Layers panel, expand a linked control point to see its constraints. Each row identifies the other point, its image, and the constraint type. Select a link row to highlight the constraint and show its details; Delete removes the link without removing either point.
 
 ### 5. 📐 Simulate alignment
 
@@ -111,7 +117,7 @@ All shortcuts can be changed in **Settings → Keyboard shortcuts...** (duplicat
 | Link points                  |              `L`               | Click two matching points in different images               |
 | Pick GCP coordinate on map   |              `G`               | Click the world map to set the selected point's coordinates |
 | Lasso selection              |              `S`               | Toggle freehand lasso instead of rectangle selection        |
-| Lock / unlock points         |              `K`               | Prevent dragging and pixel edits for selected points        |
+| Lock / unlock images and points |           `K`               | Lock image rest transforms and selected point positions     |
 | Toggle aligned / rest layout |              `A`               | Switch between arranged and solver-aligned layouts          |
 | Maximize / restore panel     |              `M`               | Focus on one panel                                          |
 | Delete selected              |             `Del`              | Remove selected images, points or link                      |

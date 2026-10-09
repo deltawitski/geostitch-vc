@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from math import cos, degrees, hypot, radians, sin
 from typing import Callable
 
-from scipy.optimize import least_squares
-
 from geostitch.models import Project
 
 ImageTransform = tuple[float, float, float, float]
@@ -52,6 +50,8 @@ def simulate_alignment(
         raise ValueError("Tolerance must be greater than zero.")
     if max_iterations < 1:
         raise ValueError("Maximum iterations must be at least one.")
+
+    from scipy.optimize import least_squares
 
     image_order = [image.id for image in project.images]
     transforms: dict[str, ImageTransform] = {}

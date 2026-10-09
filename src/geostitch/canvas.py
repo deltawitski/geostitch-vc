@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from geostitch.icons import KIND_COLORS
+
 
 class _Magnifier(QWidget):
     """Circular zoomed view of the scene around a point, with a crosshair at its centre."""
@@ -72,7 +74,7 @@ class _Magnifier(QWidget):
             painter.drawLine(QPointF(middle, middle + gap), QPointF(middle, self.DIAMETER - edge))
             painter.drawLine(QPointF(edge, middle), QPointF(middle - gap, middle))
             painter.drawLine(QPointF(middle + gap, middle), QPointF(self.DIAMETER - edge, middle))
-        painter.setPen(QPen(QColor("#65cdb1"), 3))
+        painter.setPen(QPen(QColor(KIND_COLORS["point"]), 3))
         painter.drawEllipse(QRectF(1.5, 1.5, self.DIAMETER - 3, self.DIAMETER - 3))
 
 
@@ -118,6 +120,7 @@ class ImageCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setRenderHint(self.renderHints() | self.renderHints().Antialiasing)
         self._layers: dict[str, QGraphicsPixmapItem] = {}
+        self._locked_images: set[str] = set()
         self._points: dict[tuple[str, str], tuple[float, float]] = {}
         self._point_items: dict[tuple[str, str], QGraphicsEllipseItem] = {}
         self._locked_points: set[tuple[str, str]] = set()
@@ -165,6 +168,7 @@ class ImageCanvas(QGraphicsView):
         self._marquee_origin = None
         self._scene.clear()
         self._layers.clear()
+        self._locked_images.clear()
         self._points.clear()
         self._point_items.clear()
         self._locked_points.clear()
@@ -183,10 +187,12 @@ class ImageCanvas(QGraphicsView):
         layout_x = 0.0
         for index, layer in enumerate(valid_layers):
             image_id = layer["id"]
+            if layer.get("rest_locked", False):
+                self._locked_images.add(image_id)
             pixmap_item = QGraphicsPixmapItem(layer["pixmap"])
             pixmap_item.setData(0, image_id)
             pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
-            pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not self._read_only)
+            pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not self._read_only and image_id not in self._locked_images)
             pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             pixmap_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
             pixmap_item.setZValue(index)
@@ -294,8 +300,8 @@ class ImageCanvas(QGraphicsView):
     def set_read_only(self, read_only: bool) -> None:
         """Disable moving, scaling and rotating images (point markers stay editable)."""
         self._read_only = read_only
-        for item in self._layers.values():
-            item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not read_only)
+        for image_id, item in self._layers.items():
+            item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not read_only and image_id not in self._locked_images)
         self._refresh_transform_handles()
 
     def _add_point_marker(
@@ -305,8 +311,10 @@ class ImageCanvas(QGraphicsView):
         marker.setVisible(visible)
         marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
         marker.setPos(parent.mapToScene(QPointF(x, y)))
-        marker.setPen(QPen(QColor("#ff695e"), 2))
-        marker.setBrush(QBrush(QColor(255, 105, 94, 90)))
+        color = QColor(KIND_COLORS["point"])
+        marker.setPen(QPen(color, 2))
+        color.setAlpha(90)
+        marker.setBrush(QBrush(color))
         marker.setZValue(3000)
         marker.setData(0, point_id)
         marker.setData(1, parent.data(0))
@@ -333,7 +341,7 @@ class ImageCanvas(QGraphicsView):
         for image_id in self._selected_image_ids:
             item = self._layers[image_id]
             outline = QGraphicsRectItem(item.boundingRect(), item)
-            pen = QPen(QColor("#65cdb1"), 2)
+            pen = QPen(QColor(KIND_COLORS["image"]), 2)
             pen.setCosmetic(True)
             outline.setPen(pen)
             outline.setBrush(QBrush(Qt.BrushStyle.NoBrush))
@@ -388,9 +396,11 @@ class ImageCanvas(QGraphicsView):
             is_source = candidate_id == self._constraint_source_id
             is_selected = candidate_id in self._selected_point_ids
             is_locked = (_image_id, candidate_id) in self._locked_points
-            color = QColor("#f4c95d") if is_source else QColor("#65cdb1") if is_selected else QColor("#79a9d1") if is_locked else QColor("#ff695e")
-            marker.setPen(QPen(color, 3 if is_source or is_selected else 2))
-            marker.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 100 if is_source or is_selected or is_locked else 90)))
+            color = QColor(KIND_COLORS["point"])
+            style = Qt.PenStyle.DotLine if is_source else Qt.PenStyle.DashLine if is_locked else Qt.PenStyle.SolidLine
+            marker.setPen(QPen(color, 3 if is_source or is_selected else 2, style))
+            color.setAlpha(200 if is_source else 160 if is_selected else 110 if is_locked else 90)
+            marker.setBrush(QBrush(color))
 
     def set_constraints(self, constraints: list[tuple[str, str]]) -> None:
         self._constraints = constraints
@@ -398,7 +408,7 @@ class ImageCanvas(QGraphicsView):
 
     def set_image_transform(self, image_id: str, rotation: float | None = None, scale: float | None = None) -> None:
         item = self._layers.get(image_id)
-        if item is None:
+        if item is None or image_id in self._locked_images or self._read_only:
             return
         if rotation is not None:
             item.setRotation(rotation)
@@ -409,7 +419,7 @@ class ImageCanvas(QGraphicsView):
 
     def set_image_position(self, image_id: str, x: float, y: float) -> None:
         item = self._layers.get(image_id)
-        if item is None:
+        if item is None or image_id in self._locked_images or self._read_only:
             return
         item.setPos(x, y)
         self._emit_transform(image_id)
@@ -577,7 +587,9 @@ class ImageCanvas(QGraphicsView):
                 self._pending_collapse_id = image_id
             else:
                 self.set_active_image(image_id)
-            if self._read_only:
+            if self._read_only or image_id in self._locked_images:
+                self._placement_click = True
+                event.accept()
                 return
             self._drag_moved = False
             self._dragged_image_id = image_id
@@ -735,7 +747,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_transform_handles()
         image_id = self._active_image_id
         item = self._layers.get(image_id) if image_id else None
-        if item is None or self._read_only or not item.isVisible():
+        if item is None or self._read_only or self._active_image_id in self._locked_images or not item.isVisible():
             return
         bounds = item.boundingRect()
         corners = (
@@ -745,17 +757,17 @@ class ImageCanvas(QGraphicsView):
             ("scale-sw", QPointF(bounds.left(), bounds.bottom())),
         )
         for kind, local_position in corners:
-            self._add_transform_handle(kind, item.mapToScene(local_position), QColor("#65cdb1"))
+            self._add_transform_handle(kind, item.mapToScene(local_position), QColor(KIND_COLORS["image"]))
 
         top_center = item.mapToScene(QPointF(bounds.center().x(), bounds.top()))
         rotate_position = item.mapToScene(QPointF(bounds.center().x(), bounds.top() - 32.0 / max(item.scale(), 0.05)))
-        connector_pen = QPen(QColor("#e8efeb"), 1)
+        connector_pen = QPen(QColor(KIND_COLORS["image"]), 1)
         connector_pen.setCosmetic(True)
         self._transform_connector = self._scene.addLine(
             top_center.x(), top_center.y(), rotate_position.x(), rotate_position.y(), connector_pen
         )
         self._transform_connector.setZValue(3999)
-        self._add_transform_handle("rotate", rotate_position, QColor("#f4c95d"))
+        self._add_transform_handle("rotate", rotate_position, QColor(KIND_COLORS["image"]))
 
     def _add_transform_handle(self, kind: str, position: QPointF, color: QColor) -> None:
         handle = QGraphicsEllipseItem(-6, -6, 12, 12)
@@ -893,9 +905,9 @@ class ImageCanvas(QGraphicsView):
         for item in self._constraint_items:
             self._scene.removeItem(item)
         self._constraint_items.clear()
-        pen = QPen(QColor("#f4c95d"), 2, Qt.PenStyle.DashLine)
+        pen = QPen(QColor(KIND_COLORS["link"]), 2, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
-        selected_pen = QPen(QColor("#65cdb1"), 4)
+        selected_pen = QPen(QColor(KIND_COLORS["link"]), 4)
         selected_pen.setCosmetic(True)
         for index, (first_id, second_id) in enumerate(self._constraints):
             first = self._scene_position_for_point(first_id)

@@ -134,6 +134,15 @@ def _draw_lock(p: QPainter) -> None:
     p.drawLine(QPointF(24, 29), QPointF(24, 35))
 
 
+def _draw_unlock(p: QPainter) -> None:
+    p.setPen(QPen(QColor("#6f7c78"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawRoundedRect(QRectF(10, 21, 28, 21), 3, 3)
+    p.drawArc(QRectF(23, 3, 18, 24), 0, 180 * 16)
+    p.drawLine(QPointF(23, 15), QPointF(23, 21))
+    p.drawLine(QPointF(41, 15), QPointF(41, 18))
+    p.drawLine(QPointF(24, 29), QPointF(24, 35))
+
+
 def _draw_eye(p: QPainter) -> None:
     p.drawArc(QRectF(4, 14, 40, 28), 0, 180 * 16)
     p.drawArc(QRectF(4, 6, 40, 28), 180 * 16, 180 * 16)
@@ -225,6 +234,7 @@ _GLYPHS = {
     "pick_gcp": _draw_pick_gcp,
     "delete": _draw_delete,
     "lock": _draw_lock,
+    "unlock": _draw_unlock,
     "select": _draw_select,
     "lasso": _draw_lasso,
     "eye": _draw_eye,
@@ -247,13 +257,27 @@ def app_icon() -> QIcon:
     return QIcon(str(path)) if path else QIcon()
 
 
-KIND_COLORS = {
+DEFAULT_KIND_COLORS = {
     "image": "#4aa3ff",
     "point": "#4cd37b",
     "link": "#c78bff",
     "geojson": "#f2b84b",
 }
+KIND_COLORS = DEFAULT_KIND_COLORS.copy()
 _KIND_ICONS: dict[str, QIcon] = {}
+
+
+def set_symbol_colors(colors: dict[str, str]) -> None:
+    for kind, default in DEFAULT_KIND_COLORS.items():
+        color = QColor(colors.get(kind, default))
+        KIND_COLORS[kind] = color.name() if color.isValid() else default
+    _KIND_ICONS.clear()
+
+
+def set_icon_colors(foreground: QColor, accent: QColor) -> None:
+    global _COLOR, _ACCENT
+    _COLOR = QColor(foreground)
+    _ACCENT = QColor(accent)
 
 
 def kind_icon(kind: str) -> QIcon:

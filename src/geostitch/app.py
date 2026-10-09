@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QStyleFactory,
     QFrame,
     QTableWidget,
     QTableWidgetItem,
@@ -49,11 +50,12 @@ from PySide6.QtWidgets import (
 )
 
 from geostitch.canvas import ImageCanvas
-from geostitch.export import FORMATS as EXPORT_FORMATS, export_project_images
-from geostitch.icons import app_icon, kind_bar_html, kind_icon, make_icon
+from geostitch.icons import DEFAULT_KIND_COLORS, KIND_COLORS, app_icon, kind_bar_html, kind_icon, make_icon, set_icon_colors, set_symbol_colors
+from geostitch.appearance import AppearanceDialog
 from geostitch.default_layout import DEFAULT_DOCK_STATE, DEFAULT_GEOMETRY
-from geostitch.layers import IMAGE_KIND, POINT_KIND, VECTOR_KIND, LayerItem, LayerTree
+from geostitch.layers import CONSTRAINT_KIND, IMAGE_KIND, POINT_KIND, VECTOR_KIND, LayerItem, LayerTree
 from geostitch.image_view import ImageViewer
+from geostitch.image_loader import ImageLoader
 from geostitch.masking import masked_pixmap
 from geostitch.models import GroundControlPoint, PointConstraint, Project, VectorLayer
 from geostitch.project_io import load_project, save_project
@@ -189,7 +191,7 @@ class MainWindow(QMainWindow):
         "pick_gcp": ("Pick GCP coordinate on map", "G"),
         "update_point": ("Update selected point", ""),
         "delete_point": ("Delete selected", "Delete"),
-        "toggle_lock": ("Lock / unlock selected points", "K"),
+        "toggle_lock": ("Lock / unlock selected images and points", "K"),
         "lasso_select": ("Lasso selection (off: rectangle)", "S"),
         "create_constraint": ("Link selected point to...", "Ctrl+Shift+L"),
         "remove_constraint": ("Remove selected link", ""),
@@ -206,6 +208,7 @@ class MainWindow(QMainWindow):
             application.setOrganizationName("GeoStitch")
             application.setApplicationName("GeoStitch")
         self._settings = settings or QSettings()
+        self._load_appearance()
         self.shortcut_actions: dict[str, QAction] = {}
         self.undo_stack = QUndoStack(self)
         self._active_edit_before: dict | None = None
@@ -215,6 +218,16 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.project_path: Path | None = None
         self._image_pixmaps: dict[str, QPixmap] = {}
+        self._image_load_generation = 0
+        self._background_images = False
+        self._image_load_errors: dict[str, str] = {}
+        self._loading_image_keys: set[tuple] = set()
+        self._image_loader = ImageLoader(self._read_image_data, self)
+        self._image_loader.loaded.connect(self._on_image_loaded)
+        self._image_refresh_timer = QTimer(self)
+        self._image_refresh_timer.setSingleShot(True)
+        self._image_refresh_timer.setInterval(40)
+        self._image_refresh_timer.timeout.connect(self._refresh_loaded_images)
         self._masked_pixmaps: dict[str, tuple[tuple, QPixmap, QPixmap]] = {}
         self.current_image_id: str | None = None
         self._layers_signature: list | None = None
@@ -251,9 +264,21 @@ class MainWindow(QMainWindow):
         self._restore_window_layout()
         self._apply_style()
         self._refresh_all()
-        last_project = str(self._settings.value("last_project", "") or "")
-        if last_project and Path(last_project).is_file():
-            QTimer.singleShot(0, lambda: self._open_project_path(last_project, quiet=True))
+        self._startup_project = str(self._settings.value("last_project", "") or "")
+        self._startup_timer = QTimer(self)
+        self._startup_timer.setSingleShot(True)
+        self._startup_timer.setInterval(50)
+        self._startup_timer.timeout.connect(self._reopen_startup_project)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._startup_project and not self._startup_timer.isActive():
+            self._startup_timer.start()
+
+    def _reopen_startup_project(self) -> None:
+        path, self._startup_project = self._startup_project, ""
+        if path and Path(path).is_file():
+            self._open_project_path(path, quiet=True)
 
     def _build_ui(self) -> None:
         for key, label, callback in (
@@ -269,7 +294,7 @@ class MainWindow(QMainWindow):
         ):
             self._register_shortcut_action(key, label, callback)
         fit_action = self._register_shortcut_action("fit_images", "Fit current view", self._fit_canvas)
-        fit_action.setToolTip("Fit the panel you are working in: canvas (selected or all images), world map, or image view")
+        fit_action.setToolTip("Fit the current view; from Layers, fit the selection in both canvas and world map")
         self._register_shortcut_action("arrange_images", "Arrange images", self.arrange_images)
         self._register_shortcut_action("simulate_alignment", "Simulate alignment", self.simulate_alignment_dialog)
         self._register_shortcut_action("georeference", "Georeference from GCPs", self.simulate_georeference_dialog)
@@ -290,7 +315,7 @@ class MainWindow(QMainWindow):
         self.toggle_alignment_action.setEnabled(False)
         self.toggle_alignment_action.toggled.connect(self._on_toggle_alignment)
         self._register_shortcut_action("maximize_dock", "Maximize panel", self.toggle_maximize_dock)
-        self._register_shortcut_action("toggle_lock", "Lock / unlock selected points", self.toggle_selected_locks)
+        self._register_shortcut_action("toggle_lock", "Lock / unlock selected images and points", self.toggle_selected_locks)
         self.lasso_action = self._register_shortcut_action("lasso_select", "Lasso selection", None)
         self.lasso_action.setCheckable(True)
         self.lasso_action.toggled.connect(self._on_lasso_toggled)
@@ -314,6 +339,7 @@ class MainWindow(QMainWindow):
         self.image_list = LayerTree()
         self.image_list.itemSelectionChanged.connect(self._on_image_selected)
         self.image_list.visibility_toggled.connect(self._on_layer_visibility_toggled)
+        self.image_list.lock_toggled.connect(self._on_layer_lock_toggled)
         self.image_list.layers_reordered.connect(self._on_layers_reordered)
         image_layout.addWidget(self.image_list, 1)
         remove_image_action = self._register_shortcut_action("remove_image", "Remove selected image", self.remove_selected_image)
@@ -355,7 +381,7 @@ class MainWindow(QMainWindow):
         self.alignment_toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         canvas_header.addWidget(self.alignment_toggle_button)
         self.canvas_clip_checkbox = QCheckBox("Show clipping")
-        self.canvas_clip_checkbox.setChecked(True)
+        self.canvas_clip_checkbox.setChecked(False)
         self.canvas_clip_checkbox.setToolTip("Hide the parts of images outside their clip polygons; turn off to see full images")
         self.canvas_clip_checkbox.toggled.connect(lambda _checked: self._refresh_canvas())
         canvas_header.addWidget(self.canvas_clip_checkbox)
@@ -373,7 +399,7 @@ class MainWindow(QMainWindow):
         map_toolbar = QHBoxLayout()
         self.map_points_checkbox = QCheckBox("Show control points")
         self.map_points_checkbox.setToolTip(
-            "Green: has map coordinates. Yellow: placed through its image's world transform. "
+            "Point color: has map coordinates. Lighter: placed through its image's world transform. "
             "Square: locked in its image. Circle: unlocked."
         )
         self.map_points_checkbox.toggled.connect(lambda _checked: self._refresh_map_points())
@@ -596,6 +622,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.shortcut_actions["export_images"])
         file_menu.addAction(self.shortcut_actions["remove_image"])
         file_menu.addSeparator()
+        self.file_settings_menu = file_menu.addMenu("Settings")
         file_menu.addAction(self._register_shortcut_action("quit_app", "Exit", self.close))
 
         edit_menu = self.menuBar().addMenu("Edit")
@@ -646,6 +673,11 @@ class MainWindow(QMainWindow):
         self.shortcut_settings_action = QAction("Keyboard shortcuts...", self)
         self.shortcut_settings_action.triggered.connect(self.open_shortcut_settings)
         settings_menu.addAction(self.shortcut_settings_action)
+        self.appearance_action = QAction("Appearance...", self)
+        self.appearance_action.triggered.connect(self.open_appearance_settings)
+        settings_menu.addAction(self.appearance_action)
+        self.file_settings_menu.addAction(self.shortcut_settings_action)
+        self.file_settings_menu.addAction(self.appearance_action)
 
     TOOLBAR_INFO = {
         "new_project": ("new", "Start an empty project"),
@@ -654,12 +686,12 @@ class MainWindow(QMainWindow):
         "import_images": ("import", "Add images to the project canvas"),
         "export_images": ("export", "Write every georeferenced image to a GeoTIFF or world-file image"),
         "arrange_images": ("arrange", "Lay out all images in a grid on the canvas"),
-        "fit_images": ("fit", "Zoom to the selected images, or all images; fits the map or image view when it is focused or under the cursor"),
+        "fit_images": ("fit", "Fit the current view; from Layers, fit selected elements in both canvas and world map"),
         "add_points": ("add_points", "Toggle: click images to add control points continuously"),
         "link_points": ("link_points", "Toggle: click matching points in two images to link them"),
         "pick_gcp": ("pick_gcp", "Toggle: click the world map to set the selected control point's coordinates"),
         "delete_point": ("delete", "Delete the selected images, control points, or link"),
-        "toggle_lock": ("lock", "Lock or unlock the position of the selected control points in their images"),
+        "toggle_lock": ("lock", "Lock or unlock selected image rest transforms and control point positions"),
         "lasso_select": ("select", "Drag on the canvas to select items: rectangle, or freehand lasso when toggled on. Ctrl adds, Shift drags over images"),
         "simulate_alignment": ("alignment", "Align constraint-linked images relative to each other"),
         "georeference": ("georeference", "Solve world transforms from control points with geographic coordinates"),
@@ -727,7 +759,7 @@ class MainWindow(QMainWindow):
                 bool(self._selected_constraint_ids()) or bool(self._selected_point_ids())
                 or has_image_selection or has_vector_selection
             ),
-            "toggle_lock": bool(self._selected_point_ids()),
+            "toggle_lock": has_image_selection or bool(self._selected_point_ids()),
             "pick_gcp": point is not None,
             "update_point": point is not None,
             "remove_image": has_image_selection or has_vector_selection,
@@ -775,6 +807,8 @@ class MainWindow(QMainWindow):
         self._refresh_action_tooltips()
 
     def export_georeferenced_images(self) -> None:
+        from geostitch.export import FORMATS as EXPORT_FORMATS, export_project_images
+
         georeferenced = [image for image in self.project.images if image.world_x is not None and image.world_y is not None]
         if not georeferenced:
             self._show_error("No images are georeferenced yet. Run the georeference solver first.")
@@ -858,6 +892,9 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def closeEvent(self, event) -> None:
+        self._startup_timer.stop()
+        self._startup_project = ""
+        self._reset_image_loading()
         self._restore_docks()
         self._settings.setValue("window/geometry", self.saveGeometry())
         self._settings.setValue("window/dockState", self.saveState(3))
@@ -953,7 +990,56 @@ class MainWindow(QMainWindow):
         self.crs_edit.setText(self.project.crs)
         self._refresh_world_map()
 
+    def _load_appearance(self) -> None:
+        styles = {name.casefold(): name for name in QStyleFactory.keys()}
+        saved_style = str(self._settings.value("appearance/style", "Fusion"))
+        self._qt_style = styles.get(saved_style.casefold(), "Fusion")
+        saved_scheme = str(self._settings.value("appearance/scheme", "dark"))
+        self._color_scheme = saved_scheme if saved_scheme in ("dark", "native") else "dark"
+        colors = {kind: str(self._settings.value(f"appearance/colors/{kind}", default))
+                  for kind, default in DEFAULT_KIND_COLORS.items()}
+        set_symbol_colors(colors)
+
+    def open_appearance_settings(self) -> None:
+        dialog = AppearanceDialog(self._qt_style, self._color_scheme, KIND_COLORS, self)
+        dialog.applied.connect(self._apply_appearance)
+        dialog.exec()
+
+    def _apply_appearance(self, style: str, scheme: str, colors: dict[str, str]) -> None:
+        styles = {name.casefold(): name for name in QStyleFactory.keys()}
+        if style.casefold() not in styles or scheme not in ("dark", "native"):
+            return
+        self._settings.setValue("appearance/style", styles[style.casefold()])
+        self._settings.setValue("appearance/scheme", scheme)
+        for kind, default in DEFAULT_KIND_COLORS.items():
+            color = QColor(colors.get(kind, default))
+            self._settings.setValue(f"appearance/colors/{kind}", color.name() if color.isValid() else default)
+        self._settings.sync()
+        self._load_appearance()
+        self._apply_style()
+        self._refresh_layers(force=True)
+        self._refresh_canvas()
+        self._refresh_details()
+        self._refresh_world_map()
+        self.world_map._rebuild_vector_items()
+
+    def _refresh_appearance_icons(self) -> None:
+        for key, (glyph, description) in self.TOOLBAR_INFO.items():
+            self.shortcut_actions[key].setIcon(make_icon("lasso" if key == "lasso_select" and self.lasso_action.isChecked() else glyph))
+        self.canvas.setBackgroundBrush(QBrush(QColor("#20272b") if self._color_scheme == "dark" else QApplication.palette().base().color()))
+        self.image_viewer.setBackgroundBrush(self.canvas.backgroundBrush())
+
     def _apply_style(self) -> None:
+        application = QApplication.instance()
+        if application is not None:
+            application.setStyleSheet("")
+            application.setStyle(self._qt_style)
+            if self._color_scheme == "native":
+                palette = application.style().standardPalette()
+                application.setPalette(palette)
+                set_icon_colors(palette.buttonText().color(), palette.highlight().color())
+                self._refresh_appearance_icons()
+                return
         palette = QPalette()
         palette.setColor(QPalette.ColorRole.Window, QColor("#1b2223"))
         palette.setColor(QPalette.ColorRole.WindowText, QColor("#e8efeb"))
@@ -970,8 +1056,8 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#899994"))
         application = QApplication.instance()
         if application is not None:
-            application.setStyle("Fusion")
             application.setPalette(palette)
+            set_icon_colors(palette.buttonText().color(), QColor("#76cbb0"))
             application.setStyleSheet("""
                 QWidget { background-color: #1b2223; color: #e8efeb; font-family: 'Segoe UI'; font-size: 10pt; }
                 QMainWindow, QDialog, QMessageBox { background-color: #1b2223; color: #e8efeb; }
@@ -1014,6 +1100,7 @@ class MainWindow(QMainWindow):
                 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
                 QToolTip { background-color: #263232; color: #f0f5f1; border: 1px solid #52615e; padding: 4px; }
             """)
+            self._refresh_appearance_icons()
 
     def _refresh_all(self) -> None:
         self._refresh_images()
@@ -1185,6 +1272,7 @@ class MainWindow(QMainWindow):
             if not (isfinite(x) and isfinite(y)):
                 continue
             overlay.append({
+                "id": point.id,
                 "x": x,
                 "y": y,
                 "name": point.name,
@@ -1233,6 +1321,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_layers(self, force: bool = False) -> None:
         points_by_image: dict[str, list[GroundControlPoint]] = {}
+        constraints_by_point: dict[str, list[PointConstraint]] = {}
+        points_by_id = {point.id: point for point in self.project.control_points}
+        for constraint in self.project.constraints:
+            for point_id in (constraint.first_point_id, constraint.second_point_id):
+                constraints_by_point.setdefault(point_id, []).append(constraint)
         for point in self.project.control_points:
             if point.image_id:
                 points_by_image.setdefault(point.image_id, []).append(point)
@@ -1246,7 +1339,11 @@ class MainWindow(QMainWindow):
         signature = [
             (
                 layer.id, layer.name, layer.visible, getattr(layer, "map_visible", None),
-                [(p.id, p.name, p.visible, p.map_visible) for p in points_by_image.get(layer.id, [])],
+                getattr(layer, "rest_locked", None),
+                                [(p.id, p.name, p.visible, p.map_visible, [observation.locked for observation in p.observations],
+                                    [(link.id, link.first_point_id, link.second_point_id, link.kind)
+                                     for link in constraints_by_point.get(p.id, [])])
+                 for p in points_by_image.get(layer.id, [])],
             )
             for layer in stack
         ]
@@ -1258,13 +1355,26 @@ class MainWindow(QMainWindow):
             tree.topLevelItem(row).item_id for row in range(tree.topLevelItemCount())
             if tree.topLevelItem(row).isExpanded()
         }
+        expanded_points = {
+            tree.topLevelItem(row).child(index).item_id
+            for row in range(tree.topLevelItemCount())
+            for index in range(tree.topLevelItem(row).childCount())
+            if tree.topLevelItem(row).child(index).isExpanded()
+        }
         selected_images = set(self._selected_image_ids())
         selected_vectors = set(self._selected_vector_ids())
+        current_id = tree.currentItem().item_id if tree.currentItem() is not None else None
+        current_point_id = (
+            tree.currentItem().parent().item_id
+            if tree.currentItem() is not None and tree.currentItem().kind == CONSTRAINT_KIND else None
+        )
+        rows_by_id = {}
         tree.blockSignals(True)
         tree.clear()
         for layer in stack:
             if layer.id in vectors_by_id:
                 row = LayerItem(VECTOR_KIND, layer.id, layer.name)
+                rows_by_id[layer.id] = row
                 row.setToolTip(0, layer.path)
                 self._style_layer_item(row, None, layer.visible)
                 tree.addTopLevelItem(row)
@@ -1272,19 +1382,40 @@ class MainWindow(QMainWindow):
                 continue
             image = layer
             top = LayerItem(IMAGE_KIND, image.id, image.name)
+            rows_by_id[image.id] = top
             top.setToolTip(0, image.path)
             self._style_layer_item(top, image.visible, image.map_visible)
+            self._style_layer_lock(top, image.rest_locked, "canvas rest transform")
             for point in points_by_image.get(image.id, []):
                 child = LayerItem(POINT_KIND, point.id, point.name)
+                rows_by_id[point.id] = child
                 self._style_layer_item(
                     child,
                     point.visible and image.visible,
                     point.map_visible and image.map_visible,
                 )
                 top.addChild(child)
+                observation = point.observation_for(image.id)
+                if observation is not None:
+                    self._style_layer_lock(child, observation.locked, "position in image")
+                for constraint in constraints_by_point.get(point.id, []):
+                    other_id = constraint.second_point_id if constraint.first_point_id == point.id else constraint.first_point_id
+                    other = points_by_id.get(other_id)
+                    other_image = images_by_id.get(other.image_id) if other is not None else None
+                    other_name = other.name if other is not None else "Missing point"
+                    image_name = other_image.name if other_image is not None else "No image"
+                    link = LayerItem(CONSTRAINT_KIND, constraint.id, f"{other_name} ({image_name}) - {constraint.kind}")
+                    link.setToolTip(0, self._link_text(constraint, {point_id: item.name for point_id, item in points_by_id.items()}))
+                    child.addChild(link)
+                    rows_by_id[(constraint.id, point.id)] = link
             tree.addTopLevelItem(top)
             top.setExpanded(image.id in expanded)
+            for index in range(top.childCount()):
+                child = top.child(index)
+                child.setExpanded(child.item_id in expanded_points)
             top.setSelected(image.id in selected_images)
+        current_key = (current_id, current_point_id) if current_point_id is not None else current_id
+        tree.setCurrentItem(rows_by_id.get(current_key), 0, QItemSelectionModel.SelectionFlag.NoUpdate)
         tree.blockSignals(False)
         self._sync_tree_points()
 
@@ -1301,6 +1432,7 @@ class MainWindow(QMainWindow):
 
     def _sync_tree_points(self) -> None:
         chosen = set(self._selected_point_ids())
+        chosen_links = set(self._selected_constraint_ids())
         tree = self.image_list
         tree.blockSignals(True)
         for row in range(tree.topLevelItemCount()):
@@ -1311,9 +1443,53 @@ class MainWindow(QMainWindow):
                 child.setSelected(selected)
                 if selected:
                     top.setExpanded(True)
+                for link_index in range(child.childCount()):
+                    link = child.child(link_index)
+                    link_selected = link.item_id in chosen_links
+                    link.setSelected(link_selected)
+                    if link_selected:
+                        top.setExpanded(True)
+                        child.setExpanded(True)
         tree.blockSignals(False)
 
+    @staticmethod
+    def _style_layer_lock(item: LayerItem, locked: bool, target: str) -> None:
+        item.setIcon(LayerTree.LOCK_COLUMN, make_icon("lock" if locked else "unlock"))
+        state = "Locked" if locked else "Unlocked"
+        action = "unlock" if locked else "lock"
+        item.setToolTip(LayerTree.LOCK_COLUMN, f"{state}: {target}. Click to {action}.")
+
+    def _set_image_rest_lock(self, image, locked: bool) -> None:
+        if locked and image.position_x is None and not self._aligned_view_active():
+            pose = self.canvas.image_transform(image.id)
+            if pose is not None:
+                image.position_x, image.position_y, image.rotation, image.scale = pose
+        image.rest_locked = locked
+
+    def _on_layer_lock_toggled(self, item: LayerItem) -> None:
+        before = self.project.to_dict()
+        if item.kind == IMAGE_KIND:
+            image = next((image for image in self.project.images if image.id == item.item_id), None)
+            if image is None:
+                return
+            locked = not image.rest_locked
+            self._set_image_rest_lock(image, locked)
+        elif item.kind == POINT_KIND:
+            point = self.project.point_by_id(item.item_id)
+            if point is None or not point.observations:
+                return
+            locked = not all(observation.locked for observation in point.observations)
+            for observation in point.observations:
+                observation.locked = locked
+        else:
+            return
+        self._record_project_edit(before, "Lock layer position" if locked else "Unlock layer position")
+        self._refresh_canvas()
+        self._refresh_details()
+
     def _on_layer_visibility_toggled(self, item: LayerItem, column: int) -> None:
+        if item.kind == CONSTRAINT_KIND:
+            return
         on_map = column == LayerTree.MAP_COLUMN
         if item.kind == IMAGE_KIND:
             target = next((image for image in self.project.images if image.id == item.item_id), None)
@@ -1357,15 +1533,6 @@ class MainWindow(QMainWindow):
         self._refresh_layers(force=True)
         if self.current_image_id not in {image.id for image in self.project.images}:
             self.current_image_id = self.project.images[0].id if self.project.images else None
-        if not self._selected_image_ids() and not self._selected_vector_ids() and self.current_image_id is not None:
-            current = next(
-                (self.image_list.item(row) for row in range(self.image_list.count())
-                 if self.image_list.item(row).item_id == self.current_image_id),
-                None,
-            )
-            self.image_list.blockSignals(True)
-            self.image_list.setCurrentItem(current)
-            self.image_list.blockSignals(False)
         self._refresh_canvas()
         self._refresh_details()
 
@@ -1411,6 +1578,7 @@ class MainWindow(QMainWindow):
             return
         image_ids = self._selected_image_ids()
         tree_points = [item.item_id for item in self.image_list.selected_point_items()]
+        tree_links = list(dict.fromkeys(item.item_id for item in self.image_list.selected_constraint_items()))
         current = self.image_list.currentItem()
         if current is not None and current.isSelected() and current.kind == IMAGE_KIND:
             self.current_image_id = current.item_id
@@ -1418,12 +1586,16 @@ class MainWindow(QMainWindow):
             self.current_image_id = image_ids[-1]
         elif len(tree_points) == 1:
             self.current_image_id = self.project.point_by_id(tree_points[0]).image_id or self.current_image_id
+        elif current is not None and current.isSelected() and current.kind == CONSTRAINT_KIND:
+            self.current_image_id = self.project.point_by_id(current.parent().item_id).image_id
         else:
             self.current_image_id = None
         additive = bool(QApplication.keyboardModifiers() & (
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         ))
-        if (image_ids or tree_points) and not additive:
+        if tree_links:
+            self.selected_constraint_ids = tree_links
+        elif not additive:
             self._clear_constraint_selection()
         if tree_points != self.selected_point_ids:
             self.selected_point_ids = tree_points
@@ -1622,7 +1794,7 @@ class MainWindow(QMainWindow):
         if self._aligned_view_active():
             return
         image = next((item for item in self.project.images if item.id == image_id), None)
-        if image is None:
+        if image is None or image.rest_locked:
             return
         image.position_x = x
         image.position_y = y
@@ -1666,7 +1838,7 @@ class MainWindow(QMainWindow):
             pixmap, error = (
                 self._display_pixmap_for_image(image) if show_clip else self._pixmap_for_image(image)
             )
-            if pixmap.isNull():
+            if pixmap.isNull() and (not self._background_images or error):
                 load_errors.append(f"{image.name}: {error or 'file not found'}")
             points = []
             for point in self.project.control_points:
@@ -1677,6 +1849,7 @@ class MainWindow(QMainWindow):
             layers.append({
                 "id": image.id,
                 "visible": image.visible,
+                "rest_locked": image.rest_locked,
                 "pixmap": pixmap,
                 "position_x": pose_x,
                 "position_y": pose_y,
@@ -1702,21 +1875,25 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _read_image_pixmap(path: str | Path) -> tuple[QPixmap, str]:
+        image, error = MainWindow._read_image_data(path)
+        return QPixmap.fromImage(image), error
+
+    @staticmethod
+    def _read_image_data(path: str | Path) -> tuple[QImage, str]:
         reader = QImageReader(str(path))
         reader.setAutoTransform(True)
         reader.setDecideFormatFromContent(True)
         image = reader.read()
         if not image.isNull():
-            return QPixmap.fromImage(image), ""
-
+            return image, ""
         qt_error = reader.errorString()
         try:
             return MainWindow._read_image_with_pillow(path), ""
         except Exception as error:
-            return QPixmap(), f"{qt_error}; Pillow fallback: {error}"
+            return QImage(), f"{qt_error}; Pillow fallback: {error}"
 
     @staticmethod
-    def _read_image_with_pillow(path: str | Path) -> QPixmap:
+    def _read_image_with_pillow(path: str | Path) -> QImage:
         from PIL import Image, ImageOps
 
         with Image.open(path) as source:
@@ -1732,21 +1909,64 @@ class MainWindow(QMainWindow):
                 converted.width * bytes_per_pixel,
                 image_format,
             ).copy()
-        return QPixmap.fromImage(image)
+        return image
 
     def _pixmap_for_image(self, image) -> tuple[QPixmap, str]:
         cached = self._image_pixmaps.get(image.id)
         if cached is not None:
             return cached, ""
+        if self._background_images:
+            if image.id in self._image_load_errors:
+                return QPixmap(), self._image_load_errors[image.id]
+            key = (self._image_load_generation, image.id, image.path)
+            self._loading_image_keys.add(key)
+            self._image_loader.request(key, image.path)
+            return QPixmap(), ""
         pixmap, error = self._read_image_pixmap(image.path)
         if not pixmap.isNull():
             self._image_pixmaps[image.id] = pixmap
         return pixmap, error
 
+    def _reset_image_loading(self, background: bool = False) -> None:
+        self._image_load_generation += 1
+        self._image_loader.clear_queued()
+        self._loading_image_keys.clear()
+        self._image_load_errors.clear()
+        self._image_refresh_timer.stop()
+        self._background_images = background
+
+    def _on_image_loaded(self, key: tuple, image: QImage, error: str) -> None:
+        generation, image_id, path = key
+        if generation != self._image_load_generation:
+            return
+        self._loading_image_keys.discard(key)
+        record = next((item for item in self.project.images if item.id == image_id and item.path == path), None)
+        if record is None:
+            return
+        if image.isNull():
+            self._image_load_errors[image_id] = error or "Could not decode image"
+        else:
+            self._image_pixmaps[image_id] = QPixmap.fromImage(image)
+        if not self._image_refresh_timer.isActive():
+            self._image_refresh_timer.start()
+
+    def _refresh_loaded_images(self) -> None:
+        self._refresh_canvas()
+        self._refresh_details()
+        self._refresh_world_map()
+        if self._loading_image_keys:
+            self.statusBar().showMessage(f"Loading {len(self._loading_image_keys)} remaining image(s)...")
+        elif self._image_load_errors:
+            failures = "; ".join(list(self._image_load_errors.values())[:3])
+            self.statusBar().showMessage(f"Could not display image(s): {failures}")
+        elif self.project_path is not None:
+            self.statusBar().showMessage(f"Opened {self.project_path}")
+
     def _refresh_constraints(self) -> None:
         if not hasattr(self, "details_stack"):
             return
         self.selected_constraint_ids = self._selected_constraint_ids()
+        self._refresh_layers()
         self.canvas.set_constraints([(item.first_point_id, item.second_point_id) for item in self.project.constraints])
         self._refresh_details()
 
@@ -2007,6 +2227,7 @@ class MainWindow(QMainWindow):
             f"Canvas ({'aligned' if self._aligned_view_active() and image.has_alignment else 'rest'}): "
             f"position ({pose_x or 0.0:.1f}, {pose_y:.1f}), "
             f"rotation {pose_rotation:.2f}°, scale {pose_scale:.4f}",
+            f"Rest transform: {'locked' if image.rest_locked else 'unlocked'}",
         ]
         if image.world_x is not None and image.world_y is not None:
             lines.append(
@@ -2142,19 +2363,23 @@ class MainWindow(QMainWindow):
         self._refresh_details()
 
     def toggle_selected_locks(self) -> None:
+        image_ids = set(self._selected_image_ids())
+        images = [image for image in self.project.images if image.id in image_ids]
         points = [self.project.point_by_id(point_id) for point_id in self._selected_point_ids()]
         observations = [item for point in points for item in point.observations]
-        if not observations:
+        if not observations and not images:
             return
-        # Unlock only when everything is already locked; otherwise lock all.
-        lock = not all(item.locked for item in observations)
+        lock = not all([image.rest_locked for image in images] + [item.locked for item in observations])
         before = self.project.to_dict()
+        for image in images:
+            self._set_image_rest_lock(image, lock)
         for point in points:
             for item in point.observations:
                 item.locked = lock
                 self.canvas.set_observation_locked(item.image_id, point.id, lock)
-        self._record_project_edit(before, "Lock point position" if lock else "Unlock point position")
-        self.statusBar().showMessage(f"{len(points)} point(s) {'locked' if lock else 'unlocked'}.")
+        self._record_project_edit(before, "Lock selected positions" if lock else "Unlock selected positions")
+        self._refresh_canvas()
+        self.statusBar().showMessage(f"{len(images)} image(s), {len(points)} point(s) {'locked' if lock else 'unlocked'}.")
         self._refresh_details()
 
     def _set_observation_lock(self, locked: bool) -> None:
@@ -2168,6 +2393,7 @@ class MainWindow(QMainWindow):
         self._record_project_edit(before, "Lock point position" if locked else "Unlock point position")
         state = "locked" if locked else "unlocked"
         self.statusBar().showMessage(f"'{point.name}' position in this image is {state}.")
+        self._refresh_layers()
         self._refresh_map_points()
 
     def _begin_point_observation_drag(self, _image_id: str, _point_id: str) -> None:
@@ -2485,14 +2711,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Control points linked by a tie constraint.")
 
     def delete_selected(self) -> None:
+        image_ids = self._selected_image_ids()
         point_ids = self._selected_point_ids()
         constraint_ids = self._selected_constraint_ids()
         if self._selected_vector_ids():
-            if not self.remove_selected_vectors() and not self._selected_image_ids():
+            if not self.remove_selected_vectors() and not image_ids:
                 return
             self.selected_point_ids = point_ids
             self.selected_constraint_ids = constraint_ids
-        if self._selected_image_ids():
+        if image_ids:
             if not self.remove_selected_image():
                 return
             # Removing images clears the point and link selection; restore what survived.
@@ -2520,6 +2747,8 @@ class MainWindow(QMainWindow):
             self._set_canvas_state("rest")
         layout = []
         for image in self.project.images:
+            if image.rest_locked:
+                continue
             pixmap, _error = self._pixmap_for_image(image)
             if pixmap.isNull():
                 continue
@@ -2693,11 +2922,11 @@ class MainWindow(QMainWindow):
         return True
 
     def remove_selected_image(self) -> bool:
+        image_ids = set(self._selected_image_ids())
         if self._selected_vector_ids():
             removed_vectors = self.remove_selected_vectors()
-            if not self._selected_image_ids():
+            if not image_ids:
                 return removed_vectors
-        image_ids = set(self._selected_image_ids())
         images = [item for item in self.project.images if item.id in image_ids]
         if not images:
             return False
@@ -2741,6 +2970,9 @@ class MainWindow(QMainWindow):
         self._refresh_points()
 
     def new_project(self) -> None:
+        self._startup_project = ""
+        self._startup_timer.stop()
+        self._reset_image_loading()
         self.undo_stack.clear()
         self.project = Project()
         self._image_pixmaps.clear()
@@ -2769,6 +3001,8 @@ class MainWindow(QMainWindow):
         self._open_project_path(path)
 
     def _open_project_path(self, path: str, quiet: bool = False) -> None:
+        self._startup_project = ""
+        self._startup_timer.stop()
         try:
             project = load_project(path)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -2778,8 +3012,10 @@ class MainWindow(QMainWindow):
         self._remember_directory(path)
         self._settings.setValue("last_project", str(Path(path).resolve()))
         self.undo_stack.clear()
+        self._reset_image_loading(background=True)
         self.project = project
         self._image_pixmaps.clear()
+        self._masked_pixmaps.clear()
         self.project_path = Path(path)
         self.current_image_id = project.images[0].id if project.images else None
         self.pending_point_id = None
@@ -2789,7 +3025,10 @@ class MainWindow(QMainWindow):
         self._clear_image_selection()
         self._refresh_points()
         self._restore_views()
-        self.statusBar().showMessage(f"Opened {path}")
+        if self._loading_image_keys:
+            self.statusBar().showMessage(f"Opened {path}. Loading {len(self._loading_image_keys)} image(s)...")
+        else:
+            self.statusBar().showMessage(f"Opened {path}")
 
     def _restore_views(self) -> None:
         if "canvas" in self.project.views:
@@ -2893,6 +3132,19 @@ class MainWindow(QMainWindow):
         link_indices = {
             index for index, item in enumerate(self.project.constraints) if item.id in chosen_links
         }
+        vector_ids = set(self._selected_vector_ids())
+        if panel is self.image_dock:
+            if selected_image_ids or point_ids or link_indices or vector_ids:
+                self.canvas.fit_items(selected_image_ids, point_ids, link_indices)
+                map_point_ids = set(point_ids)
+                for constraint in self.project.constraints:
+                    if constraint.id in chosen_links:
+                        map_point_ids.update((constraint.first_point_id, constraint.second_point_id))
+                self.world_map.fit_items(selected_image_ids, map_point_ids, vector_ids)
+            else:
+                self.canvas.fit_images()
+                self.world_map.fit_world()
+            return
         if point_ids or link_indices:
             self.canvas.fit_items(selected_image_ids, point_ids, link_indices)
             return

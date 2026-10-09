@@ -14,10 +14,9 @@ from PySide6.QtWidgets import (
 )
 
 from geostitch.masking import hidden_path, polygon_path
+from geostitch.icons import KIND_COLORS
 
 _ACCENT = QColor("#76cbb0")
-_POINT = QColor("#ffcc4d")
-_SELECTED_POINT = QColor("#ff6b6b")
 
 
 class ImageViewer(QGraphicsView):
@@ -109,8 +108,9 @@ class ImageViewer(QGraphicsView):
             marker = QGraphicsEllipseItem(-6, -6, 12, 12)
             marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
             marker.setPos(x, y)
-            marker.setPen(QPen(QColor("#14201d"), 2))
-            marker.setBrush(QBrush(_SELECTED_POINT if selected else _POINT))
+            color = QColor(KIND_COLORS["point"])
+            marker.setPen(QPen(color, 3 if selected else 2))
+            marker.setBrush(QBrush(color if selected else color.lighter(140)))
             marker.setZValue(30)
             marker.setData(0, point_id)
             label = QGraphicsSimpleTextItem(name, marker)

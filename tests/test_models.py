@@ -1,6 +1,17 @@
 from geostitch.models import GroundControlPoint, PointConstraint, Project
 
 
+def test_image_rest_lock_round_trips_and_legacy_defaults_unlocked():
+    project = Project()
+    image = project.add_image("locked.png")
+    image.rest_locked = True
+    assert Project.from_dict(project.to_dict()).images[0].rest_locked
+    legacy = project.to_dict()
+    legacy["version"] = 12
+    del legacy["images"][0]["rest_locked"]
+    assert not Project.from_dict(legacy).images[0].rest_locked
+
+
 def test_linked_point_stores_one_observation_per_image():
     project = Project()
     first_image = project.add_image("survey-a.tif")

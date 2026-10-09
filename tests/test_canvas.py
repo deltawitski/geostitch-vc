@@ -13,6 +13,53 @@ from geostitch.app import MainWindow
 from geostitch.adjustment import AlignmentResult
 from geostitch.georeference import GeoreferenceResult
 from geostitch.models import GroundControlPoint, PointConstraint
+from geostitch.icons import KIND_COLORS, kind_icon
+
+
+def test_canvas_element_colors_match_layer_palette_and_preserve_state_cues():
+    app = QApplication.instance() or QApplication([])
+    canvas = ImageCanvas()
+    pixmap = QPixmap(100, 80)
+    pixmap.fill(QColor("white"))
+    canvas.set_layers([
+        {"id": image_id, "pixmap": pixmap, "position_x": position, "position_y": 0,
+         "rotation": 0, "scale": 1, "points": [(point_id, 20, 30)]}
+        for image_id, position, point_id in [("first", 0, "point-a"), ("second", 150, "point-b")]
+    ], [("point-a", "point-b")])
+    try:
+        for kind in ("image", "point", "link"):
+            icon_color = kind_icon(kind).pixmap(8, 16).toImage().pixelColor(4, 8)
+            assert icon_color == QColor(KIND_COLORS[kind])
+        marker = canvas._point_items[("first", "point-a")]
+        rect = marker.rect()
+        normal_alpha = marker.brush().color().alpha()
+        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().style() == Qt.PenStyle.SolidLine
+        canvas.set_selected_points({"point-a"})
+        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().widthF() == 3
+        assert marker.brush().color().alpha() > normal_alpha
+        canvas.set_observation_locked("first", "point-a", True)
+        assert marker.pen().style() == Qt.PenStyle.DashLine
+        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        canvas.set_constraint_source("point-a")
+        assert marker.pen().style() == Qt.PenStyle.DotLine
+        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.rect() == rect
+        link = canvas._constraint_items[0]
+        assert link.pen().color() == QColor(KIND_COLORS["link"])
+        assert link.pen().style() == Qt.PenStyle.DashLine
+        canvas.set_selected_constraints({0})
+        link = canvas._constraint_items[0]
+        assert link.pen().color() == QColor(KIND_COLORS["link"])
+        assert link.pen().widthF() == 4
+        assert link.pen().style() == Qt.PenStyle.SolidLine
+        canvas.set_selected_images({"first"})
+        assert canvas._selection_outlines[0].pen().color() == QColor(KIND_COLORS["image"])
+        assert all(handle.brush().color() == QColor(KIND_COLORS["image"]) for handle in canvas._transform_handles)
+        assert canvas._transform_connector.pen().color() == QColor(KIND_COLORS["image"])
+    finally:
+        canvas.close()
 
 
 def drag_transform_handle(canvas, app, kind, delta):
@@ -607,6 +654,89 @@ def test_continuous_add_mode_creates_sequenced_points_in_clicked_images(tmp_path
     window.close()
 
 
+def test_locked_image_stays_fixed_during_group_drag_and_read_only_toggle():
+    app = QApplication.instance() or QApplication([])
+    canvas = ImageCanvas()
+    canvas.resize(800, 600)
+    pixmap = QPixmap(100, 80)
+    pixmap.fill(QColor("white"))
+    canvas.set_layers([
+        {"id": image_id, "pixmap": pixmap, "position_x": position, "position_y": 0,
+         "rotation": 0, "scale": 1, "points": [], "rest_locked": locked}
+        for image_id, position, locked in [("locked", 0, True), ("free", 200, False)]
+    ])
+    canvas.show()
+    app.processEvents()
+    canvas.fit_images()
+    canvas.set_active_image("locked")
+    assert not canvas._transform_handles
+    canvas.set_read_only(True)
+    canvas.set_read_only(False)
+    before = canvas.image_transform("locked")
+    canvas.set_image_position("locked", 50, 50)
+    canvas.set_image_transform("locked", rotation=30, scale=2)
+    assert canvas.image_transform("locked") == before
+
+    def drag(image_id):
+        start = canvas.mapFromScene(canvas._layers[image_id].mapToScene(QPointF(50, 40)))
+        end = start + QPoint(30, 20)
+        QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(canvas.viewport(), end, delay=20)
+        QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, pos=end)
+        app.processEvents()
+
+    try:
+        drag("locked")
+        assert canvas.image_transform("locked") == before
+        canvas.set_selected_images({"locked", "free"})
+        drag("free")
+        assert canvas.image_transform("locked") == before
+        assert canvas.image_transform("free")[:2] != (200, 0)
+    finally:
+        canvas.close()
+
+
+def test_lock_action_handles_images_and_points_with_undo_and_arrange(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(QSettings(str(tmp_path / "image-lock.ini"), QSettings.Format.IniFormat))
+    pixmap = QPixmap(100, 80)
+    pixmap.fill(QColor("white"))
+    first = window.project.add_image(tmp_path / "first.png")
+    second = window.project.add_image(tmp_path / "second.png")
+    first.position_x, first.position_y = 700, 800
+    second.position_x = 1000
+    for image in (first, second):
+        window._image_pixmaps[image.id] = pixmap
+    point = GroundControlPoint.create("point")
+    point.set_observation(first.id, 10, 20)
+    window.project.add_control_point(point)
+    window._refresh_all()
+    window._on_canvas_image_selected(first.id)
+    assert window.shortcut_actions["toggle_lock"].isEnabled()
+    window.selected_point_ids = [point.id]
+    try:
+        window.shortcut_actions["toggle_lock"].trigger()
+        assert first.rest_locked
+        assert point.observations[0].locked
+        assert not second.rest_locked
+        assert not window.canvas._transform_handles
+        window.undo_stack.undo()
+        assert not window.project.images[0].rest_locked
+        assert not window.project.control_points[0].observations[0].locked
+        window.undo_stack.redo()
+        assert window.project.images[0].rest_locked
+        window.arrange_images()
+        assert (window.project.images[0].position_x, window.project.images[0].position_y) == (700, 800)
+        window._on_canvas_image_selected(first.id)
+        window.selected_point_ids = [point.id]
+        window.toggle_selected_locks()
+        assert not window.project.images[0].rest_locked
+        assert not window.project.control_points[0].observations[0].locked
+        assert window.canvas._transform_handles
+    finally:
+        window.close()
+
+
 def test_observation_can_be_locked_and_dragged_after_unlock(tmp_path):
     app = QApplication.instance() or QApplication([])
     image_path = tmp_path / "point-lock.png"
@@ -935,9 +1065,11 @@ def test_clip_polygon_masks_display_pixmaps_and_is_undoable(tmp_path):
     pixmap.fill(QColor("red"))
     assert pixmap.save(str(image_path))
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    assert not window.canvas_clip_checkbox.isChecked()
     image = window.project.add_image(image_path)
     window.current_image_id = image.id
     window._refresh_all()
+    window._on_canvas_image_selected(image.id)
 
     window._on_mask_polygon_drawn([[10.0, 10.0], [50.0, 10.0], [50.0, 50.0], [10.0, 50.0]])
 

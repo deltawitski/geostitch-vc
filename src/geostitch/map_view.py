@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from math import floor, isfinite, log2
+from math import ceil, floor, isfinite, log2
 
 import numpy as np
 
-from PySide6.QtCore import QElapsedTimer, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 from PySide6.QtCore import QStandardPaths
+from geostitch.icons import KIND_COLORS
 
 
 class WorldMapView(QGraphicsView):
@@ -25,6 +26,7 @@ class WorldMapView(QGraphicsView):
     WORLD_ORIGIN = 20037508.342789244
     MIN_ZOOM = 0
     MAX_ZOOM = 19
+    MAX_VIEW_ZOOM = 22
     TILE_SIZE = 256
     coordinate_picked = Signal(float, float)
     MAX_VERTICES_PER_REDRAW = 400_000
@@ -91,7 +93,7 @@ class WorldMapView(QGraphicsView):
         self._position_attribution()
 
     def set_control_points(self, points: list[dict]) -> None:
-        """Draw control points: green = has map coordinates, yellow = placed via its image's transform; square = locked."""
+        """Draw points in their configured color; inferred coordinates are lighter and locked points are square."""
         for item in self._point_overlay_items:
             self._scene.removeItem(item)
         self._point_overlay_items.clear()
@@ -102,9 +104,11 @@ class WorldMapView(QGraphicsView):
                 marker = QGraphicsEllipseItem(-7, -7, 14, 14)
             marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
             marker.setPos(point["x"], -point["y"])
+            marker.setData(0, point.get("id"))
             selected = point.get("selected", False)
             marker.setPen(QPen(QColor("#ffffff") if selected else QColor("#14201d"), 3 if selected else 2))
-            marker.setBrush(QBrush(QColor("#4cd37b") if point["georeferenced"] else QColor("#ffcc4d")))
+            color = QColor(KIND_COLORS["point"])
+            marker.setBrush(QBrush(color if point["georeferenced"] else color.lighter(140)))
             marker.setZValue(8500)
             kind = "georeferenced" if point["georeferenced"] else "placed by image transform"
             marker.setToolTip(f"{point['name']} \u00b7 {kind} \u00b7 {'locked' if point['locked'] else 'unlocked'}")
@@ -173,7 +177,8 @@ class WorldMapView(QGraphicsView):
         pixel = 1.0 / scale if scale > 0 else 1.0
         margin = max(view.width(), view.height()) * 0.1
         view = view.adjusted(-margin, -margin, margin, margin)
-        stroke = QPen(QColor("#d98e04"), 2)
+        color = QColor(KIND_COLORS["geojson"])
+        stroke = QPen(color, 2)
         stroke.setCosmetic(True)
         budget = [self.MAX_VERTICES_PER_REDRAW]
         for index, vector in enumerate(self._vectors):
@@ -185,13 +190,15 @@ class WorldMapView(QGraphicsView):
                 item = QGraphicsPathItem(path)
                 item.setPen(stroke)
                 if closed:
-                    item.setBrush(QBrush(QColor(242, 184, 75, 60)))
+                    fill = QColor(color)
+                    fill.setAlpha(60)
+                    item.setBrush(QBrush(fill))
                 self._scene.addItem(item)
                 self._vector_items.append((item, index))
             dots = self._visible_points(data.points, view, pixel)
             if dots is not None:
                 item = QGraphicsPathItem(dots)
-                dot_pen = QPen(QColor("#f2b84b"), 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+                dot_pen = QPen(color, 8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
                 dot_pen.setCosmetic(True)
                 item.setPen(dot_pen)
                 self._scene.addItem(item)
@@ -257,7 +264,7 @@ class WorldMapView(QGraphicsView):
         marker = QGraphicsEllipseItem(-8, -8, 16, 16)
         marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
         marker.setPen(QPen(QColor("#14201d"), 2))
-        marker.setBrush(QBrush(QColor("#ffcc4d")))
+        marker.setBrush(QBrush(QColor(KIND_COLORS["point"])))
         marker.setPos(x, -y)
         marker.setZValue(9000)
         self._scene.addItem(marker)
@@ -289,6 +296,31 @@ class WorldMapView(QGraphicsView):
         margin_x = max(bounds.width() * 0.05, 1.0)
         margin_y = max(bounds.height() * 0.05, 1.0)
         self.fitInView(bounds.adjusted(-margin_x, -margin_y, margin_x, margin_y), Qt.AspectRatioMode.KeepAspectRatio)
+        self._clamp_view_scale()
+        self._zoom = self._zoom_for_scale(self.transform().m11())
+        self._update_visible_tiles()
+        self._position_attribution()
+
+    def fit_items(self, image_ids: set[str], point_ids: set[str], vector_ids: set[str]) -> None:
+        rects = [item.sceneBoundingRect() for image_id, item in self._image_items.items() if image_id in image_ids]
+        for vector in self._vectors:
+            extent = vector["data"].bounds
+            if vector["id"] in vector_ids and extent is not None:
+                rects.append(QRectF(extent[0], extent[1], extent[2] - extent[0], extent[3] - extent[1]))
+        for marker in self._point_overlay_items:
+            if marker.data(0) in point_ids:
+                rects.append(QRectF(marker.scenePos(), marker.scenePos()))
+        if not rects:
+            return
+        left = min(rect.left() for rect in rects)
+        right = max(rect.right() for rect in rects)
+        top = min(rect.top() for rect in rects)
+        bottom = max(rect.bottom() for rect in rects)
+        width = max(right - left, 120.0)
+        height = max(bottom - top, 120.0)
+        bounds = QRectF((left + right - width) / 2, (top + bottom - height) / 2, width, height)
+        self.fitInView(bounds.adjusted(-width * 0.05, -height * 0.05, width * 0.05, height * 0.05), Qt.AspectRatioMode.KeepAspectRatio)
+        self._clamp_view_scale()
         self._zoom = self._zoom_for_scale(self.transform().m11())
         self._update_visible_tiles()
         self._position_attribution()
@@ -303,8 +335,12 @@ class WorldMapView(QGraphicsView):
             scale = float(state["scale"])
         except (KeyError, TypeError, ValueError):
             return
-        if scale <= 0:
+        if scale <= 0 or not all(isfinite(value) for value in (scale, center_x, center_y)):
             return
+        minimum, maximum = self._scale_limits()
+        scale = min(maximum, max(minimum, scale))
+        center_x = min(self.WORLD_ORIGIN, max(-self.WORLD_ORIGIN, center_x))
+        center_y = min(self.WORLD_ORIGIN, max(-self.WORLD_ORIGIN, center_y))
         self.setTransform(QTransform.fromScale(scale, scale))
         self.centerOn(center_x, center_y)
         self._zoom = self._zoom_for_scale(scale)
@@ -353,13 +389,32 @@ class WorldMapView(QGraphicsView):
         self._restack_vector_items()
         self._position_attribution()
 
+    def _scale_limits(self) -> tuple[float, float]:
+        world_span = 2.0 * self.WORLD_ORIGIN
+        overview_pixels = max(1, min(self.viewport().width(), self.viewport().height()) - 4)
+        minimum = overview_pixels / (world_span * 1.1)
+        maximum = (self.TILE_SIZE * (1 << self.MAX_VIEW_ZOOM)) / (world_span * self.viewport().devicePixelRatioF())
+        return min(minimum, maximum), maximum
+
+    def _clamp_view_scale(self) -> None:
+        scale = self.transform().m11()
+        minimum, maximum = self._scale_limits()
+        bounded = min(maximum, max(minimum, scale))
+        if bounded != scale:
+            center = self.mapToScene(self.viewport().rect().center())
+            self.setTransform(QTransform.fromScale(bounded, bounded))
+            self.centerOn(center)
+
     def _zoom_for_scale(self, scale: float) -> int:
-        return min(self.MAX_ZOOM, max(self.MIN_ZOOM, round(log2(max(scale, 1e-12) * 156543.03392804097))))
+        physical_scale = max(scale, 1e-12) * self.viewport().devicePixelRatioF()
+        level = ceil(log2(physical_scale * 156543.03392804097) - 1e-9)
+        return min(self.MAX_ZOOM, max(self.MIN_ZOOM, level))
 
     def _update_visible_tiles(self) -> None:
         self._schedule_vector_update()
         if self.viewport().width() <= 0 or self.viewport().height() <= 0:
             return
+        self._zoom = self._zoom_for_scale(self.transform().m11())
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         tile_count = 1 << self._zoom
         tile_span = 2.0 * self.WORLD_ORIGIN / tile_count
@@ -405,6 +460,7 @@ class WorldMapView(QGraphicsView):
                 tile_count = 1 << zoom
                 tile_span = 2.0 * self.WORLD_ORIGIN / tile_count
                 item = self._scene.addPixmap(pixmap)
+                item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
                 item.setOffset(0.0, 0.0)
                 item.setScale(tile_span / self.TILE_SIZE)
                 item.setPos(-self.WORLD_ORIGIN + tile_x * tile_span, -self.WORLD_ORIGIN + tile_y * tile_span)
@@ -448,8 +504,16 @@ class WorldMapView(QGraphicsView):
             viewport_rect.right() - self._attribution.width() + 1, viewport_rect.bottom() - self._attribution.height() + 1
         )
 
+    def event(self, event) -> bool:
+        handled = super().event(event)
+        if event.type() == QEvent.Type.DevicePixelRatioChange and hasattr(self, "_manager"):
+            self._clamp_view_scale()
+            self._update_visible_tiles()
+        return handled
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._clamp_view_scale()
         self._update_visible_tiles()
         self._position_attribution()
 
@@ -459,9 +523,19 @@ class WorldMapView(QGraphicsView):
         self._position_attribution()
 
     def wheelEvent(self, event) -> None:
+        if event.angleDelta().y() == 0:
+            event.accept()
+            return
+        scale = self.transform().m11()
+        minimum, maximum = self._scale_limits()
+        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        bounded = min(maximum, max(minimum, scale * factor))
+        if bounded == scale:
+            event.accept()
+            return
         old_zoom = self._zoom
         scene_anchor = self.mapToScene(event.position().toPoint())
-        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
+        factor = bounded / scale
         self.scale(factor, factor)
         self._zoom = self._zoom_for_scale(self.transform().m11())
         if self._zoom != old_zoom:

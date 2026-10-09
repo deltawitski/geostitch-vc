@@ -30,6 +30,7 @@ class ImageRecord:
     aligned_scale: float = 1.0
     visible: bool = True
     map_visible: bool = True
+    rest_locked: bool = False
 
     @property
     def has_alignment(self) -> bool:
@@ -206,7 +207,7 @@ class Project:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 12,
+            "version": 13,
             "name": self.name,
             "crs": self.crs,
             "images": [json.loads(json.dumps(vars(image))) for image in self.images],
@@ -232,7 +233,7 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
-        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
             raise ValueError("This project uses an unsupported file version.")
         project = cls(name=data.get("name", "Untitled project"), crs=data.get("crs", "EPSG:4326"))
         project.images = [ImageRecord(**image) for image in data.get("images", [])]

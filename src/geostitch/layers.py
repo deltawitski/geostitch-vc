@@ -10,17 +10,18 @@ KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 IMAGE_KIND = "image"
 POINT_KIND = "point"
 VECTOR_KIND = "vector"
+CONSTRAINT_KIND = "link"
 
 
 class LayerItem(QTreeWidgetItem):
     """Tree row for an image or control point; `data(role)` defaults to the first column."""
 
     def __init__(self, kind: str, item_id: str, text: str):
-        super().__init__([text, "", ""])
+        super().__init__([text, "", "", ""])
         self.setData(0, ID_ROLE, item_id)
         self.setData(0, KIND_ROLE, kind)
         self.setIcon(0, kind_icon({VECTOR_KIND: "geojson"}.get(kind, kind)))
-        if kind == POINT_KIND:
+        if kind in (POINT_KIND, CONSTRAINT_KIND):
             self.setFlags(self.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
         # Rows stay drop-enabled so Qt accepts drops over their middle; `dropEvent` resolves above/below itself.
 
@@ -42,13 +43,16 @@ class LayerTree(QTreeWidget):
     """Images and GeoJSON layers as drag-reorderable top-level rows (top row is drawn in front), images holding their control points."""
 
     visibility_toggled = Signal(object, int)
+    lock_toggled = Signal(object)
     layers_reordered = Signal(list)
     EYE_COLUMN = 1
     MAP_COLUMN = 2
+    LOCK_COLUMN = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(3)
+        self._control_click_active = False
+        self.setColumnCount(4)
         self.setHeaderHidden(True)
         self.setIndentation(16)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -61,8 +65,10 @@ class LayerTree(QTreeWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.EYE_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(self.MAP_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.LOCK_COLUMN, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(self.EYE_COLUMN, 32)
         self.setColumnWidth(self.MAP_COLUMN, 32)
+        self.setColumnWidth(self.LOCK_COLUMN, 32)
 
     def _image_rows(self) -> list[LayerItem]:
         """Image rows from the bottom layer up, skipping GeoJSON rows."""
@@ -87,14 +93,46 @@ class LayerTree(QTreeWidget):
     def selected_vector_items(self) -> list[LayerItem]:
         return [item for item in super().selectedItems() if item.kind == VECTOR_KIND]
 
+    def selected_constraint_items(self) -> list[LayerItem]:
+        return [item for item in super().selectedItems() if item.kind == CONSTRAINT_KIND]
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self._control_click_active = False
             index = self.indexAt(event.position().toPoint())
-            if index.isValid() and index.column() in (self.EYE_COLUMN, self.MAP_COLUMN):
-                self.visibility_toggled.emit(self.itemFromIndex(index), index.column())
+            if index.isValid() and index.column() in (self.EYE_COLUMN, self.MAP_COLUMN, self.LOCK_COLUMN):
+                self._control_click_active = True
+                item = self.itemFromIndex(index)
+                if index.column() == self.LOCK_COLUMN:
+                    if item.kind in (IMAGE_KIND, POINT_KIND):
+                        self.lock_toggled.emit(item)
+                else:
+                    if item.kind != CONSTRAINT_KIND:
+                        self.visibility_toggled.emit(item, index.column())
                 event.accept()
                 return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._control_click_active:
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._control_click_active:
+            self._control_click_active = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            if index.isValid() and index.column() in (self.EYE_COLUMN, self.MAP_COLUMN, self.LOCK_COLUMN):
+                self.mousePressEvent(event)
+                return
+        super().mouseDoubleClickEvent(event)
 
     def dragMoveEvent(self, event) -> None:
         super().dragMoveEvent(event)
@@ -116,7 +154,9 @@ class LayerTree(QTreeWidget):
         if target is None:
             row = len(order)
         else:
-            layer = target.parent() or target
+            layer = target
+            while layer.parent() is not None:
+                layer = layer.parent()
             row = order.index(layer.item_id)
             below = target is not layer or position.y() > self.visualItemRect(layer).center().y()
             row += 1 if below else 0
