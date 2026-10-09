@@ -1,1 +1,1 @@
-"""GeoStitch control-point editor."""
+"""GeoStitch."""

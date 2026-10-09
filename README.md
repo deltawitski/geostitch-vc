@@ -1,6 +1,6 @@
 ﻿<div align="center">
 
-# 🧭 GeoStitch Control
+# 🧭 GeoStitch
 
 **Bring in raster images, stitch them together virtually, and georeference them against the real world.**
 
@@ -17,7 +17,7 @@
 
 ## ✨ Overview
 
-GeoStitch Control is a desktop workspace for turning a pile of unreferenced raster images (scanned maps, drone frames, survey sheets, aerial photos) into correctly placed, georeferenced layers.
+GeoStitch is a desktop workspace for turning a pile of unreferenced raster images (scanned maps, drone frames, survey sheets, aerial photos) into correctly placed, georeferenced layers.
 
 Instead of stitching pixels, you work **virtually**:
 

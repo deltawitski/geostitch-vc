@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geostitch-control"
+name = "geostitch"
 version = "0.1.0"
 description = "A desktop control-point workspace for image registration and georeferencing"
 readme = "README.md"
