@@ -105,6 +105,50 @@ def _draw_delete(p: QPainter) -> None:
     p.drawLine(QPointF(28, 20), QPointF(28, 34))
 
 
+def _draw_select(p: QPainter) -> None:
+    p.setPen(QPen(_COLOR, 3, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap))
+    p.drawRect(QRectF(7, 9, 26, 22))
+    p.setPen(QPen(_ACCENT, 3.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(30, 28), QPointF(42, 42))
+    p.drawLine(QPointF(30, 28), QPointF(30, 38))
+    p.drawLine(QPointF(30, 28), QPointF(40, 28))
+
+
+def _draw_lasso(p: QPainter) -> None:
+    p.setPen(QPen(_COLOR, 3, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap))
+    p.drawEllipse(QRectF(6, 7, 30, 22))
+    p.setPen(QPen(_ACCENT, 3.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(20, 29), QPointF(16, 37))
+    p.drawLine(QPointF(16, 37), QPointF(22, 42))
+    p.drawLine(QPointF(30, 28), QPointF(42, 42))
+    p.drawLine(QPointF(30, 28), QPointF(30, 38))
+    p.drawLine(QPointF(30, 28), QPointF(40, 28))
+
+
+def _draw_lock(p: QPainter) -> None:
+    p.drawRoundedRect(QRectF(10, 21, 28, 21), 3, 3)
+    p.drawArc(QRectF(15, 6, 18, 24), 0, 180 * 16)
+    p.drawLine(QPointF(15, 18), QPointF(15, 21))
+    p.drawLine(QPointF(33, 18), QPointF(33, 21))
+    p.setPen(QPen(_ACCENT, 3.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(QPointF(24, 29), QPointF(24, 35))
+
+
+def _draw_eye(p: QPainter) -> None:
+    p.drawArc(QRectF(4, 14, 40, 28), 0, 180 * 16)
+    p.drawArc(QRectF(4, 6, 40, 28), 180 * 16, 180 * 16)
+    p.setBrush(_ACCENT)
+    p.setPen(QPen(_ACCENT, 3))
+    p.drawEllipse(QPointF(24, 24), 6, 6)
+
+
+def _draw_eye_off(p: QPainter) -> None:
+    p.setPen(QPen(QColor("#6f7c78"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawArc(QRectF(4, 14, 40, 28), 0, 180 * 16)
+    p.drawArc(QRectF(4, 6, 40, 28), 180 * 16, 180 * 16)
+    p.drawLine(QPointF(8, 40), QPointF(40, 8))
+
+
 def _draw_alignment(p: QPainter) -> None:
     dashed = QPen(_COLOR, 3, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap)
     p.setPen(dashed)
@@ -141,6 +185,11 @@ _GLYPHS = {
     "link_points": _draw_link_points,
     "pick_gcp": _draw_pick_gcp,
     "delete": _draw_delete,
+    "lock": _draw_lock,
+    "select": _draw_select,
+    "lasso": _draw_lasso,
+    "eye": _draw_eye,
+    "eye_off": _draw_eye_off,
     "alignment": _draw_alignment,
     "aligned": _draw_aligned,
     "georeference": _draw_georeference,

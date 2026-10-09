@@ -28,6 +28,7 @@ class ImageRecord:
     aligned_y: float = 0.0
     aligned_rotation: float = 0.0
     aligned_scale: float = 1.0
+    visible: bool = True
 
     @property
     def has_alignment(self) -> bool:
@@ -59,6 +60,7 @@ class GroundControlPoint:
     geographic_y: float | None = None
     observations: list[Observation] = field(default_factory=list)
     label: str | None = None
+    visible: bool = True
 
     @property
     def image_id(self) -> str | None:
@@ -109,7 +111,7 @@ class PointConstraint:
 @dataclass
 class Project:
     name: str = "Untitled project"
-    crs: str = "EPSG:4326"
+    crs: str = "EPSG:3857"
     images: list[ImageRecord] = field(default_factory=list)
     control_points: list[GroundControlPoint] = field(default_factory=list)
     constraints: list[PointConstraint] = field(default_factory=list)
@@ -177,7 +179,7 @@ class Project:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 10,
+            "version": 11,
             "name": self.name,
             "crs": self.crs,
             "images": [json.loads(json.dumps(vars(image))) for image in self.images],
@@ -186,6 +188,7 @@ class Project:
                     "id": point.id,
                     "name": point.name,
                     "label": point.label,
+                    "visible": point.visible,
                     "geographic_x": point.geographic_x,
                     "geographic_y": point.geographic_y,
                     "observations": [vars(observation).copy() for observation in point.observations],
@@ -199,7 +202,7 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
-        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             raise ValueError("This project uses an unsupported file version.")
         project = cls(name=data.get("name", "Untitled project"), crs=data.get("crs", "EPSG:4326"))
         project.images = [ImageRecord(**image) for image in data.get("images", [])]
@@ -211,6 +214,7 @@ class Project:
                 id=point["id"],
                 name=point["name"],
                 label=point.get("label"),
+                visible=bool(point.get("visible", True)),
                 geographic_x=point.get("geographic_x"),
                 geographic_y=point.get("geographic_y"),
                 observations=[Observation(**observation) for observation in point.get("observations", [])],

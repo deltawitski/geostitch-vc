@@ -228,10 +228,15 @@ def test_fit_action_passes_selected_image_ids_or_none_for_all_images(monkeypatch
     assert fit_calls[-1] is None
 
     window.image_list.setCurrentItem(window.image_list.item(0))
-    window.image_list.item(1).setSelected(True)
+    window.image_list.clearSelection()
+    window.image_list.item(0).setSelected(True)
     selected_image_id = window.image_list.selectedItems()[0].data(Qt.ItemDataRole.UserRole)
     window._fit_canvas()
     assert fit_calls[-1] == {selected_image_id}
+
+    window.image_list.item(1).setSelected(True)
+    window._fit_canvas()
+    assert len(fit_calls[-1]) == 2
     window.close()
 
 

@@ -9,9 +9,10 @@ from geostitch.adjustment import AlignmentResult, simulate_alignment
 from geostitch.georeference import GeoreferenceResult, simulate_georeference
 from geostitch.map_view import WorldMapView
 from pyproj import CRS, Transformer
+from shiboken6 import isValid
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QRectF, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QCursor, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QItemSelectionModel, QRectF, QSettings, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -49,6 +50,8 @@ from PySide6.QtWidgets import (
 from geostitch.canvas import ImageCanvas
 from geostitch.export import FORMATS as EXPORT_FORMATS, export_project_images
 from geostitch.icons import app_icon, make_icon
+from geostitch.default_layout import DEFAULT_DOCK_STATE, DEFAULT_GEOMETRY
+from geostitch.layers import IMAGE_KIND, POINT_KIND, LayerItem, LayerTree
 from geostitch.image_view import ImageViewer
 from geostitch.masking import masked_pixmap
 from geostitch.models import GroundControlPoint, PointConstraint, Project
@@ -167,6 +170,9 @@ class MainWindow(QMainWindow):
         "new_project": ("New project", "Ctrl+N"),
         "open_project": ("Open project", "Ctrl+O"),
         "save_project": ("Save project", "Ctrl+S"),
+        "save_project_as": ("Save project as...", "Ctrl+Shift+S"),
+        "select_all": ("Select all", "Ctrl+A"),
+        "deselect_all": ("Deselect all", "Ctrl+D"),
         "import_images": ("Import images", "Ctrl+I"),
         "export_images": ("Export georeferenced images", "Ctrl+E"),
         "fit_images": ("Fit current view", "Ctrl+Shift+F"),
@@ -179,7 +185,9 @@ class MainWindow(QMainWindow):
         "link_points": ("Toggle Link points", "L"),
         "pick_gcp": ("Pick GCP coordinate on map", "G"),
         "update_point": ("Update selected point", ""),
-        "delete_point": ("Delete selected point", "Delete"),
+        "delete_point": ("Delete selected", "Delete"),
+        "toggle_lock": ("Lock / unlock selected points", "K"),
+        "lasso_select": ("Lasso selection (off: rectangle)", "S"),
         "create_constraint": ("Link selected point to...", "Ctrl+Shift+L"),
         "remove_constraint": ("Remove selected link", ""),
         "remove_image": ("Remove selected image", ""),
@@ -206,13 +214,14 @@ class MainWindow(QMainWindow):
         self._image_pixmaps: dict[str, QPixmap] = {}
         self._masked_pixmaps: dict[str, tuple[tuple, QPixmap, QPixmap]] = {}
         self.current_image_id: str | None = None
+        self._layers_signature: list | None = None
         self.pending_point_id: str | None = None
         self.add_points_mode = False
         self.link_points_mode = False
         self.pending_constraint_point_id: str | None = None
         self.pending_constraint_image_id: str | None = None
-        self.selected_point_id: str | None = None
-        self.selected_constraint_id: str | None = None
+        self.selected_point_ids: list[str] = []
+        self.selected_constraint_ids: list[str] = []
         self._last_active_dock: QDockWidget | None = None
         self._maximized_dock: QDockWidget | None = None
         self._hidden_docks: list[QDockWidget] = []
@@ -239,6 +248,9 @@ class MainWindow(QMainWindow):
             ("new_project", "New", self.new_project),
             ("open_project", "Open", self.open_project),
             ("save_project", "Save", self.save_current_project),
+            ("save_project_as", "Save as", self.save_project_as),
+            ("select_all", "Select all", self.select_all),
+            ("deselect_all", "Deselect all", self.deselect_all),
             ("import_images", "Import images", self.import_images),
             ("export_images", "Export georeferenced images", self.export_georeferenced_images),
         ):
@@ -258,7 +270,6 @@ class MainWindow(QMainWindow):
         self.link_points_action.toggled.connect(self._set_link_points_mode)
         self.pick_gcp_action = self._register_shortcut_action("pick_gcp", "Pick GCP coordinate on map", None)
         self.pick_gcp_action.setCheckable(True)
-        self.pick_gcp_action.setVisible(False)
         self.pick_gcp_action.setToolTip("Click the map to set geographic coordinates on the selected control point")
         self.pick_gcp_action.toggled.connect(self._set_map_pick_mode)
         self.toggle_alignment_action = self._register_shortcut_action("toggle_alignment", "Aligned layout", None)
@@ -266,22 +277,37 @@ class MainWindow(QMainWindow):
         self.toggle_alignment_action.setEnabled(False)
         self.toggle_alignment_action.toggled.connect(self._on_toggle_alignment)
         self._register_shortcut_action("maximize_dock", "Maximize panel", self.toggle_maximize_dock)
+        self._register_shortcut_action("toggle_lock", "Lock / unlock selected points", self.toggle_selected_locks)
+        self.lasso_action = self._register_shortcut_action("lasso_select", "Lasso selection", None)
+        self.lasso_action.setCheckable(True)
+        self.lasso_action.toggled.connect(self._on_lasso_toggled)
 
         image_panel = QWidget()
         image_layout = QVBoxLayout(image_panel)
         image_layout.setContentsMargins(12, 14, 8, 12)
-        image_title = QLabel("IMAGES")
+        image_title = QLabel("LAYERS")
         image_title.setObjectName("sectionTitle")
-        image_layout.addWidget(image_title)
-        self.image_list = QListWidget()
-        self.image_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
-        self.image_list.currentItemChanged.connect(self._on_image_selected)
+        title_row = QHBoxLayout()
+        title_row.addWidget(image_title)
+        title_row.addStretch(1)
+        for text, tooltip, name in (("+", "Expand all layers", "expandAll"), ("\u2212", "Collapse all layers", "collapseAll")):
+            button = QToolButton()
+            button.setText(text)
+            button.setToolTip(tooltip)
+            button.setAutoRaise(True)
+            button.clicked.connect(lambda _checked=False, method=name: getattr(self.image_list, method)())
+            title_row.addWidget(button)
+        image_layout.addLayout(title_row)
+        self.image_list = LayerTree()
+        self.image_list.itemSelectionChanged.connect(self._on_image_selected)
+        self.image_list.visibility_toggled.connect(self._on_layer_visibility_toggled)
+        self.image_list.layers_reordered.connect(self._on_layers_reordered)
         image_layout.addWidget(self.image_list, 1)
         remove_image_action = self._register_shortcut_action("remove_image", "Remove selected image", self.remove_selected_image)
         remove_image_button = QPushButton(remove_image_action.text())
         remove_image_button.clicked.connect(remove_image_action.trigger)
         image_layout.addWidget(remove_image_button)
-        self.image_dock = self._create_panel_dock("imagesDock", "Images", image_panel)
+        self.image_dock = self._create_panel_dock("imagesDock", "Layers", image_panel)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.image_dock)
 
         self.canvas = ImageCanvas()
@@ -297,6 +323,11 @@ class MainWindow(QMainWindow):
         self.canvas.point_marker_missed.connect(self._on_constraint_point_missed)
         self.canvas.files_dropped.connect(self._import_image_paths)
         self.canvas.image_selected.connect(self._on_canvas_image_selected)
+        self.canvas.image_toggled.connect(self._on_canvas_image_toggled)
+        self.canvas.area_selected.connect(self._on_canvas_area_selected)
+        self.canvas.constraint_clicked.connect(self._on_canvas_constraint_clicked)
+        self.canvas.constraint_toggled.connect(self._on_canvas_constraint_toggled)
+        self.canvas.point_marker_toggled.connect(self._on_canvas_point_toggled)
         self.canvas.transform_changed.connect(self._on_image_transform_changed)
         self.canvas.transform_interaction_started.connect(lambda _image_id: self._begin_project_edit("Transform image"))
         self.canvas.transform_interaction_finished.connect(lambda _image_id: self._finish_project_edit())
@@ -365,7 +396,7 @@ class MainWindow(QMainWindow):
         self.hint_label.setObjectName("shortcutHints")
         self.statusBar().addPermanentWidget(self.hint_label)
         for signal in (
-            self.image_list.currentItemChanged,
+            self.image_list.itemSelectionChanged,
             self.add_points_action.toggled,
             self.link_points_action.toggled,
             self.undo_stack.indexChanged,
@@ -380,6 +411,7 @@ class MainWindow(QMainWindow):
             self._build_image_page(),
             self._build_point_page(),
             self._build_constraint_page(),
+            self._build_selection_page(),
         ):
             self.details_stack.addWidget(page)
         panel = QWidget()
@@ -490,13 +522,23 @@ class MainWindow(QMainWindow):
         layout.addLayout(form)
         layout.addWidget(self._action_button("update_point", "Update selected point", self.update_selected_point, primary=True))
         layout.addWidget(self._action_button("create_constraint", "Link selected point to...", self.create_constraint))
-        layout.addWidget(self._action_button("delete_point", "Delete selected point", self.remove_selected_point))
+        layout.addWidget(self._action_button("delete_point", "Delete selected", self.delete_selected))
         layout.addWidget(self._section_label("IMAGE"))
         self.point_observations_list = self._make_list(self._on_detail_observation_clicked)
         layout.addWidget(self.point_observations_list, 1)
         layout.addWidget(self._section_label("LINKS"))
         self.point_links_list = self._make_list(self._on_detail_link_clicked)
         layout.addWidget(self.point_links_list, 1)
+        return page
+
+    def _build_selection_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.selection_info_label = self._info_label()
+        layout.addWidget(self.selection_info_label)
+        self.selection_list = QListWidget()
+        layout.addWidget(self.selection_list, 1)
         return page
 
     def _build_constraint_page(self) -> QWidget:
@@ -523,7 +565,7 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        for key in ("new_project", "open_project", "save_project"):
+        for key in ("new_project", "open_project", "save_project", "save_project_as"):
             file_menu.addAction(self.shortcut_actions[key])
         file_menu.addSeparator()
         file_menu.addAction(self.shortcut_actions["import_images"])
@@ -543,6 +585,9 @@ class MainWindow(QMainWindow):
         redo_action.setEnabled(False)
         edit_menu.addAction(undo_action)
         edit_menu.addAction(redo_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.shortcut_actions["select_all"])
+        edit_menu.addAction(self.shortcut_actions["deselect_all"])
 
         image_menu = self.menuBar().addMenu("Image")
         image_menu.addAction(self.shortcut_actions["arrange_images"])
@@ -564,7 +609,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(reset_layout_action)
 
         control_points_menu = self.menuBar().addMenu("Control Points")
-        for key in ("add_points", "update_point", "delete_point"):
+        for key in ("add_points", "update_point", "toggle_lock", "delete_point"):
             control_points_menu.addAction(self.shortcut_actions[key])
 
         constraints_menu = self.menuBar().addMenu("Constraints")
@@ -589,7 +634,9 @@ class MainWindow(QMainWindow):
         "add_points": ("add_points", "Toggle: click images to add control points continuously"),
         "link_points": ("link_points", "Toggle: click matching points in two images to link them"),
         "pick_gcp": ("pick_gcp", "Toggle: click the world map to set the selected control point's coordinates"),
-        "delete_point": ("delete", "Delete the selected control point and its links"),
+        "delete_point": ("delete", "Delete the selected images, control points, or link"),
+        "toggle_lock": ("lock", "Lock or unlock the position of the selected control points in their images"),
+        "lasso_select": ("select", "Drag on the canvas to select items: rectangle, or freehand lasso when toggled on. Ctrl adds, Shift drags over images"),
         "simulate_alignment": ("alignment", "Align constraint-linked images relative to each other"),
         "georeference": ("georeference", "Solve world transforms from control points with geographic coordinates"),
         "undo": ("undo", "Undo the last change"),
@@ -605,7 +652,7 @@ class MainWindow(QMainWindow):
         groups = (
             ("new_project", "open_project", "save_project"),
             ("import_images", "export_images", "arrange_images", "fit_images"),
-            ("add_points", "link_points", "pick_gcp", "delete_point"),
+            ("lasso_select", "add_points", "link_points", "pick_gcp", "toggle_lock", "delete_point"),
             ("simulate_alignment", "toggle_alignment", "georeference"),
             ("undo", "redo"),
         )
@@ -636,7 +683,7 @@ class MainWindow(QMainWindow):
         has_images = bool(project.images)
         point = self._selected_point()
         constraint = self._selected_constraint()
-        has_image_selection = self.current_image_id is not None and bool(self.image_list.selectedItems())
+        has_image_selection = bool(self._selected_image_ids())
         has_geographic_points = any(
             item.geographic_x is not None and item.geographic_y is not None and item.observations
             for item in project.control_points
@@ -650,8 +697,9 @@ class MainWindow(QMainWindow):
             "georeference": has_geographic_points,
             "toggle_alignment": any(item.has_alignment for item in project.images),
             "create_constraint": point is not None and linkable,
-            "remove_constraint": constraint is not None,
-            "delete_point": point is not None,
+            "remove_constraint": bool(self._selected_constraint_ids()),
+            "delete_point": bool(self._selected_constraint_ids()) or bool(self._selected_point_ids()) or has_image_selection,
+            "toggle_lock": bool(self._selected_point_ids()),
             "pick_gcp": point is not None,
             "update_point": point is not None,
             "remove_image": has_image_selection,
@@ -664,7 +712,6 @@ class MainWindow(QMainWindow):
         self.toggle_alignment_action.blockSignals(True)
         self.toggle_alignment_action.setChecked(self._aligned_view_active())
         self.toggle_alignment_action.blockSignals(False)
-        self.pick_gcp_action.setVisible(point is not None)
         if point is None and self.pick_gcp_action.isChecked():
             self.pick_gcp_action.setChecked(False)
 
@@ -681,10 +728,10 @@ class MainWindow(QMainWindow):
                     hints.append(("create_constraint", "Link to..."))
                 hints.append(("delete_point", "Delete point"))
             elif constraint is not None:
-                hints.append(("remove_constraint", "Remove link"))
+                hints.append(("delete_point", "Remove link"))
             elif has_image_selection:
                 hints.append(("fit_images", "Fit image"))
-                hints.append(("remove_image", "Remove image"))
+                hints.append(("delete_point", "Remove image"))
             if enabled["simulate_alignment"]:
                 hints.append(("simulate_alignment", "Align"))
             if enabled["toggle_alignment"]:
@@ -769,30 +816,17 @@ class MainWindow(QMainWindow):
         return dock
 
     def _restore_window_layout(self) -> None:
-        geometry = self._settings.value("window/geometry")
-        state = self._settings.value("window/dockState")
-        if geometry:
-            self.restoreGeometry(geometry)
-        if state:
-            self.restoreState(state, 3)
+        geometry = self._settings.value("window/geometry") or DEFAULT_GEOMETRY
+        state = self._settings.value("window/dockState") or DEFAULT_DOCK_STATE
+        self.restoreGeometry(geometry)
+        self.restoreState(state, 3)
 
     def reset_panel_layout(self) -> None:
         self._settings.remove("window/dockState")
         self._settings.remove("window/geometry")
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.image_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.canvas_dock)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.details_dock)
-        self.splitDockWidget(self.image_dock, self.canvas_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self.canvas_dock, self.details_dock, Qt.Orientation.Horizontal)
-        self.splitDockWidget(self.canvas_dock, self.world_map_dock, Qt.Orientation.Vertical)
-        self.image_dock.show()
-        self.canvas_dock.show()
-        self.details_dock.show()
-        self.world_map_dock.show()
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.image_view_dock)
-        self.splitDockWidget(self.world_map_dock, self.image_view_dock, Qt.Orientation.Horizontal)
-        self.image_view_dock.show()
-        self.resize(1320, 820)
+        self._restore_docks()
+        self.restoreGeometry(DEFAULT_GEOMETRY)
+        self.restoreState(DEFAULT_DOCK_STATE, 3)
         self._settings.sync()
 
     def closeEvent(self, event) -> None:
@@ -923,13 +957,15 @@ class MainWindow(QMainWindow):
                 QMenu::separator { height: 1px; background-color: #465553; margin: 4px 8px; }
                 QLabel#sectionTitle { color: #76cbb0; font-size: 9pt; font-weight: 700; }
                 QLabel#instruction { color: #a8b8b1; padding: 5px 0; }
-                QListWidget, QTableWidget, QLineEdit {
+                QListWidget, QTableWidget, QLineEdit, QTreeWidget {
                     background-color: #141a1b; color: #e8efeb;
                     border: 1px solid #465553; border-radius: 3px;
                     selection-background-color: #267663; selection-color: #ffffff;
                 }
                 QListWidget::item { padding: 7px 5px; }
                 QListWidget::item:selected { background-color: #245548; color: #ffffff; }
+                QTreeWidget::item { padding: 5px 3px; }
+                QTreeWidget::item:selected { background-color: #245548; color: #ffffff; }
                 QTableWidget { alternate-background-color: #20292a; gridline-color: #344140; }
                 QHeaderView::section { background-color: #293434; color: #dce7e1; border: 0; padding: 6px; font-weight: 600; }
                 QPushButton {
@@ -1097,23 +1133,100 @@ class MainWindow(QMainWindow):
         self._refresh_world_map()
         self.statusBar().showMessage(f"Set '{point.name}' to {map_x:.6f}, {map_y:.6f} ({self.project.crs}).")
 
+    def _refresh_layers(self, force: bool = False) -> None:
+        points_by_image: dict[str, list[GroundControlPoint]] = {}
+        for point in self.project.control_points:
+            if point.image_id:
+                points_by_image.setdefault(point.image_id, []).append(point)
+        # Top row is the front-most layer, so the tree lists images in reverse z-order.
+        images = list(reversed(self.project.images))
+        signature = [
+            (image.id, image.name, image.visible, [(p.id, p.name, p.visible) for p in points_by_image.get(image.id, [])])
+            for image in images
+        ]
+        if not force and signature == self._layers_signature:
+            return
+        self._layers_signature = signature
+        tree = self.image_list
+        expanded = {
+            tree.topLevelItem(row).item_id for row in range(tree.topLevelItemCount())
+            if tree.topLevelItem(row).isExpanded()
+        }
+        selected_images = set(self._selected_image_ids())
+        tree.blockSignals(True)
+        tree.clear()
+        for image in images:
+            top = LayerItem(IMAGE_KIND, image.id, image.name)
+            top.setToolTip(0, image.path)
+            self._style_layer_item(top, image.visible, image.visible)
+            for point in points_by_image.get(image.id, []):
+                child = LayerItem(POINT_KIND, point.id, point.name)
+                self._style_layer_item(child, point.visible, point.visible and image.visible)
+                top.addChild(child)
+            tree.addTopLevelItem(top)
+            top.setExpanded(image.id in expanded)
+            top.setSelected(image.id in selected_images)
+        tree.blockSignals(False)
+        self._sync_tree_points()
+
+    @staticmethod
+    def _style_layer_item(item: LayerItem, visible: bool, shown: bool) -> None:
+        item.setIcon(LayerTree.EYE_COLUMN, make_icon("eye" if visible else "eye_off"))
+        item.setToolTip(LayerTree.EYE_COLUMN, "Hide on canvas" if visible else "Show on canvas")
+        if not shown:
+            item.setForeground(0, QBrush(QColor("#6f7c78")))
+
+    def _sync_tree_points(self) -> None:
+        chosen = set(self._selected_point_ids())
+        tree = self.image_list
+        tree.blockSignals(True)
+        for row in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(row)
+            for index in range(top.childCount()):
+                child = top.child(index)
+                selected = child.item_id in chosen
+                child.setSelected(selected)
+                if selected:
+                    top.setExpanded(True)
+        tree.blockSignals(False)
+
+    def _on_layer_visibility_toggled(self, item: LayerItem) -> None:
+        if item.kind == IMAGE_KIND:
+            target = next((image for image in self.project.images if image.id == item.item_id), None)
+        else:
+            target = self.project.point_by_id(item.item_id)
+        if target is None:
+            return
+        before = self.project.to_dict()
+        target.visible = not target.visible
+        self._record_project_edit(before, "Show layer" if target.visible else "Hide layer")
+        self._refresh_canvas()
+        self._refresh_details()
+
+    def _on_layers_reordered(self, top_to_bottom: list) -> None:
+        by_id = {image.id: image for image in self.project.images}
+        ordered = [by_id[image_id] for image_id in reversed(top_to_bottom) if image_id in by_id]
+        if len(ordered) != len(self.project.images):
+            return
+        before = self.project.to_dict()
+        self.project.images = ordered
+        self._record_project_edit(before, "Reorder layers")
+        self._refresh_images()
+        self.statusBar().showMessage("Layer order updated. Top layers are drawn in front.")
+
     def _refresh_images(self) -> None:
-        self.image_list.blockSignals(True)
-        self.image_list.clear()
-        selected_item = None
-        for image in self.project.images:
-            item = QListWidgetItem(image.name)
-            item.setData(Qt.ItemDataRole.UserRole, image.id)
-            item.setToolTip(image.path)
-            self.image_list.addItem(item)
-            if image.id == self.current_image_id:
-                selected_item = item
-        if selected_item is None and self.project.images:
-            selected_item = self.image_list.item(0)
-            self.current_image_id = selected_item.data(Qt.ItemDataRole.UserRole)
-        if selected_item is not None:
-            self.image_list.setCurrentItem(selected_item)
-        self.image_list.blockSignals(False)
+        self._refresh_layers(force=True)
+        if self.current_image_id not in {image.id for image in self.project.images}:
+            self.current_image_id = self.project.images[0].id if self.project.images else None
+        if not self._selected_image_ids() and self.current_image_id is not None:
+            current = next(
+                (self.image_list.item(row) for row in range(self.image_list.count())
+                 if self.image_list.item(row).item_id == self.current_image_id),
+                None,
+            )
+            self.image_list.blockSignals(True)
+            self.image_list.setCurrentItem(current)
+            self.image_list.blockSignals(False)
         self._refresh_canvas()
         self._refresh_details()
 
@@ -1125,22 +1238,52 @@ class MainWindow(QMainWindow):
         self._refresh_canvas()
         self._refresh_constraints()
 
+    @property
+    def selected_point_id(self) -> str | None:
+        return self.selected_point_ids[0] if len(self.selected_point_ids) == 1 else None
+
+    @selected_point_id.setter
+    def selected_point_id(self, point_id: str | None) -> None:
+        self.selected_point_ids = [point_id] if point_id else []
+
+    def _selected_point_ids(self) -> list[str]:
+        return [point_id for point_id in self.selected_point_ids if self.project.point_by_id(point_id) is not None]
+
+    def _selected_image_ids(self) -> list[str]:
+        if not isValid(self.image_list):
+            return []
+        return [item.data(Qt.ItemDataRole.UserRole) for item in self.image_list.selectedItems()]
+
     def _selected_point_id(self) -> str | None:
-        point_id = self.selected_point_id
-        return point_id if point_id and self.project.point_by_id(point_id) is not None else None
+        point_ids = self._selected_point_ids()
+        return point_ids[0] if len(point_ids) == 1 else None
 
     def _selected_point(self) -> GroundControlPoint | None:
         point_id = self._selected_point_id()
         return self.project.point_by_id(point_id) if point_id else None
 
-    def _on_image_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
-        if self._syncing_selection:
+    def _on_image_selected(self) -> None:
+        if self._syncing_selection or not isValid(self.image_list):
             return
-        self.current_image_id = current.data(Qt.ItemDataRole.UserRole) if current else None
-        if current is not None:
-            self._clear_point_selection()
+        image_ids = self._selected_image_ids()
+        tree_points = [item.item_id for item in self.image_list.selected_point_items()]
+        current = self.image_list.currentItem()
+        if current is not None and current.isSelected() and current.kind == IMAGE_KIND:
+            self.current_image_id = current.item_id
+        elif image_ids:
+            self.current_image_id = image_ids[-1]
+        elif len(tree_points) == 1:
+            self.current_image_id = self.project.point_by_id(tree_points[0]).image_id or self.current_image_id
+        else:
+            self.current_image_id = None
+        additive = bool(QApplication.keyboardModifiers() & (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        ))
+        if (image_ids or tree_points) and not additive:
             self._clear_constraint_selection()
-        self.canvas.set_active_image(self.current_image_id)
+        if tree_points != self.selected_point_ids:
+            self.selected_point_ids = tree_points
+            self.pending_point_id = None
         self._refresh_points()
 
     def _clear_image_selection(self, keep_context: bool = False) -> None:
@@ -1161,23 +1304,133 @@ class MainWindow(QMainWindow):
         self._clear_point_selection()
         self._clear_constraint_selection()
         self.image_list.blockSignals(True)
+        self.image_list.clearSelection()
         for row in range(self.image_list.count()):
             item = self.image_list.item(row)
             if item.data(Qt.ItemDataRole.UserRole) == image_id:
                 self.image_list.setCurrentItem(item)
+                item.setSelected(True)
                 break
         self.image_list.blockSignals(False)
         self._refresh_points()
         self.statusBar().showMessage("Drag images to move them. Use corner handles to scale and the top handle to rotate.")
 
+    def _on_lasso_toggled(self, enabled: bool) -> None:
+        self.canvas.set_selection_mode("lasso" if enabled else "rect")
+        self.lasso_action.setIcon(make_icon("lasso" if enabled else "select"))
+        self.statusBar().showMessage(
+            "Lasso selection: drag a freehand outline on the canvas." if enabled
+            else "Rectangle selection: drag a box on the canvas."
+        )
+
+    def _on_canvas_area_selected(self, image_ids: list, point_keys: list, constraint_indices: list, additive: bool) -> None:
+        if self.add_points_mode or self.link_points_mode:
+            return
+        point_ids = [point_id for _image_id, point_id in point_keys]
+        link_ids = [
+            self.project.constraints[index].id for index in constraint_indices
+            if 0 <= index < len(self.project.constraints)
+        ]
+        if additive:
+            image_ids = [*self._selected_image_ids(), *(item for item in image_ids if item not in self._selected_image_ids())]
+            point_ids = [*self._selected_point_ids(), *(item for item in point_ids if item not in self.selected_point_ids)]
+            link_ids = [*self._selected_constraint_ids(), *(item for item in link_ids if item not in self.selected_constraint_ids)]
+        if not (image_ids or point_ids or link_ids):
+            self._on_canvas_background_clicked()
+            return
+        chosen_images = set(image_ids)
+        self.image_list.blockSignals(True)
+        self.image_list.clearSelection()
+        last_item = None
+        for row in range(self.image_list.count()):
+            item = self.image_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) in chosen_images:
+                item.setSelected(True)
+                last_item = item
+        # NoUpdate keeps the multi-selection; a plain setCurrentItem would collapse it to one row.
+        self.image_list.setCurrentItem(last_item, 0, QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.image_list.blockSignals(False)
+        if last_item is not None:
+            self.current_image_id = last_item.data(Qt.ItemDataRole.UserRole)
+        self.selected_point_ids = point_ids
+        self.selected_constraint_ids = link_ids
+        self.pending_point_id = None
+        self.canvas.set_active_point(None)
+        if len(point_ids) == 1 and not image_ids:
+            self.current_image_id = self.project.point_by_id(point_ids[0]).image_id or self.current_image_id
+        self._refresh_points()
+        self.statusBar().showMessage(
+            f"Selected {len(image_ids)} image(s), {len(point_ids)} point(s), {len(link_ids)} link(s)."
+        )
+
+    def _on_canvas_image_toggled(self, image_id: str) -> None:
+        self.image_list.blockSignals(True)
+        for row in range(self.image_list.count()):
+            item = self.image_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == image_id:
+                item.setSelected(not item.isSelected())
+                break
+        self.image_list.blockSignals(False)
+        remaining = self._selected_image_ids()
+        self.current_image_id = image_id if image_id in remaining else (remaining[-1] if remaining else None)
+        self._refresh_points()
+        self.statusBar().showMessage(f"{len(remaining)} image(s) selected. Ctrl+click to add or remove images.")
+
+    def _on_canvas_point_toggled(self, image_id: str, point_id: str) -> None:
+        point = self.project.point_by_id(point_id)
+        if point is None or point.observation_for(image_id) is None:
+            return
+        point_ids = self._selected_point_ids()
+        if point_id in point_ids:
+            point_ids.remove(point_id)
+        else:
+            point_ids.append(point_id)
+        self.selected_point_ids = point_ids
+        self.pending_point_id = None
+        self.canvas.set_active_point(None)
+        self.canvas.set_selected_points(set(point_ids))
+        if len(point_ids) == 1:
+            self.current_image_id = self.project.point_by_id(point_ids[0]).image_id or self.current_image_id
+        self._refresh_details()
+        self.statusBar().showMessage(f"{len(point_ids)} point(s) selected. Ctrl+click to add or remove points.")
+
     def _clear_point_selection(self) -> None:
         self.selected_point_id = None
         self.pending_point_id = None
         self.canvas.set_active_point(None)
-        self.canvas.set_selected_point(None)
+        self.canvas.set_selected_points(set())
 
     def _clear_constraint_selection(self) -> None:
         self.selected_constraint_id = None
+
+    @property
+    def selected_constraint_id(self) -> str | None:
+        return self.selected_constraint_ids[0] if len(self.selected_constraint_ids) == 1 else None
+
+    @selected_constraint_id.setter
+    def selected_constraint_id(self, constraint_id: str | None) -> None:
+        self.selected_constraint_ids = [constraint_id] if constraint_id else []
+
+    def _selected_constraint_ids(self) -> list[str]:
+        existing = {item.id for item in self.project.constraints}
+        return [constraint_id for constraint_id in self.selected_constraint_ids if constraint_id in existing]
+
+    def _on_canvas_constraint_toggled(self, index: int) -> None:
+        if not 0 <= index < len(self.project.constraints):
+            return
+        constraint_id = self.project.constraints[index].id
+        constraint_ids = self._selected_constraint_ids()
+        if constraint_id in constraint_ids:
+            constraint_ids.remove(constraint_id)
+        else:
+            constraint_ids.append(constraint_id)
+        self.selected_constraint_ids = constraint_ids
+        self._refresh_details()
+        self.statusBar().showMessage(f"{len(constraint_ids)} link(s) selected. Ctrl+click to add or remove links.")
+
+    def _on_canvas_constraint_clicked(self, index: int) -> None:
+        if 0 <= index < len(self.project.constraints):
+            self._select_constraint(self.project.constraints[index].id)
 
     def _select_constraint(self, constraint_id: str) -> None:
         if not any(item.id == constraint_id for item in self.project.constraints):
@@ -1190,6 +1443,26 @@ class MainWindow(QMainWindow):
     def _on_canvas_background_clicked(self) -> None:
         if self.add_points_mode or self.link_points_mode:
             return
+        self.deselect_all()
+
+    def select_all(self) -> None:
+        if self.add_points_mode or self.link_points_mode:
+            return
+        shown = {image.id for image in self.project.images if image.visible}
+        point_keys = [
+            (point.image_id, point.id) for point in self.project.control_points
+            if point.visible and point.image_id in shown
+        ]
+        visible_points = {point_id for _image_id, point_id in point_keys}
+        link_indices = [
+            index for index, item in enumerate(self.project.constraints)
+            if item.first_point_id in visible_points and item.second_point_id in visible_points
+        ]
+        self._on_canvas_area_selected(
+            [image.id for image in self.project.images if image.id in shown], point_keys, link_indices, False
+        )
+
+    def deselect_all(self) -> None:
         self.image_list.blockSignals(True)
         self.image_list.clearSelection()
         self.image_list.setCurrentItem(None)
@@ -1241,6 +1514,7 @@ class MainWindow(QMainWindow):
     def _refresh_canvas(self) -> None:
         if not hasattr(self, "canvas"):
             return
+        self._refresh_layers()
         layers = []
         load_errors = []
         for image in self.project.images:
@@ -1254,10 +1528,11 @@ class MainWindow(QMainWindow):
             for point in self.project.control_points:
                 observation = point.observation_for(image.id)
                 if observation:
-                    points.append((point.id, observation.x, observation.y, observation.locked))
+                    points.append((point.id, observation.x, observation.y, observation.locked, point.visible and image.visible))
             pose_x, pose_y, pose_rotation, pose_scale = self._canvas_pose(image)
             layers.append({
                 "id": image.id,
+                "visible": image.visible,
                 "pixmap": pixmap,
                 "position_x": pose_x,
                 "position_y": pose_y,
@@ -1268,14 +1543,13 @@ class MainWindow(QMainWindow):
         constraints = [(item.first_point_id, item.second_point_id) for item in self.project.constraints]
         self.canvas.set_read_only(self._aligned_view_active())
         self.canvas.set_layers(layers, constraints)
-        selected_image = self.image_list.currentItem() if self.image_list.selectedItems() else None
-        selected_image_id = selected_image.data(Qt.ItemDataRole.UserRole) if selected_image else None
-        self.canvas.set_active_image(selected_image_id)
+        selected_image_ids = self._selected_image_ids()
+        self.canvas.set_selected_images(set(selected_image_ids))
         active_point = "__continuous_add__" if self.add_points_mode else self.pending_point_id
         self.canvas.set_active_point(active_point)
         self.canvas.set_constraint_mode(self.link_points_mode)
         self.canvas.set_constraint_source(self.pending_constraint_point_id)
-        self.canvas.set_selected_point(self._selected_point_id())
+        self.canvas.set_selected_points(set(self._selected_point_ids()))
         if load_errors:
             shown_errors = "; ".join(load_errors[:3])
             remaining = len(load_errors) - 3
@@ -1328,8 +1602,7 @@ class MainWindow(QMainWindow):
     def _refresh_constraints(self) -> None:
         if not hasattr(self, "details_stack"):
             return
-        if self._selected_constraint() is None:
-            self.selected_constraint_id = None
+        self.selected_constraint_ids = self._selected_constraint_ids()
         self.canvas.set_constraints([(item.first_point_id, item.second_point_id) for item in self.project.constraints])
         self._refresh_details()
 
@@ -1340,17 +1613,34 @@ class MainWindow(QMainWindow):
         return next((constraint for constraint in self.project.constraints if constraint.id == constraint_id), None)
 
     def _details_image(self):
-        if not self.image_list.selectedItems() or not self.current_image_id:
+        image_ids = self._selected_image_ids()
+        if len(image_ids) != 1:
             return None
-        return next((image for image in self.project.images if image.id == self.current_image_id), None)
+        return next((image for image in self.project.images if image.id == image_ids[0]), None)
 
     def _refresh_details(self) -> None:
         if not hasattr(self, "details_stack") or not hasattr(self, "image_list"):
             return
         constraint = self._selected_constraint()
+        constraint_ids = self._selected_constraint_ids()
         point = self._selected_point()
+        point_ids = self._selected_point_ids()
+        image_ids = self._selected_image_ids()
         image = self._details_image()
-        if constraint is not None:
+        chosen_constraints = set(constraint_ids)
+        self.canvas.set_selected_constraints({
+            index for index, item in enumerate(self.project.constraints) if item.id in chosen_constraints
+        })
+        self._sync_tree_points()
+        total = len(image_ids) + len(point_ids) + len(constraint_ids)
+        kinds = sum(bool(ids) for ids in (image_ids, point_ids, constraint_ids))
+        if total > 1:
+            titles = {0: f"{len(image_ids)} IMAGES", 1: f"{len(point_ids)} CONTROL POINTS", 2: f"{len(constraint_ids)} LINKS"}
+            only_kind = next(index for index, ids in enumerate((image_ids, point_ids, constraint_ids)) if ids) if kinds == 1 else None
+            self.details_title.setText(titles[only_kind] if only_kind is not None else f"{total} ITEMS SELECTED")
+            self.details_stack.setCurrentIndex(4)
+            self._show_multi_selection_details(image_ids, point_ids, constraint_ids)
+        elif constraint is not None:
             self.details_title.setText("LINK")
             self.details_stack.setCurrentIndex(3)
             self._show_constraint_details(constraint)
@@ -1418,7 +1708,18 @@ class MainWindow(QMainWindow):
         return masked, error
 
     def _current_image_record(self):
-        return next((item for item in self.project.images if item.id == self.current_image_id), None)
+        """The image shown in the preview: only when a single image (or a single point on it) is selected."""
+        if self._selected_constraint_ids():
+            return None
+        image_ids = self._selected_image_ids()
+        point_ids = self._selected_point_ids()
+        if len(image_ids) == 1 and not point_ids:
+            image_id = image_ids[0]
+        elif len(point_ids) == 1 and not image_ids:
+            image_id = self.current_image_id
+        else:
+            return None
+        return next((item for item in self.project.images if item.id == image_id), None)
 
     def _refresh_image_view(self) -> None:
         if not hasattr(self, "image_viewer"):
@@ -1566,6 +1867,33 @@ class MainWindow(QMainWindow):
             lines.append("Not georeferenced yet")
         return "\n".join(lines)
 
+    def _show_multi_selection_details(
+        self, image_ids: list[str], point_ids: list[str], constraint_ids: list[str]
+    ) -> None:
+        chosen_images, chosen_points, chosen_links = set(image_ids), set(point_ids), set(constraint_ids)
+        images = [item for item in self.project.images if item.id in chosen_images]
+        points = [item for item in self.project.control_points if item.id in chosen_points]
+        links = [item for item in self.project.constraints if item.id in chosen_links]
+        summary = []
+        if images:
+            georeferenced = sum(image.world_x is not None for image in images)
+            summary.append(f"{len(images)} images ({georeferenced} georeferenced)")
+        if points:
+            mapped = sum(point.geographic_x is not None and point.geographic_y is not None for point in points)
+            summary.append(f"{len(points)} control points ({mapped} with map coordinates)")
+        if links:
+            summary.append(f"{len(links)} links")
+        self.selection_info_label.setText("  ·  ".join(summary))
+        image_names = {image.id: image.name for image in self.project.images}
+        point_names = {point.id: point.name for point in self.project.control_points}
+        self.selection_list.clear()
+        for image in images:
+            self.selection_list.addItem(f"Image  ·  {image.name}")
+        for point in points:
+            self.selection_list.addItem(f"Point  ·  {point.name}  ·  {image_names.get(point.image_id, '?')}")
+        for link in links:
+            self.selection_list.addItem(f"Link  ·  {self._link_text(link, point_names)}")
+
     def _show_image_details(self, image) -> None:
         self.image_info_label.setText(self._image_info_text(image))
         points = [point for point in self.project.control_points if point.observation_for(image.id) is not None]
@@ -1656,6 +1984,22 @@ class MainWindow(QMainWindow):
         self.pending_point_id = None
         self.canvas.set_active_point(None)
         self.canvas.set_selected_point(point.id)
+        self._refresh_details()
+
+    def toggle_selected_locks(self) -> None:
+        points = [self.project.point_by_id(point_id) for point_id in self._selected_point_ids()]
+        observations = [item for point in points for item in point.observations]
+        if not observations:
+            return
+        # Unlock only when everything is already locked; otherwise lock all.
+        lock = not all(item.locked for item in observations)
+        before = self.project.to_dict()
+        for point in points:
+            for item in point.observations:
+                item.locked = lock
+                self.canvas.set_observation_locked(item.image_id, point.id, lock)
+        self._record_project_edit(before, "Lock point position" if lock else "Unlock point position")
+        self.statusBar().showMessage(f"{len(points)} point(s) {'locked' if lock else 'unlocked'}.")
         self._refresh_details()
 
     def _set_observation_lock(self, locked: bool) -> None:
@@ -1985,13 +2329,26 @@ class MainWindow(QMainWindow):
         self._select_constraint(constraint.id)
         self.statusBar().showMessage("Control points linked by a tie constraint.")
 
+    def delete_selected(self) -> None:
+        point_ids = self._selected_point_ids()
+        constraint_ids = self._selected_constraint_ids()
+        if self._selected_image_ids():
+            if not self.remove_selected_image():
+                return
+            # Removing images clears the point and link selection; restore what survived.
+            self.selected_point_ids = point_ids
+            self.selected_constraint_ids = constraint_ids
+        if self._selected_constraint_ids():
+            self.remove_constraint()
+        if self._selected_point_ids():
+            self.remove_selected_point()
+
     def remove_constraint(self) -> None:
-        constraint = self._selected_constraint()
-        if constraint is None:
+        constraint_ids = set(self._selected_constraint_ids())
+        if not constraint_ids:
             return
-        constraint_id = constraint.id
         before = self.project.to_dict()
-        self.project.constraints = [item for item in self.project.constraints if item.id != constraint_id]
+        self.project.constraints = [item for item in self.project.constraints if item.id not in constraint_ids]
         self._record_project_edit(before, "Remove point constraint")
         self.pending_point_id = None
         self.selected_constraint_id = None
@@ -2114,19 +2471,20 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
-    def remove_selected_image(self) -> None:
-        if not self.current_image_id:
-            return
-        image = next((item for item in self.project.images if item.id == self.current_image_id), None)
-        if image is None:
-            return
-        answer = QMessageBox.question(self, "Remove image", f"Remove '{image.name}' and its control points?")
+    def remove_selected_image(self) -> bool:
+        image_ids = set(self._selected_image_ids())
+        images = [item for item in self.project.images if item.id in image_ids]
+        if not images:
+            return False
+        names = f"'{images[0].name}'" if len(images) == 1 else f"{len(images)} images"
+        answer = QMessageBox.question(self, "Remove image", f"Remove {names} and their control points?")
         if answer != QMessageBox.StandardButton.Yes:
-            return
+            return False
         before = self.project.to_dict()
-        self.project.images = [item for item in self.project.images if item.id != image.id]
-        self._image_pixmaps.pop(image.id, None)
-        removed_point_ids = {point.id for point in self.project.control_points if point.image_id == image.id}
+        self.project.images = [item for item in self.project.images if item.id not in image_ids]
+        for image_id in image_ids:
+            self._image_pixmaps.pop(image_id, None)
+        removed_point_ids = {point.id for point in self.project.control_points if point.image_id in image_ids}
         self.project.control_points = [
             point for point in self.project.control_points if point.id not in removed_point_ids
         ]
@@ -2139,16 +2497,17 @@ class MainWindow(QMainWindow):
         self._record_project_edit(before, "Remove image")
         self.current_image_id = None
         self._refresh_all()
+        return True
 
     def remove_selected_point(self) -> None:
-        point = self._selected_point()
-        if point is None:
+        point_ids = set(self._selected_point_ids())
+        if not point_ids:
             return
         before = self.project.to_dict()
-        self.project.control_points = [item for item in self.project.control_points if item.id != point.id]
+        self.project.control_points = [item for item in self.project.control_points if item.id not in point_ids]
         self.project.constraints = [
             constraint for constraint in self.project.constraints
-            if point.id not in (constraint.first_point_id, constraint.second_point_id)
+            if not {constraint.first_point_id, constraint.second_point_id} & point_ids
         ]
         self._record_project_edit(before, "Delete control point")
         self.pending_point_id = None
@@ -2210,9 +2569,13 @@ class MainWindow(QMainWindow):
         if "map" in self.project.views:
             self.world_map.restore_view_state(self.project.views["map"])
 
-    def save_current_project(self) -> None:
-        if self.project_path is None:
-            path, _ = QFileDialog.getSaveFileName(self, "Save project", self._last_directory(), "GeoStitch project (*.gsp)")
+    def save_project_as(self) -> None:
+        self.save_current_project(save_as=True)
+
+    def save_current_project(self, _checked: bool = False, save_as: bool = False) -> None:
+        if self.project_path is None or save_as:
+            start = str(self.project_path) if self.project_path else self._last_directory()
+            path, _ = QFileDialog.getSaveFileName(self, "Save project", start, "GeoStitch project (*.gsp)")
             if not path:
                 return
             self._remember_directory(path)
@@ -2231,9 +2594,12 @@ class MainWindow(QMainWindow):
         self._update_title()
 
     def _panel_under_focus_or_cursor(self):
-        """The map or image-view dock the user is working in (menu use leaves the cursor outside any panel)."""
-        dock = self._dock_under_focus_or_cursor() or self._last_active_dock
-        return dock if dock in (self.world_map_dock, self.image_view_dock) else None
+        """The dock under the cursor, else the focused or last active one (menu use leaves the cursor outside any panel)."""
+        return (
+            self._dock_containing(QApplication.widgetAt(QCursor.pos()))
+            or self._dock_under_focus_or_cursor()
+            or self._last_active_dock
+        )
 
     def _remember_active_dock(self, _old, new) -> None:
         dock = self._dock_containing(new)
@@ -2294,6 +2660,14 @@ class MainWindow(QMainWindow):
             item.data(Qt.ItemDataRole.UserRole)
             for item in self.image_list.selectedItems()
         }
+        point_ids = set(self._selected_point_ids())
+        chosen_links = set(self._selected_constraint_ids())
+        link_indices = {
+            index for index, item in enumerate(self.project.constraints) if item.id in chosen_links
+        }
+        if point_ids or link_indices:
+            self.canvas.fit_items(selected_image_ids, point_ids, link_indices)
+            return
         self.canvas.fit_images(selected_image_ids or None)
 
     def simulate_alignment_dialog(self) -> None:
@@ -2518,6 +2892,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("GeoStitch")
     app.setWindowIcon(app_icon())
+    # Qt's default 256 MB cap rejects large survey images before the Pillow fallback is tried.
+    QImageReader.setAllocationLimit(2048)
     window = MainWindow()
     window.show()
     return app.exec()

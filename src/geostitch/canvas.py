@@ -3,18 +3,82 @@ from __future__ import annotations
 from math import atan2, degrees, hypot
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QPen, QPixmap, QTransform
+from PySide6.QtGui import QBrush, QColor, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsLineItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
+    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
+    QWidget,
 )
+
+
+class _Magnifier(QWidget):
+    """Circular zoomed view of the scene around a point, with a crosshair at its centre."""
+
+    DIAMETER = 150
+    ZOOM = 4.0
+    CURSOR_OFFSET = 24
+
+    def __init__(self, view: QGraphicsView):
+        super().__init__(view.viewport())
+        self._view = view
+        self._center = QPointF()
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.resize(self.DIAMETER, self.DIAMETER)
+        self.hide()
+
+    def track(self, scene_center: QPointF, cursor: QPoint) -> None:
+        self._center = scene_center
+        viewport = self._view.viewport().rect()
+        x = cursor.x() + self.CURSOR_OFFSET
+        y = cursor.y() - self.CURSOR_OFFSET - self.DIAMETER
+        if x + self.DIAMETER > viewport.right():
+            x = cursor.x() - self.CURSOR_OFFSET - self.DIAMETER
+        if y < viewport.top():
+            y = cursor.y() + self.CURSOR_OFFSET
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        circle = QPainterPath()
+        circle.addEllipse(QRectF(1, 1, self.DIAMETER - 2, self.DIAMETER - 2))
+        painter.setClipPath(circle)
+        painter.fillRect(self.rect(), QColor("#20272b"))
+        side = self.DIAMETER / (self._view.transform().m11() * self.ZOOM)
+        source = QRectF(self._center.x() - side / 2, self._center.y() - side / 2, side, side)
+        overlays = self._view.overlay_items()
+        for item in overlays:
+            item.setVisible(False)
+        self._view.scene().render(painter, QRectF(self.rect()), source)
+        for item in overlays:
+            item.setVisible(True)
+        painter.setClipping(False)
+        middle = self.DIAMETER / 2
+        gap = 6
+        edge = 10
+        for color, width in ((QColor(0, 0, 0, 90), 2), (QColor(255, 255, 255, 190), 1)):
+            painter.setPen(QPen(color, width))
+            painter.drawLine(QPointF(middle, edge), QPointF(middle, middle - gap))
+            painter.drawLine(QPointF(middle, middle + gap), QPointF(middle, self.DIAMETER - edge))
+            painter.drawLine(QPointF(edge, middle), QPointF(middle - gap, middle))
+            painter.drawLine(QPointF(middle + gap, middle), QPointF(self.DIAMETER - edge, middle))
+        painter.setPen(QPen(QColor("#65cdb1"), 3))
+        painter.drawEllipse(QRectF(1.5, 1.5, self.DIAMETER - 3, self.DIAMETER - 3))
 
 
 class ImageCanvas(QGraphicsView):
     NAVIGATION_EXTENT = 10_000_000.0
+    POINT_DRAG_THRESHOLD = 5
 
     image_clicked = Signal(str, float, float)
     files_dropped = Signal(list)
@@ -25,6 +89,11 @@ class ImageCanvas(QGraphicsView):
     point_observation_interaction_started = Signal(str, str)
     point_observation_interaction_finished = Signal(str, str)
     image_selected = Signal(str)
+    image_toggled = Signal(str)
+    area_selected = Signal(list, list, list, bool)
+    constraint_clicked = Signal(int)
+    constraint_toggled = Signal(int)
+    point_marker_toggled = Signal(str, str)
     background_clicked = Signal()
     transform_changed = Signal(str, float, float, float, float)
     transform_interaction_started = Signal(str)
@@ -53,6 +122,14 @@ class ImageCanvas(QGraphicsView):
         self._point_items: dict[tuple[str, str], QGraphicsEllipseItem] = {}
         self._locked_points: set[tuple[str, str]] = set()
         self._dragged_point_key: tuple[str, str] | None = None
+        self._magnifier = _Magnifier(self)
+        self._pending_point_drag: tuple[tuple[str, str], QPoint] | None = None
+        self._selection_mode = "rect"
+        self._marquee_origin: QPoint | None = None
+        self._marquee_points: list[QPointF] = []
+        self._marquee_active = False
+        self._marquee_background = False
+        self._marquee_item: QGraphicsPathItem | None = None
         self._transform_handles: list[QGraphicsEllipseItem] = []
         self._transform_connector: QGraphicsLineItem | None = None
         self._active_transform_handle: str | None = None
@@ -63,12 +140,17 @@ class ImageCanvas(QGraphicsView):
         self._transform_start_distance = 1.0
         self._constraints: list[tuple[str, str]] = []
         self._constraint_items: list[QGraphicsLineItem] = []
+        self._selected_constraint_indices: set[int] = set()
         self._active_image_id: str | None = None
+        self._selected_image_ids: set[str] = set()
+        self._selection_outlines: list[QGraphicsRectItem] = []
+        self._selected_point_ids: set[str] = set()
+        self._pending_collapse_id: str | None = None
+        self._drag_moved = False
         self._placing_point = False
         self._active_point_id: str | None = None
         self._linking_points = False
         self._constraint_source_id: str | None = None
-        self._selected_point_id: str | None = None
         self._panning = False
         self._placement_click = False
         self._last_pan_position = None
@@ -77,7 +159,10 @@ class ImageCanvas(QGraphicsView):
         self._read_only = False
 
     def set_layers(self, layers: list[dict], constraints: list[tuple[str, str]] | None = None) -> None:
-        previous_active_image_id = self._active_image_id
+        previous_selected_ids = set(self._selected_image_ids)
+        self._selection_outlines.clear()
+        self._marquee_item = None
+        self._marquee_origin = None
         self._scene.clear()
         self._layers.clear()
         self._points.clear()
@@ -90,6 +175,7 @@ class ImageCanvas(QGraphicsView):
         self._constraint_items.clear()
         self._constraints = []
         self._active_image_id = None
+        self._selected_image_ids = set()
         valid_layers = [layer for layer in layers if not layer["pixmap"].isNull()]
         if not valid_layers:
             return
@@ -104,6 +190,7 @@ class ImageCanvas(QGraphicsView):
             pixmap_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             pixmap_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
             pixmap_item.setZValue(index)
+            pixmap_item.setVisible(layer.get("visible", True))
             x = layer["position_x"] if layer["position_x"] is not None else layout_x
             pixmap_item.setPos(x, layer["position_y"])
             pixmap_item.setRotation(layer["rotation"])
@@ -112,24 +199,97 @@ class ImageCanvas(QGraphicsView):
             self._scene.addItem(pixmap_item)
             self._layers[image_id] = pixmap_item
             for point_data in layer["points"]:
-                if len(point_data) == 4:
+                visible = True
+                if len(point_data) == 5:
+                    point_id, pixel_x, pixel_y, locked, visible = point_data
+                elif len(point_data) == 4:
                     point_id, pixel_x, pixel_y, locked = point_data
                 else:
                     point_id, pixel_x, pixel_y = point_data
                     locked = False
-                self._add_point_marker(pixmap_item, point_id, pixel_x, pixel_y, locked)
+                self._add_point_marker(pixmap_item, point_id, pixel_x, pixel_y, locked, visible)
 
         for first_id, second_id in constraints or []:
             self._constraints.append((first_id, second_id))
-        if previous_active_image_id in self._layers:
-            self._active_image_id = previous_active_image_id
-            for index, (image_id, item) in enumerate(self._layers.items()):
-                selected = image_id == previous_active_image_id
-                item.setSelected(selected)
-                item.setZValue(1000 if selected else index)
+        self._apply_image_selection(previous_selected_ids)
         self._redraw_constraints()
         self.set_constraint_source(self._constraint_source_id)
         self._refresh_transform_handles()
+
+    def set_selection_mode(self, mode: str) -> None:
+        self._selection_mode = "lasso" if mode == "lasso" else "rect"
+
+    def _marquee_path(self) -> QPainterPath:
+        path = QPainterPath()
+        if self._selection_mode == "lasso":
+            path.addPolygon(QPolygonF(self._marquee_points))
+        else:
+            path.addRect(QRectF(self._marquee_points[0], self._marquee_points[-1]).normalized())
+        path.closeSubpath()
+        return path
+
+    def _update_marquee(self, viewport_position: QPoint) -> None:
+        if not self._marquee_active:
+            if (viewport_position - self._marquee_origin).manhattanLength() < self.POINT_DRAG_THRESHOLD:
+                return
+            self._marquee_active = True
+            self._marquee_item = QGraphicsPathItem()
+            pen = QPen(QColor("#65cdb1"), 1, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            self._marquee_item.setPen(pen)
+            self._marquee_item.setBrush(QBrush(QColor(101, 205, 177, 40)))
+            self._marquee_item.setZValue(5000)
+            self._scene.addItem(self._marquee_item)
+        scene_position = self.mapToScene(viewport_position)
+        if self._selection_mode == "lasso":
+            self._marquee_points.append(scene_position)
+        else:
+            self._marquee_points = [self._marquee_points[0], scene_position]
+        self._marquee_item.setPath(self._marquee_path())
+
+    def _finish_marquee(self, additive: bool) -> None:
+        active, background = self._marquee_active, self._marquee_background
+        path = self._marquee_path() if active else None
+        if self._marquee_item is not None:
+            self._scene.removeItem(self._marquee_item)
+        self._marquee_item = None
+        self._marquee_origin = None
+        self._marquee_active = False
+        if path is None:
+            if background and not additive:
+                self.background_clicked.emit()
+            return
+        images = []
+        for image_id, item in self._layers.items():
+            if not item.isVisible():
+                continue
+            corners = (item.mapToScene(corner) for corner in (
+                item.boundingRect().topLeft(), item.boundingRect().topRight(),
+                item.boundingRect().bottomRight(), item.boundingRect().bottomLeft(),
+            ))
+            if all(path.contains(corner) for corner in corners):
+                images.append(image_id)
+        points = [
+            key for key, marker in self._point_items.items()
+            if marker.isVisible() and path.contains(marker.scenePos())
+        ]
+        links = []
+        for index, (first_id, second_id) in enumerate(self._constraints):
+            first = self._scene_position_for_point(first_id)
+            second = self._scene_position_for_point(second_id)
+            if first is not None and second is not None and path.contains(first) and path.contains(second):
+                links.append(index)
+        self.area_selected.emit(images, points, links, additive)
+
+    def overlay_items(self) -> list:
+        """Markers, links, handles and outlines drawn above the images."""
+        return [
+            *self._point_items.values(),
+            *self._constraint_items,
+            *self._transform_handles,
+            *self._selection_outlines,
+            *([self._transform_connector] if self._transform_connector is not None else []),
+        ]
 
     def set_read_only(self, read_only: bool) -> None:
         """Disable moving, scaling and rotating images (point markers stay editable)."""
@@ -138,8 +298,11 @@ class ImageCanvas(QGraphicsView):
             item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not read_only)
         self._refresh_transform_handles()
 
-    def _add_point_marker(self, parent: QGraphicsPixmapItem, point_id: str, x: float, y: float, locked: bool = False) -> None:
+    def _add_point_marker(
+        self, parent: QGraphicsPixmapItem, point_id: str, x: float, y: float, locked: bool = False, visible: bool = True
+    ) -> None:
         marker = QGraphicsEllipseItem(-6, -6, 12, 12)
+        marker.setVisible(visible)
         marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
         marker.setPos(parent.mapToScene(QPointF(x, y)))
         marker.setPen(QPen(QColor("#ff695e"), 2))
@@ -156,20 +319,38 @@ class ImageCanvas(QGraphicsView):
             self._locked_points.add(key)
         self._refresh_marker_styles()
 
+    def _apply_image_selection(self, image_ids: set[str]) -> None:
+        self._selected_image_ids = {image_id for image_id in image_ids if image_id in self._layers}
+        # Transform handles only make sense for a single image.
+        self._active_image_id = next(iter(self._selected_image_ids)) if len(self._selected_image_ids) == 1 else None
+        for index, (image_id, item) in enumerate(self._layers.items()):
+            selected = image_id in self._selected_image_ids
+            item.setSelected(selected)
+            item.setZValue(index)
+        for outline in self._selection_outlines:
+            self._scene.removeItem(outline)
+        self._selection_outlines.clear()
+        for image_id in self._selected_image_ids:
+            item = self._layers[image_id]
+            outline = QGraphicsRectItem(item.boundingRect(), item)
+            pen = QPen(QColor("#65cdb1"), 2)
+            pen.setCosmetic(True)
+            outline.setPen(pen)
+            outline.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._selection_outlines.append(outline)
+        self._refresh_transform_handles()
+
+    def set_selected_images(self, image_ids: set[str]) -> None:
+        self._apply_image_selection(image_ids)
+        self._redraw_constraints()
+
     def set_active_image(self, image_id: str | None) -> None:
         if image_id not in self._layers:
-            self._active_image_id = None
-            for item in self._layers.values():
-                item.setSelected(False)
-            self._refresh_transform_handles()
+            self._apply_image_selection(set())
             return
-        changed = image_id != self._active_image_id
-        self._active_image_id = image_id
-        for index, (candidate_id, item) in enumerate(self._layers.items()):
-            selected = candidate_id == image_id
-            item.setSelected(selected)
-            item.setZValue(1000 if selected else index)
-        self._refresh_transform_handles()
+        changed = image_id != self._active_image_id or len(self._selected_image_ids) != 1
+        self._apply_image_selection({image_id})
         self._redraw_constraints()
         if changed:
             self.image_selected.emit(image_id)
@@ -188,7 +369,10 @@ class ImageCanvas(QGraphicsView):
         self._refresh_marker_styles()
 
     def set_selected_point(self, point_id: str | None) -> None:
-        self._selected_point_id = point_id
+        self.set_selected_points({point_id} if point_id else set())
+
+    def set_selected_points(self, point_ids: set[str]) -> None:
+        self._selected_point_ids = set(point_ids)
         self._refresh_marker_styles()
 
     def set_observation_locked(self, image_id: str, point_id: str, locked: bool) -> None:
@@ -202,7 +386,7 @@ class ImageCanvas(QGraphicsView):
     def _refresh_marker_styles(self) -> None:
         for (_image_id, candidate_id), marker in self._point_items.items():
             is_source = candidate_id == self._constraint_source_id
-            is_selected = candidate_id == self._selected_point_id
+            is_selected = candidate_id in self._selected_point_ids
             is_locked = (_image_id, candidate_id) in self._locked_points
             color = QColor("#f4c95d") if is_source else QColor("#65cdb1") if is_selected else QColor("#79a9d1") if is_locked else QColor("#ff695e")
             marker.setPen(QPen(color, 3 if is_source or is_selected else 2))
@@ -267,11 +451,49 @@ class ImageCanvas(QGraphicsView):
             self._refresh_point_overlay_positions()
             self._refresh_transform_handles()
 
-    def wheelEvent(self, event) -> None:
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self.scale(factor, factor)
+    def fit_items(self, image_ids: set[str], point_ids: set[str], constraint_indices: set[int]) -> None:
+        rects = [self._layers[image_id].sceneBoundingRect() for image_id in image_ids if image_id in self._layers]
+        positions = [self._scene_position_for_point(point_id) for point_id in point_ids]
+        for index in constraint_indices:
+            if 0 <= index < len(self._constraints):
+                positions.extend(self._scene_position_for_point(point_id) for point_id in self._constraints[index])
+        for position in positions:
+            if position is not None:
+                rects.append(QRectF(position, position))
+        if not rects:
+            return
+        rect = rects[0]
+        for other in rects[1:]:
+            rect = rect.united(other)
+        # Keep a lone point or short link from zooming in absurdly far.
+        minimum = 120.0
+        rect = rect.adjusted(
+            -max(0.0, (minimum - rect.width()) / 2), -max(0.0, (minimum - rect.height()) / 2),
+            max(0.0, (minimum - rect.width()) / 2), max(0.0, (minimum - rect.height()) / 2),
+        )
+        margin = max(rect.width(), rect.height()) * 0.1
+        self.fitInView(rect.adjusted(-margin, -margin, margin, margin), Qt.AspectRatioMode.KeepAspectRatio)
         self._refresh_point_overlay_positions()
         self._refresh_transform_handles()
+
+    def wheelEvent(self, event) -> None:
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        # Qt's mouse anchor goes stale while a point drag swallows mouse moves, so anchor manually.
+        cursor = event.position().toPoint()
+        scene_before = self.mapToScene(cursor)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.scale(factor, factor)
+        shift = self.mapFromScene(scene_before) - cursor
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + shift.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + shift.y())
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self._refresh_point_overlay_positions()
+        self._refresh_transform_handles()
+        if self._dragged_point_key is not None:
+            self._move_point_marker(self._dragged_point_key, self.mapToScene(cursor))
+            marker = self._point_items.get(self._dragged_point_key)
+            if marker is not None:
+                self._magnifier.track(marker.scenePos(), cursor)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -298,21 +520,43 @@ class ImageCanvas(QGraphicsView):
                     self._begin_transform_handle(handle_kind, self.mapToScene(event.position().toPoint()))
                     event.accept()
                     return
+            additive = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
             if self._active_point_id != "__continuous_add__":
                 point = self._point_marker_at(event.position().toPoint())
+                if point is not None and additive:
+                    self.point_marker_toggled.emit(*point)
+                    self._placement_click = True
+                    event.accept()
+                    return
                 if point is not None:
                     image_id, point_id = point
                     self.set_active_image(image_id)
                     self.point_marker_selected.emit(image_id, point_id)
                     key = (image_id, point_id)
                     if key not in self._locked_points:
-                        self._dragged_point_key = key
-                        self.point_observation_interaction_started.emit(image_id, point_id)
+                        self._pending_point_drag = (key, event.position().toPoint())
+                    self._placement_click = True
+                    event.accept()
+                    return
+                constraint_index = self._constraint_at(event.position().toPoint())
+                if constraint_index is not None:
+                    if additive:
+                        self.constraint_toggled.emit(constraint_index)
+                    else:
+                        self.constraint_clicked.emit(constraint_index)
                     self._placement_click = True
                     event.accept()
                     return
             scene_position = self.mapToScene(event.position().toPoint())
             image_id = self._image_at(scene_position)
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if not self._placing_point and (image_id is None or shift):
+                self._marquee_origin = event.position().toPoint()
+                self._marquee_points = [scene_position]
+                self._marquee_active = False
+                self._marquee_background = image_id is None
+                event.accept()
+                return
             if image_id is None:
                 self.background_clicked.emit()
                 super().mousePressEvent(event)
@@ -323,9 +567,19 @@ class ImageCanvas(QGraphicsView):
                 self._placement_click = True
                 event.accept()
                 return
-            self.set_active_image(image_id)
+            if additive:
+                self.image_toggled.emit(image_id)
+                self._placement_click = True
+                event.accept()
+                return
+            if image_id in self._selected_image_ids and len(self._selected_image_ids) > 1:
+                # Keep the group so it can be dragged together; collapse on release if it did not move.
+                self._pending_collapse_id = image_id
+            else:
+                self.set_active_image(image_id)
             if self._read_only:
                 return
+            self._drag_moved = False
             self._dragged_image_id = image_id
             self.transform_interaction_started.emit(image_id)
             self._drag_start = event.position().toPoint()
@@ -359,24 +613,44 @@ class ImageCanvas(QGraphicsView):
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
             return
+        if self._marquee_origin is not None:
+            self._update_marquee(event.position().toPoint())
+            return
         if self._active_transform_handle is not None:
             self._update_transform_handle(self.mapToScene(event.position().toPoint()))
             return
+        if self._pending_point_drag is not None:
+            key, press_position = self._pending_point_drag
+            if (event.position().toPoint() - press_position).manhattanLength() < self.POINT_DRAG_THRESHOLD:
+                return
+            self._pending_point_drag = None
+            self._dragged_point_key = key
+            self.point_observation_interaction_started.emit(*key)
         if self._dragged_point_key is not None:
             self._move_point_marker(self._dragged_point_key, self.mapToScene(event.position().toPoint()))
+            marker = self._point_items.get(self._dragged_point_key)
+            if marker is not None:
+                self._magnifier.track(marker.scenePos(), event.position().toPoint())
             return
         super().mouseMoveEvent(event)
         if self._dragged_image_id:
+            self._drag_moved = True
             self._refresh_point_overlay_positions()
             self._redraw_constraints()
             self._refresh_transform_handles()
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._marquee_origin is not None:
+            self._finish_marquee(bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier))
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._placement_click:
             self._placement_click = False
+            self._pending_point_drag = None
             if self._dragged_point_key is not None:
                 image_id, point_id = self._dragged_point_key
                 self._dragged_point_key = None
+                self._magnifier.hide()
                 self.point_observation_interaction_finished.emit(image_id, point_id)
             event.accept()
             return
@@ -399,8 +673,15 @@ class ImageCanvas(QGraphicsView):
             image_id = self._dragged_image_id
             self._dragged_image_id = None
             self._drag_start = None
+            moved = self._drag_moved
+            for selected_id in sorted(self._selected_image_ids - {image_id}):
+                if moved:
+                    self._emit_transform(selected_id)
             self._emit_transform(image_id)
             self.transform_interaction_finished.emit(image_id)
+        collapse_id, self._pending_collapse_id = self._pending_collapse_id, None
+        if event.button() == Qt.MouseButton.LeftButton and collapse_id and not self._drag_moved:
+            self.set_active_image(collapse_id)
 
     def _image_at(self, scene_position) -> str | None:
         if self._placing_point and self._active_image_id:
@@ -454,7 +735,7 @@ class ImageCanvas(QGraphicsView):
         self._clear_transform_handles()
         image_id = self._active_image_id
         item = self._layers.get(image_id) if image_id else None
-        if item is None or self._read_only:
+        if item is None or self._read_only or not item.isVisible():
             return
         bounds = item.boundingRect()
         corners = (
@@ -572,6 +853,8 @@ class ImageCanvas(QGraphicsView):
         if point_key is None:
             return None
         image_id, _point_id = point_key
+        if not self._point_items[point_key].isVisible():
+            return None
         x, y = self._points[point_key]
         item = self._layers.get(image_id)
         if item is None:
@@ -580,17 +863,46 @@ class ImageCanvas(QGraphicsView):
 
         return item.mapToScene(QPointF(x, y))
 
+    def set_selected_constraints(self, indices: set[int]) -> None:
+        if indices != self._selected_constraint_indices:
+            self._selected_constraint_indices = set(indices)
+            self._redraw_constraints()
+
+    def _constraint_at(self, viewport_position: QPoint) -> int | None:
+        best_index = None
+        best_distance = 7.0
+        for index, (first_id, second_id) in enumerate(self._constraints):
+            first = self._scene_position_for_point(first_id)
+            second = self._scene_position_for_point(second_id)
+            if first is None or second is None:
+                continue
+            a = self.mapFromScene(first)
+            b = self.mapFromScene(second)
+            dx, dy = b.x() - a.x(), b.y() - a.y()
+            length_squared = dx * dx + dy * dy
+            t = 0.0 if length_squared == 0 else max(0.0, min(1.0, (
+                (viewport_position.x() - a.x()) * dx + (viewport_position.y() - a.y()) * dy
+            ) / length_squared))
+            distance = hypot(viewport_position.x() - (a.x() + t * dx), viewport_position.y() - (a.y() + t * dy))
+            if distance <= best_distance:
+                best_distance = distance
+                best_index = index
+        return best_index
+
     def _redraw_constraints(self) -> None:
         for item in self._constraint_items:
             self._scene.removeItem(item)
         self._constraint_items.clear()
         pen = QPen(QColor("#f4c95d"), 2, Qt.PenStyle.DashLine)
         pen.setCosmetic(True)
-        for first_id, second_id in self._constraints:
+        selected_pen = QPen(QColor("#65cdb1"), 4)
+        selected_pen.setCosmetic(True)
+        for index, (first_id, second_id) in enumerate(self._constraints):
             first = self._scene_position_for_point(first_id)
             second = self._scene_position_for_point(second_id)
             if first is None or second is None:
                 continue
-            line = self._scene.addLine(first.x(), first.y(), second.x(), second.y(), pen)
-            line.setZValue(2000)
+            selected = index in self._selected_constraint_indices
+            line = self._scene.addLine(first.x(), first.y(), second.x(), second.y(), selected_pen if selected else pen)
+            line.setZValue(2500 if selected else 2000)
             self._constraint_items.append(line)

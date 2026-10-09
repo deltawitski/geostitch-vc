@@ -221,3 +221,20 @@ def test_loading_legacy_shared_point_splits_it_into_linked_per_image_points():
     assert {project.constraints[0].first_point_id, project.constraints[0].second_point_id} == {
         point.id for point in project.control_points
     }
+
+
+def test_layer_visibility_round_trips_and_defaults_to_visible():
+    project = Project()
+    image = project.add_image('layer.png')
+    point = GroundControlPoint.create('p')
+    project.add_control_point(point)
+    image.visible = False
+    point.visible = False
+    data = project.to_dict()
+    loaded = Project.from_dict(data)
+    assert loaded.images[0].visible is False
+    assert loaded.control_points[0].visible is False
+    del data['control_points'][0]['visible']
+    del data['images'][0]['visible']
+    legacy = Project.from_dict(data)
+    assert legacy.images[0].visible and legacy.control_points[0].visible

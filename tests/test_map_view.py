@@ -93,7 +93,8 @@ def test_app_map_dock_updates_when_georeference_result_is_applied(tmp_path):
 
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     assert window.pick_gcp_action.isCheckable() is True
-    assert not window.pick_gcp_action.isVisible()
+    assert window.pick_gcp_action.isVisible()
+    assert not window.pick_gcp_action.isEnabled()
     image = window.project.add_image(image_path)
     window._image_pixmaps[image.id] = pixmap
     result = GeoreferenceResult(
