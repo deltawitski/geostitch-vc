@@ -111,26 +111,26 @@ Give some points real coordinates in the project CRS: type them in the details p
 
 All shortcuts can be changed in **Settings → Keyboard shortcuts...** (duplicates are rejected; _Restore defaults_ resets them).
 
-| Tool / command               |              Key               | Description                                                 |
-| ---------------------------- | :----------------------------: | ----------------------------------------------------------- |
-| Add points                   |              `P`               | Click images to create control points continuously          |
-| Link points                  |              `L`               | Click two matching points in different images               |
-| Pick GCP coordinate on map   |              `G`               | Click the world map to set the selected point's coordinates |
-| Lasso selection              |              `S`               | Toggle freehand lasso instead of rectangle selection        |
-| Lock / unlock images and points |           `K`               | Lock image rest transforms and selected point positions     |
-| Toggle aligned / rest layout |              `A`               | Switch between arranged and solver-aligned layouts          |
-| Maximize / restore panel     |              `M`               | Focus on one panel                                          |
-| Delete selected              |             `Del`              | Remove selected images, points or link                      |
-| Select all / Deselect all    |      `Ctrl+A` / `Ctrl+D`       |                                                             |
-| Undo / Redo                  |      `Ctrl+Z` / `Ctrl+Y`       |                                                             |
-| New / Open / Save            | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | `Ctrl+Shift+S` for Save as                                  |
-| Import images                |            `Ctrl+I`            |                                                             |
-| Export georeferenced images  |            `Ctrl+E`            |                                                             |
-| Fit current view             |         `Ctrl+Shift+F`         | Fits canvas, map or image view, whichever you are in        |
-| Arrange images               |         `Ctrl+Shift+A`         |                                                             |
-| Simulate alignment           |         `Ctrl+Shift+M`         |                                                             |
-| Georeference from GCPs       |         `Ctrl+Shift+G`         |                                                             |
-| Link selected point to...    |         `Ctrl+Shift+L`         |                                                             |
+| Tool / command                  |              Key               | Description                                                 |
+| ------------------------------- | :----------------------------: | ----------------------------------------------------------- |
+| Add points                      |              `P`               | Click images to create control points continuously          |
+| Link points                     |              `L`               | Click two matching points in different images               |
+| Pick GCP coordinate on map      |              `G`               | Click the world map to set the selected point's coordinates |
+| Lasso selection                 |              `S`               | Toggle freehand lasso instead of rectangle selection        |
+| Lock / unlock images and points |              `K`               | Lock image rest transforms and selected point positions     |
+| Toggle aligned / rest layout    |              `A`               | Switch between arranged and solver-aligned layouts          |
+| Maximize / restore panel        |              `M`               | Focus on one panel                                          |
+| Delete selected                 |             `Del`              | Remove selected images, points or link                      |
+| Select all / Deselect all       |      `Ctrl+A` / `Ctrl+D`       |                                                             |
+| Undo / Redo                     |      `Ctrl+Z` / `Ctrl+Y`       |                                                             |
+| New / Open / Save               | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | `Ctrl+Shift+S` for Save as                                  |
+| Import images                   |            `Ctrl+I`            |                                                             |
+| Export georeferenced images     |            `Ctrl+E`            |                                                             |
+| Fit current view                |         `Ctrl+Shift+F`         | Fits canvas, map or image view, whichever you are in        |
+| Arrange images                  |         `Ctrl+Shift+A`         |                                                             |
+| Simulate alignment              |         `Ctrl+Shift+M`         |                                                             |
+| Georeference from GCPs          |         `Ctrl+Shift+G`         |                                                             |
+| Link selected point to...       |         `Ctrl+Shift+L`         |                                                             |
 
 **Mouse:** wheel to zoom, middle-drag to pan. In select mode, `Ctrl` adds to the selection and `Shift` drags over images.
 
