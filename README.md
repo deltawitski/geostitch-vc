@@ -1,10 +1,175 @@
-# GeoStitch Control
+﻿<div align="center">
 
-GeoStitch Control is a PySide6 desktop workspace for marking corresponding control points across raster images and recording their map coordinates.
+# 🧭 GeoStitch Control
 
-## Run
+**Bring in raster images, stitch them together virtually, and georeference them against the real world.**
 
-Requires Python 3.10 or newer.
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![Qt](https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D6?logo=windows&logoColor=white)
+![Status](https://img.shields.io/badge/status-alpha-orange)
+
+[Overview](#-overview) · [Workflow](#-workflow) · [Tools](#-tools-and-shortcuts) · [Panels](#-workspace-panels) · [Export](#-exporting) · [Project files](#-project-files) · [Development](#-development)
+
+</div>
+
+---
+
+## ✨ Overview
+
+GeoStitch Control is a desktop workspace for turning a pile of unreferenced raster images (scanned maps, drone frames, survey sheets, aerial photos) into correctly placed, georeferenced layers.
+
+Instead of stitching pixels, you work **virtually**:
+
+1. Lay all images out on one shared canvas.
+2. Mark features that appear in more than one image and **link** them.
+3. Let the solver **align** the images to each other.
+4. Give some points real-world coordinates and let the solver **georeference** every image.
+5. **Export** each image as a GeoTIFF or a world-file image, ready for GIS software.
+
+> [!NOTE]
+> Images are never warped or resampled into a single mosaic. Each image is exported with its own georeferencing, so the result drops straight into QGIS, ArcGIS, or any tool that reads GeoTIFFs and world files.
+
+### Highlights
+
+| | Feature |
+|---|---|
+| 🖼️ | Shared, pannable and zoomable canvas for any number of images |
+| 🧲 | Drag, rotate and scale layers with on-canvas handles |
+| 📍 | Continuous control-point placement with screen-sized markers |
+| 🔗 | Tie-point links between matching features in different images |
+| 📐 | Least-squares alignment and georeferencing with residual reports |
+| 🗺️ | Live OpenStreetMap world map showing solved footprints, with click-to-pick coordinates |
+| ✂️ | Per-image clip polygons (keep inside or outside) applied on export |
+| 🧩 | GeoJSON vector overlays reprojected to the project CRS |
+| ↩️ | Full undo/redo for project edits |
+| 🧱 | Dockable, floatable, splittable panels with remembered layout and custom shortcuts |
+
+---
+
+## 🔄 Workflow
+
+```mermaid
+flowchart LR
+    A[📥 Import images] --> B[🧲 Arrange & position]
+    B --> C[📍 Add control points]
+    C --> D[🔗 Link matching points]
+    D --> E[📐 Simulate alignment]
+    E --> F[🌍 Enter map coordinates]
+    F --> G[🧮 Georeference]
+    G --> H[📤 Export GeoTIFFs]
+```
+
+### 1. 📥 Import images
+Use **File → Import images** (`Ctrl+I`) or drag files into the window. New layers are laid out in a balanced, near-square grid. Choose the project **coordinate system** (for example `EPSG:32610`) in the details panel or the map toolbar.
+
+### 2. 🧲 Arrange and position
+- Drag a layer to move it.
+- Select a layer to show handles: drag a **corner** to scale proportionally, or the **handle above the image** to rotate.
+- **Arrange images** (`Ctrl+Shift+A`) rebuilds the grid; **Fit current view** (`Ctrl+Shift+F`) zooms to the selection or everything.
+
+### 3. 📍 Add control points
+Toggle **Add points** (`P`) and click features. Every click creates one point belonging to the clicked image, auto-named per image (`survey-001`, `survey-002`, …). The tool stays active until you toggle it off. Give points optional labels, edit pixel positions, or **lock** them (`K`) to prevent accidental drags.
+
+### 4. 🔗 Link matching points
+Toggle **Link points** (`L`), click a marker, then click its match in a **different** image. The tool stays active for successive pairs. You can also select a point and choose **Link selected point to...** (`Ctrl+Shift+L`). Links appear as dashed lines in the scene.
+
+### 5. 📐 Simulate alignment
+**Image → Simulate alignment** (`Ctrl+Shift+M`) jointly fits all linked observations for each connected image group, solving translation, rotation and uniform scale with bounded least squares. One reference image per group stays fixed. Review the residual report, then apply it. Use **Toggle aligned / rest layout** (`A`) to flip between the arranged and aligned canvas.
+
+### 6. 🌍 Enter map coordinates
+Give some points real coordinates in the project CRS: type them in the details panel, or toggle **Pick GCP coordinate on map** (`G`) and click the world map.
+
+### 7. 🧮 Georeference
+**Image → Georeference from GCPs** (`Ctrl+Shift+G`) solves a pixel-to-world transform per image from every point that has map coordinates. The report lists residuals per image and point in CRS units. Applied transforms are stored separately from the canvas layout, and images with a solved transform appear on the world map.
+
+### 8. 📤 Export
+**File → Export georeferenced images** (`Ctrl+E`). See [Exporting](#-exporting).
+
+> [!TIP]
+> Alignment and georeferencing are both undoable, so experiment freely.
+
+---
+
+## 🛠️ Tools and shortcuts
+
+All shortcuts can be changed in **Settings → Keyboard shortcuts...** (duplicates are rejected; *Restore defaults* resets them).
+
+| Tool / command | Key | Description |
+|---|:---:|---|
+| Add points | `P` | Click images to create control points continuously |
+| Link points | `L` | Click two matching points in different images |
+| Pick GCP coordinate on map | `G` | Click the world map to set the selected point's coordinates |
+| Lasso selection | `S` | Toggle freehand lasso instead of rectangle selection |
+| Lock / unlock points | `K` | Prevent dragging and pixel edits for selected points |
+| Toggle aligned / rest layout | `A` | Switch between arranged and solver-aligned layouts |
+| Maximize / restore panel | `M` | Focus on one panel |
+| Delete selected | `Del` | Remove selected images, points or link |
+| Select all / Deselect all | `Ctrl+A` / `Ctrl+D` | |
+| Undo / Redo | `Ctrl+Z` / `Ctrl+Y` | |
+| New / Open / Save | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | `Ctrl+Shift+S` for Save as |
+| Import images | `Ctrl+I` | |
+| Export georeferenced images | `Ctrl+E` | |
+| Fit current view | `Ctrl+Shift+F` | Fits canvas, map or image view, whichever you are in |
+| Arrange images | `Ctrl+Shift+A` | |
+| Simulate alignment | `Ctrl+Shift+M` | |
+| Georeference from GCPs | `Ctrl+Shift+G` | |
+| Link selected point to... | `Ctrl+Shift+L` | |
+
+**Mouse:** wheel to zoom, middle-drag to pan. In select mode, `Ctrl` adds to the selection and `Shift` drags over images.
+
+---
+
+## 🪟 Workspace panels
+
+| Panel | Purpose |
+|---|---|
+| **Images** | Layer list; select, reorder and remove images |
+| **Image Canvas** | Shared workspace for positioning images and placing points and links |
+| **Image View** | Single-image view for precise point placement |
+| **Control Points** | Points and links for the active image, with editable pixel and map coordinates, names, labels and constraint types |
+| **World Map** | OpenStreetMap basemap with solved image footprints, GeoJSON overlays, and coordinate picking |
+
+Panels can be docked, floated, closed, or split by dragging a title bar to another panel's edge. The layout is restored on next launch; use **View → Reset panel layout** to return to the default.
+
+> [!NOTE]
+> Map tiles are fetched from `tile.openstreetmap.org` and cached locally, so an internet connection is needed for uncached areas. © OpenStreetMap contributors.
+
+### Extras
+
+- **Clip polygons** - draw a polygon on an image and keep the inside or outside; applied on export, with a cutline GeoJSON written alongside.
+- **GeoJSON layers** - **File → Import GeoJSON layers** overlays vector data, reprojected to the project CRS.
+
+---
+
+## 📤 Exporting
+
+Every image with a solved world transform is written to the folder you choose as `<name>_georef.<ext>`.
+
+| Format | Output |
+|---|---|
+| GeoTIFF | `.tif` with embedded georeferencing |
+| PNG + world file | `.png` + `.pgw` |
+| JPEG + world file | `.jpg` + `.jgw` |
+
+Clipped images additionally produce a `_cutline.geojson` (and a `_mask.png` for formats without alpha).
+
+---
+
+## 💾 Project files
+
+Projects are saved as versioned JSON `.gsp` files containing image paths and transforms, points and labels, observations, map coordinates, the CRS, constraints, and view state.
+
+> [!WARNING]
+> Projects reference the **original image files on disk**. Moving or renaming them breaks the references.
+
+Older files with multi-image points are split into linked per-image points on load.
+
+---
+
+## 📦 Install and run
+
+Requires **Python 3.10+**.
 
 ```powershell
 python -m venv .venv
@@ -13,37 +178,49 @@ python -m pip install -e ".[test]"
 python -m geostitch
 ```
 
-In VS Code, select **GeoStitch: desktop app** in **Run and Debug** and press **F5** to launch the GUI under the debugger.
+---
 
-Use **Settings → Keyboard shortcuts...** to customize command shortcuts. Changes are saved for future launches, duplicate assignments are rejected, and **Restore defaults** resets the built-in bindings.
+## 👩‍💻 Development
 
-Commands are grouped in the menu bar by **File** (project and image import), **Edit** (Undo/Redo project changes), **Image** (arrangement and simulation), **View** (fit and panel visibility), **Control Points**, and **Constraints**. **Settings** contains keyboard shortcut customization. Undo/redo covers project data edits, including point and constraint changes, image imports/removals, arrangement, and image transforms; viewport-only changes such as pan and zoom are not recorded. The **Images**, **Image Canvas**, **Control Points**, and **World Map** panels can be docked, floated, closed, or split horizontally/vertically by dragging a panel title bar to another panel's edge. Their layout is restored on the next launch. Use **View → Reset panel layout** to restore the default arrangement.
+### Layout
 
-To run the model tests:
+```text
+src/geostitch/
+├── app.py            # main window, tools, panels, dialogs
+├── canvas.py         # shared image canvas
+├── image_view.py     # single-image view
+├── map_view.py       # world map and tiles
+├── models.py         # Qt-independent project data
+├── project_io.py     # .gsp serialization
+├── adjustment.py     # alignment solver
+├── georeference.py   # GCP georeferencing solver
+├── export.py         # GeoTIFF / world-file export
+├── masking.py        # clip polygons
+├── vector*.py        # GeoJSON loading and reprojection
+└── assets/           # icons and images
+tests/                # pytest suite
+packaging/            # PyInstaller specs, build script, installer
+```
+
+### Conventions
+
+- Keep Qt UI code in `src/geostitch`; keep `models.py` free of Qt.
+- A control point belongs to exactly one image; points in different images relate only through constraints.
+- Keep `.gsp` serialization backward compatible and covered by tests.
+
+### Tests
 
 ```powershell
 python -m pytest
 ```
 
-## Workflow
+In VS Code, pick **GeoStitch: desktop app** under **Run and Debug** and press **F5** to launch under the debugger.
 
-1. Import images with **Import images** or drag image files into the window. New images are arranged in a balanced, near-square grid on the shared canvas.
-2. Drag an image to reposition it. Select one layer in the image list or click it to show transform handles: drag a corner handle to scale proportionally, or drag the handle above the image to rotate. **Arrange images** rebuilds the near-square grid. **Fit current view** (View menu or `Ctrl+Shift+F`) fits the panel you are working in: the selected image, or all layers if none is selected, on the canvas; the georeferenced footprints on the world map; or the image in the image view.
-3. Toggle **Add points** on, then click image features continuously. Each click creates a control point that belongs to the clicked image, with an increasing image-based name (for example, `survey-001`). The active image selection stays unchanged while adding points. Toggle **Add points** off to return to moving image layers.
-4. Click a point marker on the canvas or in the Image View, or pick it from the Details lists, to select it and edit its name, label, map coordinates and pixel position. Selection alone does not move a point; unlocked markers can be dragged to reposition them. Check **Lock position in image** to prevent dragging or pixel edits. Each point is stored in its image's pixel coordinates and belongs to exactly one image; points in different images are related only through links.
-5. Toggle **Link points** on, click a point marker, then click a marker in a different image to add a tie constraint. The source marker highlights while you choose its match; after each pair the tool resets for the next pair and remains enabled. Alternatively, select one control-point row and choose **Link selected point to...**, then choose its target. The dashed scene line shows a connected pair. Select a link and choose **Remove link** to delete it.
-6. Save the project as a `.gsp` file. It stores image paths and transforms, point names and optional labels, observations, map coordinates, the CRS identifier, and point constraints.
+### Building executables
 
-Use **Image → Simulate alignment** to jointly fit all linked observations and constraints in each connected image group using bounded least squares for translation, rotation, and uniform scale. Each group keeps one reference image fixed; image pairs without enough distinct matches retain their initial rotation and scale. After running alignment, choose **Step 2: Georeference** to solve per-image pixel-to-world transforms against all control-point geographic X/Y coordinates in the project CRS. You can also rerun that second stage from **Image → Georeference from GCPs**. Its report gives residuals per image/control point in CRS units; applying the result stores separate world transforms without changing canvas layout. Both Apply operations are undoable. The app currently estimates transforms only; it does not yet stitch, warp, or resample raster pixels or export a mosaic.
+```powershell
+.\packaging\build.ps1            # folder build + Inno Setup installer
+.\packaging\build.ps1 -OneFile   # single self-contained dist\GeoStitch.exe
+```
 
-The **Control Points** dock is scoped to the active image context. It lists only points observed in that image, shows editable pixel and map coordinates, and lists constraints attached to those points. Selecting a constraint exposes editable endpoints and constraint type.
-
-The **World Map** dock displays an OpenStreetMap basemap that can be panned with the middle mouse button and zoomed with the wheel. Tiles are fetched over the internet from `tile.openstreetmap.org` and cached locally; an internet connection is needed for tiles that are not already cached. The map includes the required © OpenStreetMap contributors attribution. Images with applied GCP world transforms appear at their solved project-CRS positions, north-up; images without applied world transforms are omitted. Use **View → Fit current view** (with the map active) to fit the georeferenced image footprints, or to return to the full-world view when no footprints are available. The overview does not stitch or rasterize image pixels.
-
-Only one image, control point, or constraint is selected at a time. Selecting an item in another panel clears the previous selection.
-
-Use the mouse wheel to zoom and drag the canvas with the middle mouse button to pan. The canvas has a large fixed navigation range, so you can pan far beyond the current images without reaching an edge; **Fit current view** recenters the relevant image layers. Point markers remain screen-sized while zooming; optional labels are shown in the point table, not on the canvas. Map coordinates may be left blank until known; when entered, both X and Y are required.
-
-## Current scope
-
-This release provides a shared transformable image workspace, tie-point observations, point constraints, and georeferencing metadata entry. Constraint links are recorded and visualized; they do not yet solve image alignment. The app does not yet calculate georeferencing transformations, resample imagery, or export a stitched/georeferenced raster. Image paths refer to original files on disk, so moving those files can break project references.
+The installer step requires [Inno Setup 6](https://jrsoftware.org/isinfo.php).
