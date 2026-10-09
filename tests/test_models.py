@@ -1,0 +1,223 @@
+from geostitch.models import GroundControlPoint, PointConstraint, Project
+
+
+def test_linked_point_stores_one_observation_per_image():
+    project = Project()
+    first_image = project.add_image("survey-a.tif")
+    second_image = project.add_image("survey-b.tif")
+    point = GroundControlPoint.create("bridge")
+    project.add_control_point(point)
+
+    point.set_observation(first_image.id, 12.5, 40.0)
+    point.set_observation(second_image.id, 8.0, 21.5)
+    point.set_observation(first_image.id, 13.0, 41.0)
+
+    assert len(point.observations) == 2
+    assert point.observation_for(first_image.id).x == 13.0
+    assert point.observation_for(second_image.id).y == 21.5
+
+
+def test_project_round_trips_linked_points_and_coordinates():
+    project = Project(name="coast survey", crs="EPSG:32610")
+    image = project.add_image("coast.tif")
+    point = GroundControlPoint.create("pier", "Old harbor pier")
+    point.geographic_x = 500_000.0
+    point.geographic_y = 5_400_000.0
+    point.set_observation(image.id, 122.0, 350.0)
+    project.add_control_point(point)
+
+    restored = Project.from_dict(project.to_dict())
+
+    assert restored.name == "coast survey"
+    assert restored.crs == "EPSG:32610"
+    assert restored.control_points[0].geographic_x == 500_000.0
+    assert restored.control_points[0].label == "Old harbor pier"
+    assert restored.control_points[0].observations[0].image_id == image.id
+
+
+def test_default_control_point_names_increase_per_image():
+    project = Project()
+    first_image = project.add_image("survey-a.tif")
+    second_image = project.add_image("survey-b.tif")
+
+    first_name = project.next_control_point_name(first_image.id)
+    first_point = GroundControlPoint.create(first_name)
+    project.add_control_point(first_point)
+    first_point.set_observation(first_image.id, 10.0, 20.0)
+
+    assert project.next_control_point_name(first_image.id) == "survey-a-002"
+    assert project.next_control_point_name(second_image.id) == "survey-b-001"
+
+    second_point = GroundControlPoint.create(project.next_control_point_name(second_image.id), "  Gate  ")
+    assert second_point.label == "Gate"
+
+
+def test_auto_name_skips_an_existing_custom_name():
+    project = Project()
+    image = project.add_image("map.tif")
+    project.add_control_point(GroundControlPoint.create("map-001"))
+
+    assert project.next_control_point_name(image.id) == "map-002"
+
+
+def test_duplicate_control_point_names_are_rejected_case_insensitively():
+    project = Project()
+    project.add_control_point(GroundControlPoint.create("North gate"))
+
+    try:
+        project.add_control_point(GroundControlPoint.create("north GATE"))
+    except ValueError as error:
+        assert "already exists" in str(error)
+    else:
+        raise AssertionError("Duplicate point name should have been rejected")
+
+
+def test_image_transforms_and_constraints_round_trip():
+    project = Project()
+    image = project.add_image("mosaic-part.tif")
+    image.position_x = 425.0
+    image.position_y = -18.0
+    image.rotation = 7.5
+    image.scale = 1.25
+    first = GroundControlPoint.create("west tie")
+    second = GroundControlPoint.create("east tie")
+    project.add_control_point(first)
+    project.add_control_point(second)
+    constraint = PointConstraint.create(first.id, second.id)
+    project.add_constraint(constraint)
+
+    restored = Project.from_dict(project.to_dict())
+
+    assert restored.images[0].position_x == 425.0
+    assert restored.images[0].position_y == -18.0
+    assert restored.images[0].rotation == 7.5
+    assert restored.images[0].scale == 1.25
+    assert restored.constraints[0].first_point_id == first.id
+    assert restored.constraints[0].second_point_id == second.id
+
+
+def test_constraint_rejects_self_links_and_duplicate_pairs():
+    project = Project()
+    first = GroundControlPoint.create("one")
+    second = GroundControlPoint.create("two")
+    project.add_control_point(first)
+    project.add_control_point(second)
+
+    try:
+        project.add_constraint(PointConstraint.create(first.id, first.id))
+    except ValueError as error:
+        assert "itself" in str(error)
+    else:
+        raise AssertionError("Self constraints should have been rejected")
+
+    project.add_constraint(PointConstraint.create(first.id, second.id))
+    try:
+        project.add_constraint(PointConstraint.create(second.id, first.id))
+    except ValueError as error:
+        assert "already connected" in str(error)
+    else:
+        raise AssertionError("Duplicate symmetric constraints should have been rejected")
+
+
+def test_version_one_projects_load_with_default_layer_transforms():
+    project = Project.from_dict({
+        "version": 1,
+        "name": "legacy",
+        "crs": "EPSG:4326",
+        "images": [{"id": "image-1", "path": "legacy.png", "name": "legacy.png"}],
+        "control_points": [],
+    })
+
+    assert project.images[0].position_x is None
+    assert project.images[0].position_y == 0.0
+    assert project.images[0].rotation == 0.0
+    assert project.images[0].scale == 1.0
+    assert project.images[0].world_x is None
+    assert project.images[0].world_y is None
+    assert project.images[0].world_rotation == 0.0
+    assert project.images[0].world_scale == 1.0
+    assert project.constraints == []
+
+
+def test_project_serialization_is_an_independent_snapshot():
+    project = Project()
+    image = project.add_image("snapshot.png")
+    point = GroundControlPoint.create("snapshot-001")
+    point.set_observation(image.id, 10.0, 20.0)
+    project.add_control_point(point)
+    snapshot = project.to_dict()
+
+    image.position_x = 55.0
+    point.observations[0].x = 44.0
+
+    assert snapshot["images"][0]["position_x"] is None
+    assert snapshot["control_points"][0]["observations"][0]["x"] == 10.0
+
+
+def test_observation_lock_round_trips_and_legacy_projects_default_unlocked():
+    project = Project()
+    image = project.add_image("locked.png")
+    point = GroundControlPoint.create("locked-001")
+    point.set_observation(image.id, 12.0, 34.0)
+    point.observation_for(image.id).locked = True
+    project.add_control_point(point)
+
+    restored = Project.from_dict(project.to_dict())
+    assert restored.control_points[0].observation_for(image.id).locked
+
+    legacy = Project.from_dict({
+        "version": 3,
+        "images": [{"id": image.id, "path": image.path, "name": image.name}],
+        "control_points": [{
+            "id": "legacy-point",
+            "name": "legacy",
+            "observations": [{"image_id": image.id, "x": 1.0, "y": 2.0}],
+        }],
+    })
+    assert not legacy.control_points[0].observation_for(image.id).locked
+
+    locked_point = restored.control_points[0]
+    try:
+        locked_point.set_observation(image.id, 90.0, 91.0)
+    except ValueError as error:
+        assert "locked" in str(error)
+    else:
+        raise AssertionError("A locked image observation must not be moved")
+
+
+def test_unique_control_point_name_increments_trailing_number():
+    from geostitch.models import GroundControlPoint, Project
+
+    project = Project()
+    for name in ("gcp-009", "gcp-010", "corner"):
+        project.add_control_point(GroundControlPoint.create(name))
+
+    assert project.unique_control_point_name("fresh") == "fresh"
+    assert project.unique_control_point_name("GCP-009") == "GCP-011"
+    assert project.unique_control_point_name("corner") == "corner-2"
+
+
+def test_loading_legacy_shared_point_splits_it_into_linked_per_image_points():
+    from geostitch.models import Project
+
+    legacy = {
+        "version": 8,
+        "images": [
+            {"id": "a", "path": "a.png", "name": "a.png"},
+            {"id": "b", "path": "b.png", "name": "b.png"},
+        ],
+        "control_points": [{
+            "id": "p", "name": "gcp", "geographic_x": 1.0, "geographic_y": 2.0,
+            "observations": [{"image_id": "a", "x": 1.0, "y": 2.0}, {"image_id": "b", "x": 3.0, "y": 4.0}],
+        }],
+    }
+
+    project = Project.from_dict(legacy)
+
+    assert [point.image_id for point in project.control_points] == ["a", "b"]
+    assert project.control_points[1].name == "gcp-b"
+    assert project.control_points[1].geographic_x == 1.0
+    assert len(project.constraints) == 1
+    assert {project.constraints[0].first_point_id, project.constraints[0].second_point_id} == {
+        point.id for point in project.control_points
+    }

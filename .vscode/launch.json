@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "GeoStitch: desktop app",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "geostitch",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

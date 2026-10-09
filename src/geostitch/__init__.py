@@ -1,0 +1,1 @@
+"""GeoStitch control-point editor."""
