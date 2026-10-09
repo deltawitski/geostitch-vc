@@ -1,6 +1,8 @@
 ﻿<div align="center">
 
-# <img src="src/geostitch/assets/app_icon.png" alt="" width="48" align="center"> GeoStitch
+<img src="src/geostitch/assets/app_icon.png" alt="GeoStitch icon" width="96">
+
+# GeoStitch
 
 **Bring in raster images, stitch them together virtually, and georeference them against the real world.**
 
