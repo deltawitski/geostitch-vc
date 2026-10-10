@@ -68,6 +68,9 @@ def install_refit_solver(window, monkeypatch, converged=False):
 
 def test_refit_uses_saved_settings_progress_and_updates_report_without_undo(refit_window, monkeypatch):
     app, window, image_id, point_id, errors = refit_window
+    window.project.georeference_settings = SolverSettings(
+        0.25, 321, False, transform_model="translation", loss="huber", parameter_scaling="jacobian",
+    )
     calls = install_refit_solver(window, monkeypatch)
     before_count = window.undo_stack.count()
     window._resolve_world_transforms()
@@ -76,6 +79,7 @@ def test_refit_uses_saved_settings_progress_and_updates_report_without_undo(refi
     assert crs == window.project.crs
     assert kwargs["tolerance"] == 0.25
     assert kwargs["max_iterations"] == 321
+    assert kwargs["settings"] == window.project.georeference_settings
     assert kwargs["initial_transforms"] == {image_id: (10.0, 45.0, 12.0, 0.001)}
     assert window._georeference_result is result
     assert window._georeference_result_tolerance == 0.25

@@ -142,6 +142,16 @@ class SolverSettings:
     tolerance: float = 0.5
     max_iterations: int = 100
     auto_apply: bool = True
+    transform_model: str = "similarity"
+    optimizer_method: str = "trf"
+    loss: str = "linear"
+    loss_scale: float = 1.0
+    scale_min: float | None = None
+    scale_max: float | None = None
+    ftol: float = 1e-10
+    xtol: float = 1e-10
+    gtol: float = 1e-10
+    parameter_scaling: str = "unit"
 
     def __post_init__(self) -> None:
         if not isfinite(self.tolerance) or self.tolerance <= 0:
@@ -150,14 +160,37 @@ class SolverSettings:
             raise ValueError("Maximum solver iterations must be an integer from 1 to 10000.")
         if not isinstance(self.auto_apply, bool):
             raise ValueError("Automatic application must be true or false.")
+        for value, choices, label in (
+            (self.transform_model, ("translation", "rigid", "similarity"), "Transform model"),
+            (self.optimizer_method, ("trf", "dogbox"), "Optimizer method"),
+            (self.loss, ("linear", "soft_l1", "huber", "cauchy"), "Robust loss"),
+            (self.parameter_scaling, ("unit", "jacobian"), "Parameter scaling"),
+        ):
+            if value not in choices:
+                raise ValueError(f"{label} is not supported.")
+        for value, label in (
+            (self.loss_scale, "Robust loss threshold"), (self.ftol, "Error improvement threshold"),
+            (self.xtol, "Transform change threshold"), (self.gtol, "Gradient threshold"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be finite and greater than zero.")
+        if min(self.ftol, self.xtol, self.gtol) < 1e-14:
+            raise ValueError("Convergence thresholds must be at least 1e-14.")
+        for value in (self.scale_min, self.scale_max):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
+            ):
+                raise ValueError("Scale bounds must be finite and greater than zero.")
+        if self.scale_min is not None and self.scale_max is not None and self.scale_min >= self.scale_max:
+            raise ValueError("Minimum scale must be less than maximum scale.")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: SolverSettings) -> SolverSettings:
         if not isinstance(data, dict):
             raise ValueError("Solver settings must be an object.")
-        return cls(float(data.get("tolerance", defaults.tolerance)),
-                   data.get("max_iterations", defaults.max_iterations),
-                   data.get("auto_apply", defaults.auto_apply))
+        values = {name: data.get(name, value) for name, value in vars(defaults).items()}
+        values["tolerance"] = float(values["tolerance"])
+        return cls(**values)
 
 
 @dataclass

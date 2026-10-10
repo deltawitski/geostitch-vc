@@ -115,11 +115,13 @@ def check_readiness(
             for pair, matches in pairs.items():
                 point_ids = tuple(dict.fromkeys(point_id for match in matches for point_id in match[1:3]))
                 link_ids = tuple(match[0] for match in matches)
-                if len(matches) < 2:
+                if len(matches) < 2 and project.alignment_settings.transform_model != "translation":
                     issues.append(ReadinessIssue("alignment", "Warning", "translation_only",
                         "An image pair has only one linked observation. Non-reference images touching this pair retain their rotation and scale.",
                         "Add at least one more matching point pair at a distinct location.", pair, point_ids, link_ids))
-                elif len({match[3] for match in matches}) < 2 or len({match[4] for match in matches}) < 2:
+                elif len(matches) >= 2 and project.alignment_settings.transform_model != "translation" and (
+                    len({match[3] for match in matches}) < 2 or len({match[4] for match in matches}) < 2
+                ):
                     issues.append(ReadinessIssue("alignment", "Warning", "coincident_links",
                         "Linked observations repeat a single pixel location on an endpoint image; rotation and scale are weakly constrained.",
                         "Use distinct matching features spread across both images.", pair, point_ids, link_ids))
@@ -168,7 +170,7 @@ def check_readiness(
                         "Assign geographic coordinates to points in this group, or link it to a controlled group.", members))
                 continue
             unique = {(round(location[0], 9), round(location[1], 9)) for point_id, location in matches}
-            if len(unique) < 2:
+            if len(unique) < 2 and project.georeference_settings.transform_model != "translation":
                 issues.append(ReadinessIssue("georeference", "Warning", "translation_only",
                     "An image group has only one distinct geographic-control location; rotation and scale are not determined by its controls.",
                     "Add another geographic control at a distinct group-frame location.", members, point_ids))

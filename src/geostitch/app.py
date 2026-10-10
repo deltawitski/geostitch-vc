@@ -4251,7 +4251,7 @@ class MainWindow(QMainWindow):
                     )
                 return simulate_alignment(
                     candidate, tolerance=config.tolerance, max_iterations=config.max_iterations,
-                    initial_transforms=initial, progress=progress,
+                    initial_transforms=initial, progress=progress, settings=config,
                 )
             initial = {
                 image.id: (image.world_x, image.world_y, image.world_rotation, image.world_scale)
@@ -4259,7 +4259,7 @@ class MainWindow(QMainWindow):
             }
             return simulate_georeference(
                 candidate, tolerance=config.tolerance, max_iterations=config.max_iterations,
-                initial_transforms=initial, progress=progress,
+                initial_transforms=initial, progress=progress, settings=config,
             )
 
     def _run_solver_pipeline(self, stages: tuple[str, ...]) -> bool:
@@ -4380,53 +4380,93 @@ class MainWindow(QMainWindow):
         ]
         if result.optimizer_message:
             lines.append(f"Optimizer message: {result.optimizer_message}")
-        if result.converged:
-            lines.append("Next steps: Target reached; no solver-setting change is needed for this fit.")
-            return lines
-        if result.optimizer_status == 0:
-            lines.append(
-                "Next steps: Increase Maximum iterations and rerun to allow more optimization. "
-                "This does not guarantee that the residual target is achievable."
-            )
-        elif result.optimizer_status == 1:
-            lines.append(
-                "Next steps: The optimizer found a stationary least-squares fit, not necessarily a global minimum. "
-                "More iterations alone are unlikely to help; check the largest residuals for conflicting observations."
-            )
-        elif result.optimizer_status in (2, 3, 4):
-            lines.append(
-                "Next steps: Improvement or transform updates became too small. This may be a best fit, "
-                "a local minimum, or numerical stagnation; the stop reason alone cannot distinguish them. "
-                "Check the largest residuals and initial transforms before increasing Maximum iterations."
-            )
-        elif result.optimizer_status is None:
-            lines.append("Next steps: Rerun the solver to capture its stop reason before changing solver settings.")
-            return lines
-        else:
-            lines.append("Next steps: Check inputs and initial transforms in Image > Solver diagnostics before rerunning.")
-        if stage == "alignment":
-            lines.append(
-                "Review high-error links in Link Review and correct mismatched or misplaced endpoints. "
-                "Use distinct, well-spread matches; single-match pairs keep rotation and scale fixed. "
-                "Check the fixed reference image and initial layout; alignment scale is limited to 0.05-20."
-            )
-        else:
-            lines.append(
-                "Check high-error control points, the project CRS, coordinate units, and pixel locations. "
-                "Use distinct, well-spread controls. Linked images are fitted as rigid groups; "
-                "review alignment first if a group's internal geometry is wrong."
-            )
-        lines.append(
-            "Run Image > Solver diagnostics to check control geometry. The similarity model cannot correct "
-            "shear, perspective, or local distortion. Only relax the target maximum residual if the "
-            "remaining error is acceptable; relaxing it does not improve the fit."
+        config = result.settings
+        if config is not None:
+            lines.extend((
+                f"Transform model: {config.transform_model} | Optimizer: {config.optimizer_method}",
+                f"Residual loss: {config.loss} | Robust loss threshold: {config.loss_scale:g}",
+                f"Convergence thresholds: ftol={config.ftol:g}, xtol={config.xtol:g}, gtol={config.gtol:g}",
+                f"Parameter scaling: {config.parameter_scaling}",
+            ))
+            if config.transform_model == "similarity":
+                minimum = config.scale_min if config.scale_min is not None else (0.05 if stage == "alignment" else 1e-12)
+                maximum = config.scale_max if config.scale_max is not None else (20.0 if stage == "alignment" else float("inf"))
+                lines.append(f"Optimized scale bounds: {minimum:g} to {maximum:g}")
+            else:
+                lines.append("Fixed parameters: rotation and scale" if config.transform_model == "translation" else "Fixed parameters: scale")
+            if config.loss != "linear":
+                lines.append("Robust loss downweights residual components; reported errors and the accuracy target still use raw distances.")
+        return lines
+
+    def _solver_review_lines(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> list[str]:
+        config = result.settings
+        tolerance = config.tolerance if config is not None else (
+            self._alignment_feedback.tolerance if stage == "alignment" and self._alignment_feedback is not None
+            else self._georeference_result_tolerance if stage == "georeference" else None
         )
+        units = "scene units" if stage == "alignment" else "CRS units"
+        target = f" (target {tolerance:g})" if tolerance is not None else ""
+        reasons = {
+            -1: "Optimizer could not proceed.",
+            0: "Evaluation limit reached.",
+            1: "No further improvement found. More iterations alone are unlikely to help.",
+            2: "Error improvement became too small; a best fit or numerical stagnation is possible.",
+            3: "Transform changes became too small; a best fit or numerical stagnation is possible.",
+            4: "Improvement and transform changes became too small; numerical stagnation is possible.",
+        }
+        lines = [f"Maximum error: {result.maximum_residual:.4g} {units}{target}."]
+        if result.converged:
+            lines.append("Target reached; no solver-setting change is needed for this fit.")
+            return lines
+        lines.append(f"Reason: {reasons.get(result.optimizer_status, 'Stop reason unavailable.')}")
+        residuals = result.constraint_residuals if isinstance(result, AlignmentResult) else result.observation_residuals
+        above_target = {key: value for key, value in residuals.items() if tolerance is None or value > tolerance}
+        if tolerance is not None:
+            noun = "links" if stage == "alignment" else "control observations"
+            lines.append(f"{len(above_target)} of {len(residuals)} {noun} exceed the target.")
+        worst = sorted(above_target.items(), key=lambda item: item[1], reverse=True)[:2]
+        if worst:
+            labels = []
+            constraints = {item.id: item for item in self.project.constraints}
+            points = {point.id: point for point in self.project.control_points}
+            images = {image.id: image for image in self.project.images}
+            for key, value in worst:
+                if stage == "alignment":
+                    link = constraints.get(key)
+                    name = link.name if link is not None and link.name else "Unknown link"
+                else:
+                    image_id, point_id = key
+                    point, image = points.get(point_id), images.get(image_id)
+                    name = f"{point.display_name if point else 'Unknown point'} ({image.name if image else 'Unknown image'})"
+                labels.append(f"{name}: {value:.4g}")
+            lines.append(f"Highest errors: {'; '.join(labels)} {units}.")
+        if result.optimizer_status == 0:
+            lines.append("Next: Increase Maximum iterations and rerun.")
+        elif result.optimizer_status is None:
+            lines.append("Next: Rerun the solver to capture its stop reason.")
+        elif result.optimizer_status == -1:
+            lines.append("Next: Check inputs and initial transforms in Image > Solver diagnostics.")
+        else:
+            lines.append(
+                "Next: Review the highest-error links in Link Review and check their point positions."
+                if stage == "alignment" else
+                "Next: Check the highest-error controls, their pixel positions, and the project CRS."
+            )
+            if config is not None and config.transform_model != "similarity":
+                lines.append(
+                    "Then: Switch to rigid for rotation, or similarity for rotation and scale, if needed."
+                    if config.transform_model == "translation" else
+                    "Then: Use Similarity if scale needs to change; Rigid holds it fixed."
+                )
+            elif result.optimizer_status in (2, 3, 4):
+                lines.append("Then: Check the initial transforms before raising the iteration limit.")
         return lines
 
     def _review_solver_result(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> str:
         box = QMessageBox(QMessageBox.Icon.Warning, "Solver target not reached",
-                          self._solver_summary(stage, result, "Target not reached"), parent=self)
-        box.setInformativeText("\n".join(self._solver_termination_lines(stage, result)))
+                          f"{stage.title()} target not reached", parent=self)
+        box.setInformativeText("\n".join(self._solver_review_lines(stage, result)))
+        box.setDetailedText("\n".join(self._solver_termination_lines(stage, result)))
         apply_button = box.addButton("Apply best result", QMessageBox.ButtonRole.AcceptRole)
         settings_button = box.addButton("Adjust settings", QMessageBox.ButtonRole.ActionRole)
         discard_button = box.addButton("Discard", QMessageBox.ButtonRole.RejectRole)
@@ -4449,7 +4489,7 @@ class MainWindow(QMainWindow):
             f"{stage.title()} report",
             f"Status: {'target reached' if result.converged else 'target not reached'}",
             self._solver_summary(stage, result, "Last result"),
-            *self._solver_termination_lines(stage, result),
+            *self._solver_review_lines(stage, result),
             "",
         ]
         image_names = {image.id: image.name or image.id for image in self.project.images}
@@ -4483,6 +4523,7 @@ class MainWindow(QMainWindow):
                 image_name = image_names.get(image_id, image_id)
                 point_name = point_names.get(point_id, point_id)
                 lines.append(f"{image_name} / {point_name}: {residual:.4f} {units}")
+        lines.extend(("", "Technical details", *self._solver_termination_lines(stage, result)))
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Last {stage} report")
         dialog.resize(640, 480)

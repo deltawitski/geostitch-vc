@@ -4,7 +4,7 @@ import pytest
 
 from geostitch.adjustment import AlignmentResult
 from geostitch.alignment_feedback import AlignmentFeedback, residual_color
-from geostitch.models import GroundControlPoint, PointConstraint, Project
+from geostitch.models import GroundControlPoint, PointConstraint, Project, SolverSettings
 
 
 def make_feedback_project():
@@ -100,7 +100,10 @@ def test_feedback_version_two_saves_only_original_inputs_and_result():
 
 def test_feedback_preserves_optimizer_diagnostics_in_saved_project():
     project, images, points, links, result = make_feedback_project()
-    result = replace(result, optimizer_status=1, optimizer_message="gtol satisfied", max_iterations=321)
+    result = replace(
+        result, optimizer_status=1, optimizer_message="gtol satisfied", max_iterations=321,
+        settings=SolverSettings(transform_model="rigid", loss="huber"),
+    )
     project.alignment_feedback = AlignmentFeedback.capture(project, result, 0.5)
 
     restored = Project.from_dict(project.to_dict())
@@ -134,6 +137,14 @@ def test_feedback_rejects_invalid_optimizer_diagnostics(field, value):
     project, images, points, links, result = make_feedback_project()
     data = AlignmentFeedback.capture(project, result, 0.5).to_dict()
     data["result"][field] = value
+    with pytest.raises(ValueError):
+        AlignmentFeedback.from_dict(data)
+
+
+def test_feedback_rejects_invalid_saved_run_settings():
+    project, images, points, links, result = make_feedback_project()
+    data = AlignmentFeedback.capture(project, result, 0.5).to_dict()
+    data["result"]["settings"] = {"transform_model": "affine"}
     with pytest.raises(ValueError):
         AlignmentFeedback.from_dict(data)
 

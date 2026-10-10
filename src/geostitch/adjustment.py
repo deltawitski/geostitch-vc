@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from math import degrees, hypot, radians
 from typing import Callable
 
-from geostitch.models import Project
+from geostitch.models import Project, SolverSettings
 from geostitch.transforms import apply_similarity_transform as _apply_transform
 
 ImageTransform = tuple[float, float, float, float]
@@ -20,6 +20,7 @@ class AlignmentResult:
     optimizer_status: int | None = None
     optimizer_message: str = ""
     max_iterations: int | None = None
+    settings: SolverSettings | None = None
 
     @property
     def maximum_residual(self) -> float:
@@ -43,13 +44,16 @@ def simulate_alignment(
     max_iterations: int = 100,
     initial_transforms: dict[str, ImageTransform] | None = None,
     progress: Callable[[float], None] | None = None,
+    settings: SolverSettings | None = None,
 ) -> AlignmentResult:
-    """Jointly align every constrained image with a global least-squares solve.
+    """Jointly align constrained images with the configured transform and loss.
 
     One image in each connected image component is held fixed to remove the free
     global translation/rotation/scale. Every linked observation contributes to the
     same residual vector. Image pixels are not resampled or warped.
     """
+    config = settings or SolverSettings(tolerance, max_iterations)
+    tolerance, max_iterations = config.tolerance, config.max_iterations
     if tolerance <= 0:
         raise ValueError("Tolerance must be greater than zero.")
     if max_iterations < 1:
@@ -111,19 +115,28 @@ def simulate_alignment(
         if count < 2
         for image_id in pair
     }
+    translation_ids = set(variable_image_ids) if config.transform_model == "translation" else underconstrained_images
+    scale_min = config.scale_min if config.scale_min is not None else 0.05
+    scale_max = config.scale_max if config.scale_max is not None else 20.0
+    if config.transform_model == "similarity" and scale_min >= scale_max:
+        raise ValueError("Minimum alignment scale must be less than maximum scale.")
     initial_values: list[float] = []
     lower_bounds: list[float] = []
     upper_bounds: list[float] = []
     for image_id in variable_image_ids:
         x, y, rotation, scale = transforms[image_id]
-        if image_id in underconstrained_images:
+        if image_id in translation_ids:
             initial_values.extend((x, y))
             lower_bounds.extend((-float("inf"), -float("inf")))
             upper_bounds.extend((float("inf"), float("inf")))
+        elif config.transform_model == "rigid":
+            initial_values.extend((x, y, radians(rotation)))
+            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf")))
+            upper_bounds.extend((float("inf"), float("inf"), float("inf")))
         else:
-            initial_values.extend((x, y, radians(rotation), scale))
-            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf"), 0.05))
-            upper_bounds.extend((float("inf"), float("inf"), float("inf"), 20.0))
+            initial_values.extend((x, y, radians(rotation), min(scale_max, max(scale_min, scale))))
+            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf"), scale_min))
+            upper_bounds.extend((float("inf"), float("inf"), float("inf"), scale_max))
 
     evaluations = [0]
     budget = max_iterations * (len(initial_values) + 1)
@@ -132,7 +145,7 @@ def simulate_alignment(
         candidate = dict(transforms)
         offset = 0
         for image_id in variable_image_ids:
-            if image_id in underconstrained_images:
+            if image_id in translation_ids:
                 candidate[image_id] = (
                     values[offset],
                     values[offset + 1],
@@ -140,6 +153,11 @@ def simulate_alignment(
                     transforms[image_id][3],
                 )
                 offset += 2
+            elif config.transform_model == "rigid":
+                candidate[image_id] = (
+                    values[offset], values[offset + 1], degrees(values[offset + 2]), transforms[image_id][3],
+                )
+                offset += 3
             else:
                 candidate[image_id] = (
                     values[offset],
@@ -176,9 +194,13 @@ def simulate_alignment(
             initial_values,
             bounds=(lower_bounds, upper_bounds),
             max_nfev=max_iterations,
-            ftol=1e-10,
-            xtol=1e-10,
-            gtol=1e-10,
+            method=config.optimizer_method,
+            loss=config.loss,
+            f_scale=config.loss_scale,
+            x_scale="jac" if config.parameter_scaling == "jacobian" else 1.0,
+            ftol=config.ftol,
+            xtol=config.xtol,
+            gtol=config.gtol,
         )
         transforms = unpack(optimization.x.tolist())
         iterations_run = optimization.nfev
@@ -203,6 +225,7 @@ def simulate_alignment(
         optimizer_status=optimizer_status,
         optimizer_message=optimizer_message,
         max_iterations=max_iterations,
+        settings=config,
     )
 
 

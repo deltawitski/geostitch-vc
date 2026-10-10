@@ -5,7 +5,7 @@ from math import isfinite, sqrt
 from typing import Any
 
 from geostitch.adjustment import AlignmentResult, ImageTransform
-from geostitch.models import Project
+from geostitch.models import Project, SolverSettings
 
 
 def residual_color(value: float, tolerance: float) -> str:
@@ -93,6 +93,7 @@ class AlignmentFeedback:
                 "optimizer_status": self.result.optimizer_status,
                 "optimizer_message": self.result.optimizer_message,
                 "max_iterations": self.result.max_iterations,
+                "settings": vars(self.result.settings).copy() if self.result.settings is not None else None,
             },
             "tolerance": self.tolerance,
             "input_signature": [[list(entry) for entry in group] for group in self.input_signature],
@@ -149,6 +150,7 @@ class AlignmentFeedback:
             transforms, _read_residuals(saved_result["constraint_residuals"]),
             iterations, saved_result["converged"], tuple(anchors),
             optimizer_status, optimizer_message, max_iterations,
+            SolverSettings.from_dict(saved_result["settings"], SolverSettings()) if saved_result.get("settings") is not None else None,
         )
         groups = data["input_signature"]
         if not isinstance(groups, list) or len(groups) != 3:

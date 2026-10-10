@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageB
 from geostitch.app import MainWindow
 from geostitch.alignment_feedback import AlignmentFeedback
 from geostitch.icons import make_icon
-from geostitch.models import SolverSettings
+from geostitch.models import GroundControlPoint, PointConstraint, SolverSettings
 from geostitch.solver_dialog import SolverSettingsDialog, SolverToolbarControl
 from test_solver_workflow import solver_window
 
@@ -154,11 +154,14 @@ def test_reports_distinguish_stop_reason_from_target_and_recommend_changes(
     assert "Status: target not reached" in text
     assert "Function evaluations: 7 / 321" in text
     assert "Optimizer stop:" in text
+    assert text.index("Reason:") < text.index("Technical details")
+    if status is not None:
+        assert text.index("Technical details") < text.index("Optimizer message:")
     assert expected in text
     if status is not None:
         assert "Optimizer message: Captured stop reason" in text
-        assert "relaxing it does not improve the fit" in text
-        assert ("Link Review" if stage == "alignment" else "project CRS") in text
+        if status in (1, 2, 3, 4):
+            assert ("Link Review" if stage == "alignment" else "project CRS") in text
     else:
         assert "Optimizer stop: Unavailable for this result" in text
     if status != 0:
@@ -174,25 +177,123 @@ def test_target_miss_review_shows_stop_reason_and_guidance(solver_window, monkey
         converged=False, optimizer_status=status, optimizer_message="Captured reason", max_iterations=100,
     )
     messages = []
+    details = []
 
     def inspect(box):
         messages.append(box.informativeText())
+        details.append(box.detailedText())
         return 0
 
     monkeypatch.setattr(QMessageBox, "exec", inspect)
     assert window._review_solver_result(stage, result) == "discard"
     assert len(messages) == 1
-    assert "Optimizer message: Captured reason" in messages[0]
-    assert ("Increase Maximum iterations" if status == 0 else "stationary least-squares fit") in messages[0]
+    assert "Optimizer message: Captured reason" in details[0]
+    assert "Optimizer message:" not in messages[0]
+    assert "Convergence thresholds:" not in messages[0]
+    assert len(messages[0]) < 800
+    assert ("Increase Maximum iterations" if status == 0 else "More iterations alone are unlikely to help") in messages[0]
 
 
 def test_target_reached_report_does_not_suggest_solver_changes(solver_window):
     app, window, images, alignment, world, errors = solver_window
     result = replace(alignment, optimizer_status=1, optimizer_message="gtol satisfied")
-    text = "\n".join(window._solver_termination_lines("alignment", result))
+    text = "\n".join(window._solver_review_lines("alignment", result))
     assert "Target reached; no solver-setting change is needed" in text
     assert "Increase Maximum iterations" not in text
     assert "relax" not in text
+
+
+@pytest.mark.parametrize("stage", ["alignment", "georeference"])
+def test_concise_review_counts_errors_and_names_only_the_two_worst(solver_window, stage):
+    app, window, images, alignment, world, errors = solver_window
+    config = SolverSettings(tolerance=0.5)
+    if stage == "alignment":
+        first, second = window.project.constraints[:2]
+        extra = GroundControlPoint.create("extra-review-point")
+        extra.set_observation(images[2].id, 10, 20)
+        window.project.add_control_point(extra)
+        third = PointConstraint.create(first.first_point_id, extra.id)
+        window.project.add_constraint(third)
+        residuals = {first.id: 1.1, second.id: 9.0, third.id: 4.5}
+        result = replace(alignment, constraint_residuals=residuals, converged=False, optimizer_status=1, settings=config)
+        expected_names = [second.name, third.name]
+        omitted_name = first.name
+    else:
+        points = window.project.control_points[:3]
+        residuals = {(point.image_id, point.id): value for point, value in zip(points, (1.1, 9.0, 4.5))}
+        result = replace(world, observation_residuals=residuals, converged=False, optimizer_status=1, settings=config)
+        expected_names = [points[1].display_name, points[2].display_name]
+        omitted_name = points[0].display_name
+    lines = window._solver_review_lines(stage, result)
+    assert "3 of 3" in "\n".join(lines)
+    highest = next(line for line in lines if line.startswith("Highest errors:"))
+    assert expected_names[0] in highest and expected_names[1] in highest
+    assert highest.index(expected_names[0]) < highest.index(expected_names[1])
+    assert omitted_name not in highest
+    assert len(lines) <= 6
+    assert "ftol" not in "\n".join(lines)
+
+
+@pytest.mark.parametrize("stage", ["alignment", "georeference"])
+def test_advanced_dialog_controls_are_loaded_and_applied(stage, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    settings = SolverSettings(
+        transform_model="rigid", optimizer_method="dogbox", loss="huber", loss_scale=2.5,
+        ftol=1e-8, xtol=1e-9, gtol=1e-7, parameter_scaling="jacobian",
+    )
+    dialog = SolverSettingsDialog(stage, settings)
+    applied = []
+    dialog.settings_applied.connect(applied.append)
+    try:
+        assert dialog.model_combo.currentData() == "rigid"
+        assert dialog.method_combo.currentData() == "dogbox"
+        assert dialog.loss_scale_spin.isEnabled()
+        assert not dialog.scale_min_spin.isEnabled()
+        assert dialog.apply_settings()
+        assert applied[-1] == settings
+        dialog.advanced_group.setChecked(True)
+        dialog.model_combo.setCurrentIndex(dialog.model_combo.findData("similarity"))
+        dialog.default_bounds_checkbox.setChecked(False)
+        dialog.scale_max_checkbox.setChecked(True)
+        dialog.scale_min_spin.setValue(0.2)
+        dialog.scale_max_spin.setValue(5)
+        assert dialog.scale_min_spin.isEnabled() and dialog.scale_max_spin.isEnabled()
+        dialog.run()
+        assert dialog.run_requested
+        assert applied[-1] == replace(settings, transform_model="similarity", scale_min=0.2, scale_max=5)
+    finally:
+        dialog.close()
+
+
+def test_dialog_rejects_invalid_scale_bounds_without_running(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    dialog = SolverSettingsDialog("alignment", SolverSettings())
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args[2]))
+    applied = []
+    dialog.settings_applied.connect(applied.append)
+    try:
+        dialog.default_bounds_checkbox.setChecked(False)
+        dialog.scale_min_spin.setValue(5)
+        dialog.scale_max_spin.setValue(1)
+        dialog.run()
+        assert not dialog.run_requested
+        assert applied == []
+        assert "Minimum scale" in warnings[0]
+    finally:
+        dialog.close()
+
+
+def test_report_shows_run_settings_not_current_settings(solver_window):
+    app, window, images, alignment, world, errors = solver_window
+    settings = SolverSettings(transform_model="translation", optimizer_method="dogbox", loss="huber", loss_scale=3)
+    result = replace(alignment, converged=False, optimizer_status=1, settings=settings)
+    text = "\n".join(window._solver_termination_lines("alignment", result))
+    assert "Transform model: translation | Optimizer: dogbox" in text
+    assert "Robust loss threshold: 3" in text
+    assert "Fixed parameters: rotation and scale" in text
+    assert "accuracy target still use raw distances" in text
+    assert "Switch to rigid" in "\n".join(window._solver_review_lines("alignment", result))
 
 
 def test_saved_solver_settings_are_restored_on_reopen(solver_window, tmp_path):

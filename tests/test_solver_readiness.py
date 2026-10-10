@@ -1,4 +1,4 @@
-from geostitch.models import GroundControlPoint, PointConstraint, Project
+from geostitch.models import GroundControlPoint, PointConstraint, Project, SolverSettings
 from geostitch.solver_readiness import check_readiness
 
 
@@ -29,6 +29,19 @@ def test_single_link_warns_translation_only_without_blocking():
     warning = next(issue for issue in issues if issue.code == "translation_only")
     assert set(warning.image_ids) == {first.id, second.id}
     assert warning.constraint_ids == (link.id,)
+
+
+def test_explicit_translation_model_does_not_warn_about_automatic_parameter_fallback():
+    project = Project()
+    project.alignment_settings = SolverSettings(transform_model="translation")
+    project.georeference_settings = SolverSettings(transform_model="translation")
+    first, second = [project.add_image(name) for name in ("one.png", "two.png")]
+    points = [add_point(project, image, str(index), (10, 20)) for index, image in enumerate((first, second))]
+    points[0].geographic_x, points[0].geographic_y = 100, 200
+    project.add_constraint(PointConstraint.create(points[0].id, points[1].id))
+    issues = check_readiness(project)
+    assert not any(issue.code == "translation_only" for issue in issues)
+    assert not any(issue.severity == "Error" for issue in issues)
 
 
 def test_disconnected_and_isolated_images_are_identified():

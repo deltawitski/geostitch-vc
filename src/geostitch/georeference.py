@@ -5,7 +5,7 @@ from math import degrees, hypot, radians
 from cmath import phase
 from typing import Callable
 
-from geostitch.models import Project
+from geostitch.models import Project, SolverSettings
 from geostitch.transforms import apply_similarity_transform as _apply_world_transform
 
 WorldTransform = tuple[float, float, float, float]
@@ -22,6 +22,7 @@ class GeoreferenceResult:
     optimizer_status: int | None = None
     optimizer_message: str = ""
     max_iterations: int | None = None
+    settings: SolverSettings | None = None
 
     @property
     def maximum_residual(self) -> float:
@@ -44,8 +45,11 @@ def simulate_georeference(
     max_iterations: int = 1000,
     initial_transforms: dict[str, WorldTransform] | None = None,
     progress: Callable[[float], None] | None = None,
+    settings: SolverSettings | None = None,
 ) -> GeoreferenceResult:
-    """Jointly fit per-image pixel-to-world similarity transforms to every GCP observation."""
+    """Fit each connected group's pixel-to-world transform to its GCP observations."""
+    config = settings or SolverSettings(tolerance, max_iterations)
+    tolerance, max_iterations = config.tolerance, config.max_iterations
     if tolerance <= 0:
         raise ValueError("Tolerance must be greater than zero.")
     if max_iterations < 1:
@@ -104,6 +108,10 @@ def simulate_georeference(
     values: list[float] = []
     lower_bounds: list[float] = []
     upper_bounds: list[float] = []
+    scale_min = config.scale_min if config.scale_min is not None else 1e-12
+    scale_max = config.scale_max if config.scale_max is not None else float("inf")
+    if config.transform_model == "similarity" and scale_min >= scale_max:
+        raise ValueError("Minimum geographic scale must be less than maximum scale.")
     for chunk_id in chunk_ids:
         image_matches = matches_by_image[chunk_id]
         current = chunk_initial.get(chunk_id) or _closed_form_fit(image_matches) or (
@@ -112,9 +120,26 @@ def simulate_georeference(
             0.0,
             1.0,
         )
+        if chunk_id not in chunk_initial:
+            x, y, rotation, scale = current
+            if config.transform_model == "translation":
+                rotation, scale = 0.0, 1.0
+            elif config.transform_model == "rigid":
+                scale = 1.0
+            else:
+                scale = min(scale_max, max(scale_min, scale))
+            offsets = [
+                _apply_world_transform(match.pixel_x, match.pixel_y, (0.0, 0.0, rotation, scale))
+                for match in image_matches
+            ]
+            current = (
+                sum(match.world_x - offset[0] for match, offset in zip(image_matches, offsets)) / len(image_matches),
+                sum(match.world_y - offset[1] for match, offset in zip(image_matches, offsets)) / len(image_matches),
+                rotation, scale,
+            )
         initial[chunk_id] = current
         unique_pixels = {(round(match.pixel_x, 9), round(match.pixel_y, 9)) for match in image_matches}
-        if len(unique_pixels) < 2:
+        if len(unique_pixels) < 2 or config.transform_model == "translation":
             underconstrained_ids.add(chunk_id)
         variable_ids.append(chunk_id)
         x, y, rotation, scale = current
@@ -122,10 +147,14 @@ def simulate_georeference(
             values.extend((x - world_origin_x, y - world_origin_y))
             lower_bounds.extend((-float("inf"), -float("inf")))
             upper_bounds.extend((float("inf"), float("inf")))
+        elif config.transform_model == "rigid":
+            values.extend((x - world_origin_x, y - world_origin_y, radians(rotation)))
+            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf")))
+            upper_bounds.extend((float("inf"), float("inf"), float("inf")))
         else:
-            values.extend((x - world_origin_x, y - world_origin_y, radians(rotation), scale))
-            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf"), 1e-12))
-            upper_bounds.extend((float("inf"), float("inf"), float("inf"), float("inf")))
+            values.extend((x - world_origin_x, y - world_origin_y, radians(rotation), min(scale_max, max(scale_min, scale))))
+            lower_bounds.extend((-float("inf"), -float("inf"), -float("inf"), scale_min))
+            upper_bounds.extend((float("inf"), float("inf"), float("inf"), scale_max))
 
     def unpack(parameters: list[float]) -> dict[str, WorldTransform]:
         result = dict(initial)
@@ -139,6 +168,12 @@ def simulate_georeference(
                     initial[image_id][3],
                 )
                 offset += 2
+            elif config.transform_model == "rigid":
+                result[image_id] = (
+                    parameters[offset] + world_origin_x, parameters[offset + 1] + world_origin_y,
+                    degrees(parameters[offset + 2]), initial[image_id][3],
+                )
+                offset += 3
             else:
                 result[image_id] = (
                     parameters[offset] + world_origin_x,
@@ -175,9 +210,13 @@ def simulate_georeference(
         values,
         bounds=(lower_bounds, upper_bounds),
         max_nfev=max_iterations,
-        ftol=1e-10,
-        xtol=1e-10,
-        gtol=1e-10,
+        method=config.optimizer_method,
+        loss=config.loss,
+        f_scale=config.loss_scale,
+        x_scale="jac" if config.parameter_scaling == "jacobian" else 1.0,
+        ftol=config.ftol,
+        xtol=config.xtol,
+        gtol=config.gtol,
     )
     chunk_transforms = unpack(optimization.x.tolist())
     transforms = {
@@ -206,6 +245,7 @@ def simulate_georeference(
         optimizer_status=int(optimization.status),
         optimizer_message=str(optimization.message),
         max_iterations=max_iterations,
+        settings=config,
     )
 
 

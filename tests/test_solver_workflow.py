@@ -36,7 +36,9 @@ def solver_window(tmp_path, monkeypatch):
 
 def test_one_click_alignment_uses_saved_settings_and_applies(solver_window, monkeypatch):
     app, window, images, result, world, errors = solver_window
-    window.project.alignment_settings = SolverSettings(0.25, 321, True)
+    window.project.alignment_settings = SolverSettings(
+        0.25, 321, True, transform_model="rigid", optimizer_method="dogbox", loss="huber",
+    )
     calls = []
 
     def solve(project, **kwargs):
@@ -52,6 +54,7 @@ def test_one_click_alignment_uses_saved_settings_and_applies(solver_window, monk
     assert len(calls) == 1
     assert calls[0]["tolerance"] == 0.25
     assert calls[0]["max_iterations"] == 321
+    assert calls[0]["settings"] == window.project.alignment_settings
     assert window.project.images[1].aligned_x == result.transforms[images[1].id][0]
     assert window.undo_stack.count() == before + 1
     assert window._alignment_feedback.tolerance == 0.25
@@ -75,7 +78,7 @@ def test_preview_mode_does_not_apply_transforms(solver_window, monkeypatch):
 def test_combined_run_uses_alignment_for_world_solve_and_one_undo(solver_window, monkeypatch):
     app, window, images, alignment, world, errors = solver_window
     calls = []
-    window.project.georeference_settings = SolverSettings(0.75, 456, True)
+    window.project.georeference_settings = SolverSettings(0.75, 456, True, loss="soft_l1", loss_scale=3)
 
     def align(project, **kwargs):
         calls.append("alignment")
@@ -87,6 +90,7 @@ def test_combined_run_uses_alignment_for_world_solve_and_one_undo(solver_window,
         assert not window.project.images[1].has_alignment
         assert kwargs["tolerance"] == 0.75
         assert kwargs["max_iterations"] == 456
+        assert kwargs["settings"] == window.project.georeference_settings
         return world
 
     monkeypatch.setattr("geostitch.app.simulate_alignment", align)
