@@ -179,7 +179,7 @@ Image View uses the same top-right overlay style for **Draw clip polygon**, **Cl
 | **Image View**     | Single-image view for precise point placement                                                                      |
 | **Control Points** | Points and links for the active image, with editable pixel and map coordinates, names, labels and constraint types |
 | **World Map**      | OpenStreetMap basemap with solved image footprints, GeoJSON overlays, and coordinate picking                       |
-| **Link Review**    | Searchable, sortable link list and side-by-side endpoint images for correcting observations                       |
+| **Link Review**    | Searchable, sortable link list and side-by-side endpoint images for correcting observations                        |
 
 Panels can be docked, floated, closed, or split by dragging a title bar to another panel's edge. The layout is restored on next launch; use **View → Reset panel layout** to return to the default.
 
