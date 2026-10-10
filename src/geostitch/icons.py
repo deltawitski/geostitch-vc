@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
@@ -221,6 +222,53 @@ def _draw_undo(p: QPainter) -> None:
     _arrow(p, QPointF(10, 37), 0, 1)
 
 
+def _draw_settings(painter: QPainter) -> None:
+    painter.drawEllipse(QPointF(24, 24), 13, 13)
+    painter.drawEllipse(QPointF(24, 24), 5, 5)
+    for angle in range(0, 360, 45):
+        painter.save()
+        painter.translate(24, 24)
+        painter.rotate(angle)
+        painter.drawRect(QRectF(-3, -20, 6, 7))
+        painter.restore()
+
+
+def _draw_combined_solve(painter: QPainter) -> None:
+    painter.save()
+    painter.translate(1, 1)
+    painter.scale(0.6, 0.6)
+    _draw_alignment(painter)
+    painter.restore()
+    painter.save()
+    painter.translate(20, 20)
+    painter.scale(0.55, 0.55)
+    _draw_georeference(painter)
+    painter.restore()
+
+
+def _draw_run(painter: QPainter, glyph: Callable[[QPainter], None]) -> None:
+    painter.save()
+    painter.translate(20, 23)
+    painter.scale(0.5, 0.5)
+    glyph(painter)
+    painter.restore()
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(_ACCENT)
+    painter.drawPolygon(QPolygonF([QPointF(4, 6), QPointF(26, 18), QPointF(4, 30)]))
+
+
+def _draw_run_alignment(painter: QPainter) -> None:
+    _draw_run(painter, _draw_alignment)
+
+
+def _draw_run_georeference(painter: QPainter) -> None:
+    _draw_run(painter, _draw_georeference)
+
+
+def _draw_run_combined_solve(painter: QPainter) -> None:
+    _draw_run(painter, _draw_combined_solve)
+
+
 _GLYPHS = {
     "new": _draw_new,
     "open": _draw_open,
@@ -246,6 +294,11 @@ _GLYPHS = {
     "alignment": _draw_alignment,
     "aligned": _draw_aligned,
     "georeference": _draw_georeference,
+    "settings": _draw_settings,
+    "combined_solve": _draw_combined_solve,
+    "run_alignment": _draw_run_alignment,
+    "run_georeference": _draw_run_georeference,
+    "run_combined_solve": _draw_run_combined_solve,
     "undo": _draw_undo,
 }
 

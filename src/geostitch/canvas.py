@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
 )
 
 from geostitch.icons import KIND_COLORS
+from geostitch.alignment_feedback import residual_color
+from geostitch.view_navigation import zoom_at_cursor
 
 
 class _Magnifier(QWidget):
@@ -142,6 +144,8 @@ class ImageCanvas(QGraphicsView):
         self._transform_start_rotation = 0.0
         self._transform_start_distance = 1.0
         self._constraints: list[tuple[str, str]] = []
+        self._constraint_residuals: dict[int, float] = {}
+        self._residual_tolerance = 0.5
         self._constraint_items: list[QGraphicsLineItem] = []
         self._selected_constraint_indices: set[int] = set()
         self._active_image_id: str | None = None
@@ -158,7 +162,6 @@ class ImageCanvas(QGraphicsView):
         self._placement_click = False
         self._last_pan_position = None
         self._dragged_image_id: str | None = None
-        self._drag_start = None
         self._read_only = False
 
     def set_layers(self, layers: list[dict], constraints: list[tuple[str, str]] | None = None) -> None:
@@ -392,9 +395,14 @@ class ImageCanvas(QGraphicsView):
         self._refresh_marker_styles()
 
     def _refresh_marker_styles(self) -> None:
+        linked_points = {
+            point_id for index in self._selected_constraint_indices
+            if 0 <= index < len(self._constraints)
+            for point_id in self._constraints[index]
+        }
         for (_image_id, candidate_id), marker in self._point_items.items():
             is_source = candidate_id == self._constraint_source_id
-            is_selected = candidate_id in self._selected_point_ids
+            is_selected = candidate_id in self._selected_point_ids or candidate_id in linked_points
             is_locked = (_image_id, candidate_id) in self._locked_points
             color = QColor(KIND_COLORS["point"])
             style = Qt.PenStyle.DotLine if is_source else Qt.PenStyle.DashLine if is_locked else Qt.PenStyle.SolidLine
@@ -404,6 +412,13 @@ class ImageCanvas(QGraphicsView):
 
     def set_constraints(self, constraints: list[tuple[str, str]]) -> None:
         self._constraints = constraints
+        self._redraw_constraints()
+
+    def set_constraint_residuals(self, residuals: dict[int, float], tolerance: float = 0.5) -> None:
+        if residuals == self._constraint_residuals and tolerance == self._residual_tolerance:
+            return
+        self._constraint_residuals = dict(residuals)
+        self._residual_tolerance = tolerance
         self._redraw_constraints()
 
     def set_image_transform(self, image_id: str, rotation: float | None = None, scale: float | None = None) -> None:
@@ -489,14 +504,7 @@ class ImageCanvas(QGraphicsView):
     def wheelEvent(self, event) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         # Qt's mouse anchor goes stale while a point drag swallows mouse moves, so anchor manually.
-        cursor = event.position().toPoint()
-        scene_before = self.mapToScene(cursor)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
-        self.scale(factor, factor)
-        shift = self.mapFromScene(scene_before) - cursor
-        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + shift.x())
-        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + shift.y())
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        cursor = zoom_at_cursor(self, event, factor)
         self._refresh_point_overlay_positions()
         self._refresh_transform_handles()
         if self._dragged_point_key is not None:
@@ -594,7 +602,6 @@ class ImageCanvas(QGraphicsView):
             self._drag_moved = False
             self._dragged_image_id = image_id
             self.transform_interaction_started.emit(image_id)
-            self._drag_start = event.position().toPoint()
         super().mousePressEvent(event)
 
     def dragEnterEvent(self, event) -> None:
@@ -684,7 +691,6 @@ class ImageCanvas(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton and self._dragged_image_id:
             image_id = self._dragged_image_id
             self._dragged_image_id = None
-            self._drag_start = None
             moved = self._drag_moved
             for selected_id in sorted(self._selected_image_ids - {image_id}):
                 if moved:
@@ -878,6 +884,7 @@ class ImageCanvas(QGraphicsView):
     def set_selected_constraints(self, indices: set[int]) -> None:
         if indices != self._selected_constraint_indices:
             self._selected_constraint_indices = set(indices)
+            self._refresh_marker_styles()
             self._redraw_constraints()
 
     def _constraint_at(self, viewport_position: QPoint) -> int | None:
@@ -905,16 +912,19 @@ class ImageCanvas(QGraphicsView):
         for item in self._constraint_items:
             self._scene.removeItem(item)
         self._constraint_items.clear()
-        pen = QPen(QColor(KIND_COLORS["link"]), 2, Qt.PenStyle.DashLine)
-        pen.setCosmetic(True)
-        selected_pen = QPen(QColor(KIND_COLORS["link"]), 4)
-        selected_pen.setCosmetic(True)
         for index, (first_id, second_id) in enumerate(self._constraints):
             first = self._scene_position_for_point(first_id)
             second = self._scene_position_for_point(second_id)
             if first is None or second is None:
                 continue
             selected = index in self._selected_constraint_indices
-            line = self._scene.addLine(first.x(), first.y(), second.x(), second.y(), selected_pen if selected else pen)
+            residual = self._constraint_residuals.get(index)
+            color = residual_color(residual, self._residual_tolerance) if residual is not None else KIND_COLORS["link"]
+            pen = QPen(QColor(color), 4 if selected else 2,
+                       Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            line = self._scene.addLine(first.x(), first.y(), second.x(), second.y(), pen)
+            if residual is not None:
+                line.setToolTip(f"Link residual: {residual:.6f} scene units\nTarget: {self._residual_tolerance:g} scene units")
             line.setZValue(2500 if selected else 2000)
             self._constraint_items.append(line)

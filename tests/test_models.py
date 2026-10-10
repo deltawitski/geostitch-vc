@@ -56,8 +56,9 @@ def test_default_control_point_names_increase_per_image():
     project.add_control_point(first_point)
     first_point.set_observation(first_image.id, 10.0, 20.0)
 
-    assert project.next_control_point_name(first_image.id) == "survey-a-002"
-    assert project.next_control_point_name(second_image.id) == "survey-b-001"
+    assert first_name == "P1"
+    assert project.next_control_point_name(first_image.id) == "P2"
+    assert project.next_control_point_name(second_image.id) == "P1"
 
     second_point = GroundControlPoint.create(project.next_control_point_name(second_image.id), "  Gate  ")
     assert second_point.label == "Gate"
@@ -66,9 +67,43 @@ def test_default_control_point_names_increase_per_image():
 def test_auto_name_skips_an_existing_custom_name():
     project = Project()
     image = project.add_image("map.tif")
-    project.add_control_point(GroundControlPoint.create("map-001"))
+    custom = GroundControlPoint.create("P1")
+    custom.set_observation(image.id, 0, 0)
+    project.add_control_point(custom)
 
-    assert project.next_control_point_name(image.id) == "map-002"
+    assert project.next_control_point_name(image.id) == "P2"
+
+
+def test_compact_point_aliases_preserve_unique_names_and_custom_names():
+    project = Project()
+    images = [project.add_image(name) for name in ("first.png", "second.png")]
+    for image in images:
+        short_name = project.next_control_point_name(image.id)
+        point = GroundControlPoint.create(project.unique_control_point_name(short_name))
+        point.short_name = short_name
+        point.set_observation(image.id, 10, 20)
+        project.add_control_point(point)
+    assert [point.display_name for point in project.control_points] == ["P1", "P1"]
+    assert len({point.name for point in project.control_points}) == 2
+    custom = GroundControlPoint.create("North gate")
+    assert custom.display_name == "North gate"
+    restored = Project.from_dict(project.to_dict())
+    assert [point.display_name for point in restored.control_points] == ["P1", "P1"]
+
+
+def test_link_numbers_are_stable_and_not_reused_after_deletion():
+    project = Project()
+    points = [GroundControlPoint.create(name) for name in ("first", "second", "third")]
+    for point in points:
+        project.add_control_point(point)
+    first = PointConstraint.create(points[0].id, points[1].id)
+    project.add_constraint(first)
+    assert first.name == "L1"
+    project.constraints.remove(first)
+    restored = Project.from_dict(project.to_dict())
+    second = PointConstraint.create(points[0].id, points[2].id)
+    restored.add_constraint(second)
+    assert second.name == "L2"
 
 
 def test_duplicate_control_point_names_are_rejected_case_insensitively():

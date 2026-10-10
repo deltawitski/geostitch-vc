@@ -308,7 +308,7 @@ def test_main_window_click_places_observation_and_controls_update_layer(tmp_path
     window.canvas.fit_images()
     app.processEvents()
     window._select_point(first_point.id)
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     assert window._selected_point_id() == first_point.id
     assert window.label_edit.text() == "Old stone bridge"
     scene_position = window.canvas._layers[image.id].mapToScene(QPointF(35.0, 55.0))
@@ -324,7 +324,7 @@ def test_main_window_click_places_observation_and_controls_update_layer(tmp_path
     marker_position = window.canvas.mapFromScene(marker.scenePos())
     QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=marker_position)
     assert window._selected_point_id() == first_point.id
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     assert not window.image_list.selectedItems()
 
     window.image_list.setCurrentItem(window.image_list.item(0))
@@ -347,10 +347,10 @@ def test_main_window_click_places_observation_and_controls_update_layer(tmp_path
 
     window._select_point(first_point.id)
     assert not window.image_list.selectedItems()
-    monkeypatch.setattr("geostitch.app.QInputDialog.getItem", lambda *args, **kwargs: ("road", True))
+    monkeypatch.setattr("geostitch.app.QInputDialog.getItem", lambda *args, **kwargs: (args[3][0], True))
     window.create_constraint()
     assert len(window.project.constraints) == 1
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     assert not window.image_list.selectedItems()
     assert window._selected_point_id() is None
     assert window.selected_constraint_id == window.project.constraints[0].id
@@ -395,10 +395,10 @@ def test_selecting_points_does_not_arm_or_move_them_without_explicit_command(tmp
 
     click_marker(first.id)
     assert window._selected_point_id() == first.id
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     click_marker(second.id)
     assert window._selected_point_id() == second.id
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
 
     target = window.canvas.mapFromScene(window.canvas._layers[image.id].mapToScene(QPointF(130.0, 110.0)))
     QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=target)
@@ -408,7 +408,7 @@ def test_selecting_points_does_not_arm_or_move_them_without_explicit_command(tmp
     assert window.project.point_by_id(second.id).observation_for(image.id).y == 80.0
 
     window._select_point(second.id)
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     window.close()
 
 
@@ -426,7 +426,7 @@ def test_undo_redo_constraint_and_point_deletion_cascade(tmp_path, monkeypatch):
     window.current_image_id = image.id
     window._refresh_points()
     window._select_point(first.id)
-    monkeypatch.setattr("geostitch.app.QInputDialog.getItem", lambda *args, **kwargs: ("second", True))
+    monkeypatch.setattr("geostitch.app.QInputDialog.getItem", lambda *args, **kwargs: (args[3][0], True))
 
     window.create_constraint()
     assert len(window.project.constraints) == 1
@@ -479,7 +479,7 @@ def test_control_point_details_filter_by_image_and_edit_point_and_constraint(tmp
     assert {
         window.image_points_list.item(row).text().split("  ·  ")[0]
         for row in range(window.image_points_list.count())
-    } == {"shared-001", "first-only"}
+    } == {"shared-001 · shared feature", "first-only"}
     assert window.image_links_list.count() == 1
 
     window._select_point(first.id)
@@ -607,7 +607,7 @@ def test_clicking_empty_canvas_clears_image_and_control_point_selection(tmp_path
     assert not window.image_list.selectedItems()
     assert window.current_image_id is None
     assert window._selected_point_id() is None
-    assert window.pending_point_id is None
+    assert window.canvas._active_point_id is None
     assert window.canvas._active_image_id is None
     assert not window.canvas._transform_handles
     window.close()
@@ -638,7 +638,9 @@ def test_continuous_add_mode_creates_sequenced_points_in_clicked_images(tmp_path
     QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=window.canvas.mapFromScene(second_position))
 
     assert window.add_points_mode
-    assert [point.name for point in window.project.control_points] == ["north-001", "south-001"]
+    assert window.canvas._active_point_id == "__continuous_add__"
+    assert [point.display_name for point in window.project.control_points] == ["P1", "P1"]
+    assert len({point.name for point in window.project.control_points}) == 2
     assert window.current_image_id == images[1].id
     assert not window.image_list.selectedItems()
     assert window.canvas._active_image_id is None
@@ -647,10 +649,11 @@ def test_continuous_add_mode_creates_sequenced_points_in_clicked_images(tmp_path
     assert window.project.control_points[0].label is None
     assert window.project.control_points[1].label is None
     window.undo_stack.undo()
-    assert [point.name for point in window.project.control_points] == ["north-001"]
+    assert [point.display_name for point in window.project.control_points] == ["P1"]
     window.undo_stack.redo()
-    assert [point.name for point in window.project.control_points] == ["north-001", "south-001"]
+    assert [point.display_name for point in window.project.control_points] == ["P1", "P1"]
     window.add_points_action.setChecked(False)
+    assert window.canvas._active_point_id is None
     window.close()
 
 

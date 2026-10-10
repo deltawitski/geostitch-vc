@@ -7,6 +7,7 @@ from math import atan2, ceil, cos, degrees, hypot, isfinite, radians, sin, sqrt
 from pathlib import Path
 
 from geostitch.adjustment import AlignmentResult, simulate_alignment
+from geostitch.alignment_feedback import AlignmentFeedback
 from geostitch.georeference import GeoreferenceResult, simulate_georeference
 from geostitch.map_view import WorldMapView
 from pyproj import CRS, Transformer
@@ -21,7 +22,6 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -32,10 +32,11 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QKeySequenceEdit,
     QScrollArea,
-    QSpinBox,
     QStackedWidget,
     QStyleFactory,
     QFrame,
@@ -57,10 +58,15 @@ from geostitch.layers import CONSTRAINT_KIND, IMAGE_KIND, POINT_KIND, VECTOR_KIN
 from geostitch.image_view import ImageViewer
 from geostitch.image_loader import ImageLoader
 from geostitch.masking import masked_pixmap
-from geostitch.models import GroundControlPoint, PointConstraint, Project, VectorLayer
+from geostitch.models import GroundControlPoint, PointConstraint, Project, SolverSettings, VectorLayer
 from geostitch.project_io import load_project, save_project
+from geostitch.solver_dialog import SolverSettingsDialog, SolverToolbarControl
 from geostitch.status_bar import ScrollingStatusBar
 from geostitch.vector_loader import VectorLoader
+
+
+class SolverCancelled(Exception):
+    pass
 
 
 class ShortcutSettingsDialog(QDialog):
@@ -182,8 +188,13 @@ class MainWindow(QMainWindow):
         "export_images": ("Export georeferenced images", "Ctrl+E"),
         "fit_images": ("Fit current view", "Ctrl+Shift+F"),
         "arrange_images": ("Arrange images", "Ctrl+Shift+A"),
-        "simulate_alignment": ("Simulate alignment", "Ctrl+Shift+M"),
-        "georeference": ("Georeference from GCPs", "Ctrl+Shift+G"),
+        "simulate_alignment": ("Align", "Ctrl+Shift+M"),
+        "georeference": ("Georeference", "Ctrl+Shift+G"),
+        "alignment_settings": ("Alignment settings...", ""),
+        "georeference_settings": ("Georeference settings...", ""),
+        "align_georeference": ("Align and georeference", ""),
+        "alignment_report": ("Last alignment report...", ""),
+        "georeference_report": ("Last georeference report...", ""),
         "toggle_alignment": ("Toggle aligned / rest layout", "A"),
         "maximize_dock": ("Maximize / restore current panel", "M"),
         "add_points": ("Toggle Add points", "P"),
@@ -214,7 +225,10 @@ class MainWindow(QMainWindow):
         self._active_edit_before: dict | None = None
         self._active_edit_label: str | None = None
         self._edit_depth = 0
-        self._alignment_result: AlignmentResult | None = None
+        self._georeference_result: GeoreferenceResult | None = None
+        self._georeference_result_tolerance: float | None = None
+        self._solver_running = False
+        self._solver_progress_dialog: QProgressDialog | None = None
         self.project = Project()
         self.project_path: Path | None = None
         self._image_pixmaps: dict[str, QPixmap] = {}
@@ -240,7 +254,6 @@ class MainWindow(QMainWindow):
         self._vector_loader.progress.connect(self._on_vector_progress)
         self._vector_loader.loaded.connect(self._on_vector_loaded)
         self._vector_loader.failed.connect(self._on_vector_failed)
-        self.pending_point_id: str | None = None
         self.add_points_mode = False
         self.link_points_mode = False
         self.pending_constraint_point_id: str | None = None
@@ -296,8 +309,18 @@ class MainWindow(QMainWindow):
         fit_action = self._register_shortcut_action("fit_images", "Fit current view", self._fit_canvas)
         fit_action.setToolTip("Fit the current view; from Layers, fit the selection in both canvas and world map")
         self._register_shortcut_action("arrange_images", "Arrange images", self.arrange_images)
-        self._register_shortcut_action("simulate_alignment", "Simulate alignment", self.simulate_alignment_dialog)
-        self._register_shortcut_action("georeference", "Georeference from GCPs", self.simulate_georeference_dialog)
+        self._register_shortcut_action("simulate_alignment", "Align", self.run_alignment)
+        self._register_shortcut_action("georeference", "Georeference", self.run_georeference)
+        self._register_shortcut_action("align_georeference", "Align and georeference", self.run_combined_solvers)
+        for stage in ("alignment", "georeference"):
+            self._register_shortcut_action(
+                f"{stage}_settings", f"{stage.title()} settings...",
+                lambda _checked=False, chosen=stage: self.open_solver_settings(chosen),
+            )
+            self._register_shortcut_action(
+                f"{stage}_report", f"Last {stage} report...",
+                lambda _checked=False, chosen=stage: self.show_solver_report(chosen),
+            )
         self.add_points_action = self._register_shortcut_action("add_points", "Add points", None)
         self.add_points_action.setCheckable(True)
         self.add_points_action.setToolTip("Toggle on, then click images to continuously add control points")
@@ -388,6 +411,22 @@ class MainWindow(QMainWindow):
         canvas_header.addStretch(1)
         canvas_layout.addLayout(canvas_header)
         canvas_layout.addWidget(self.canvas, 1)
+        error_row = QHBoxLayout()
+        error_row.setContentsMargins(6, 0, 6, 4)
+        self.alignment_errors_checkbox = QCheckBox("Alignment errors")
+        self.alignment_errors_checkbox.setChecked(True)
+        self.alignment_errors_checkbox.setToolTip(
+            "Color links by the latest solve tolerance: green within target, amber within twice target, red above. "
+            "In rest layout, colors show solve residuals, not the displayed endpoint gaps."
+        )
+        self.alignment_errors_checkbox.toggled.connect(lambda _checked: self._refresh_alignment_feedback())
+        error_row.addWidget(self.alignment_errors_checkbox)
+        self.alignment_error_label = QLabel("Alignment: unavailable")
+        self.alignment_error_label.setWordWrap(True)
+        self.alignment_error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.alignment_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        error_row.addWidget(self.alignment_error_label, 1)
+        canvas_layout.addLayout(error_row)
         self.canvas_dock = self._create_panel_dock("canvasDock", "Image Canvas", canvas_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.canvas_dock)
         self.splitDockWidget(self.image_dock, self.canvas_dock, Qt.Orientation.Horizontal)
@@ -642,8 +681,15 @@ class MainWindow(QMainWindow):
 
         image_menu = self.menuBar().addMenu("Image")
         image_menu.addAction(self.shortcut_actions["arrange_images"])
-        image_menu.addAction(self.shortcut_actions["simulate_alignment"])
-        image_menu.addAction(self.shortcut_actions["georeference"])
+        image_menu.addSeparator()
+        for key in ("simulate_alignment", "georeference", "align_georeference"):
+            image_menu.addAction(self.shortcut_actions[key])
+        image_menu.addSeparator()
+        for key in ("alignment_settings", "georeference_settings"):
+            image_menu.addAction(self.shortcut_actions[key])
+        image_menu.addSeparator()
+        for key in ("alignment_report", "georeference_report"):
+            image_menu.addAction(self.shortcut_actions[key])
 
         view_menu = self.menuBar().addMenu("View")
         view_menu.addAction(self.shortcut_actions["fit_images"])
@@ -676,6 +722,9 @@ class MainWindow(QMainWindow):
         self.appearance_action = QAction("Appearance...", self)
         self.appearance_action.triggered.connect(self.open_appearance_settings)
         settings_menu.addAction(self.appearance_action)
+        settings_menu.addSeparator()
+        for key in ("alignment_settings", "georeference_settings"):
+            settings_menu.addAction(self.shortcut_actions[key])
         self.file_settings_menu.addAction(self.shortcut_settings_action)
         self.file_settings_menu.addAction(self.appearance_action)
 
@@ -693,8 +742,13 @@ class MainWindow(QMainWindow):
         "delete_point": ("delete", "Delete the selected images, control points, or link"),
         "toggle_lock": ("lock", "Lock or unlock selected image rest transforms and control point positions"),
         "lasso_select": ("select", "Drag on the canvas to select items: rectangle, or freehand lasso when toggled on. Ctrl adds, Shift drags over images"),
-        "simulate_alignment": ("alignment", "Align constraint-linked images relative to each other"),
-        "georeference": ("georeference", "Solve world transforms from control points with geographic coordinates"),
+        "simulate_alignment": ("run_alignment", "Align constraint-linked images relative to each other"),
+        "alignment_settings": ("settings", "Set alignment tolerance, iteration limit, and automatic application"),
+        "georeference": ("run_georeference", "Solve world transforms from control points with geographic coordinates"),
+        "georeference_settings": ("settings", "Set georeference tolerance, iteration limit, and automatic application"),
+        "align_georeference": ("run_combined_solve", "Align images, then solve their world transforms using the saved settings"),
+        "alignment_report": ("alignment", "Read the last alignment result and constraint residuals"),
+        "georeference_report": ("georeference", "Read the last georeference result and geographic control point residuals"),
         "undo": ("undo", "Undo the last change"),
         "toggle_alignment": ("aligned", "Switch the canvas between the arranged rest layout and the solver-aligned layout"),
         "redo": ("redo", "Redo the last undone change"),
@@ -705,11 +759,13 @@ class MainWindow(QMainWindow):
         toolbar.setObjectName("mainToolbar")
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         toolbar.setIconSize(QSize(24, 24))
+        self.solver_buttons: dict[str, SolverToolbarControl] = {}
+        self.solver_toolbar_actions: dict[str, QAction] = {}
         groups = (
             ("new_project", "open_project", "save_project"),
-            ("import_images", "export_images", "arrange_images", "fit_images"),
+            ("import_images", "export_images", "arrange_images", "fit_images", "toggle_alignment"),
             ("lasso_select", "add_points", "link_points", "pick_gcp", "toggle_lock", "delete_point"),
-            ("simulate_alignment", "toggle_alignment", "georeference"),
+            ("simulate_alignment", "georeference", "align_georeference"),
             ("undo", "redo"),
         )
         for index, group in enumerate(groups):
@@ -718,7 +774,20 @@ class MainWindow(QMainWindow):
             for key in group:
                 action = self.shortcut_actions[key]
                 action.setIcon(make_icon(self.TOOLBAR_INFO[key][0]))
-                toolbar.addAction(action)
+                if key in ("simulate_alignment", "georeference"):
+                    stage = "alignment" if key == "simulate_alignment" else "georeference"
+                    settings_action = self.shortcut_actions[f"{stage}_settings"]
+                    settings_action.setIcon(make_icon("settings"))
+                    control = SolverToolbarControl(action, settings_action, toolbar)
+                    self.solver_buttons[stage] = control
+                    self.solver_toolbar_actions[key] = toolbar.addWidget(control)
+                else:
+                    toolbar.addAction(action)
+                    if key == "align_georeference":
+                        self.solver_toolbar_actions[key] = action
+                        toolbar.widgetForAction(action).setFixedSize(44, 40)
+        for key in ("alignment_report", "georeference_report"):
+            self.shortcut_actions[key].setIcon(make_icon(self.TOOLBAR_INFO[key][0]))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
         self.main_toolbar = toolbar
 
@@ -752,6 +821,11 @@ class MainWindow(QMainWindow):
             "link_points": linkable or self.link_points_mode,
             "simulate_alignment": bool(project.constraints),
             "georeference": has_geographic_points,
+            "align_georeference": bool(project.constraints) and has_geographic_points,
+            "alignment_settings": True,
+            "georeference_settings": True,
+            "alignment_report": self._alignment_result is not None or self._alignment_feedback is not None,
+            "georeference_report": self._georeference_result is not None,
             "toggle_alignment": any(item.has_alignment for item in project.images),
             "create_constraint": point is not None and linkable,
             "remove_constraint": bool(self._selected_constraint_ids()),
@@ -768,6 +842,12 @@ class MainWindow(QMainWindow):
             "export_images": any(item.world_x is not None and item.world_y is not None for item in project.images),
         }
         for key, value in enabled.items():
+            if key in (
+                "simulate_alignment", "georeference", "align_georeference",
+                "alignment_settings", "georeference_settings", "alignment_report", "georeference_report",
+            ) and self._solver_running:
+                value = False
+                enabled[key] = False
             self.shortcut_actions[key].setEnabled(value)
         self.toggle_alignment_action.blockSignals(True)
         self.toggle_alignment_action.setChecked(self._aligned_view_active())
@@ -968,11 +1048,26 @@ class MainWindow(QMainWindow):
         if before != after:
             self.undo_stack.push(ProjectSnapshotCommand(self, before, after, label))
 
+    @property
+    def _alignment_feedback(self) -> AlignmentFeedback | None:
+        return self.project.alignment_feedback
+
+    @_alignment_feedback.setter
+    def _alignment_feedback(self, feedback: AlignmentFeedback | None) -> None:
+        self.project.alignment_feedback = feedback
+
+    @property
+    def _alignment_result(self) -> AlignmentResult | None:
+        feedback = self.project.alignment_feedback
+        return feedback.result if feedback is not None else None
+
     def _restore_project_snapshot(self, snapshot: dict) -> None:
         selected_point_id = self._selected_point_id()
         canvas_state = self.project.canvas_state
+        feedback = self._alignment_feedback
         self.project = Project.from_dict(snapshot)
         self.project.canvas_state = canvas_state
+        self._alignment_feedback = feedback
         valid_image_ids = {image.id for image in self.project.images}
         self._image_pixmaps = {
             image_id: pixmap for image_id, pixmap in self._image_pixmaps.items()
@@ -980,7 +1075,6 @@ class MainWindow(QMainWindow):
         }
         if self.current_image_id not in valid_image_ids:
             self.current_image_id = self.project.images[0].id if self.project.images else None
-        self.pending_point_id = None
         self.pending_constraint_point_id = None
         self.pending_constraint_image_id = None
         self.canvas.set_constraint_source(None)
@@ -1104,8 +1198,6 @@ class MainWindow(QMainWindow):
 
     def _refresh_all(self) -> None:
         self._refresh_images()
-        self._refresh_points()
-        self._refresh_constraints()
         self.crs_edit.setText(self.project.crs)
         self._refresh_world_map()
         self._update_title()
@@ -1340,14 +1432,15 @@ class MainWindow(QMainWindow):
             (
                 layer.id, layer.name, layer.visible, getattr(layer, "map_visible", None),
                 getattr(layer, "rest_locked", None),
-                                [(p.id, p.name, p.visible, p.map_visible, [observation.locked for observation in p.observations],
-                                    [(link.id, link.first_point_id, link.second_point_id, link.kind)
+                                [(p.id, p.name, p.short_name, p.label, p.visible, p.map_visible, [observation.locked for observation in p.observations],
+                                    [(link.id, link.name, link.first_point_id, link.second_point_id, link.kind)
                                      for link in constraints_by_point.get(p.id, [])])
                  for p in points_by_image.get(layer.id, [])],
             )
             for layer in stack
         ]
         if not force and signature == self._layers_signature:
+            self._refresh_layer_errors()
             return
         self._layers_signature = signature
         tree = self.image_list
@@ -1387,7 +1480,8 @@ class MainWindow(QMainWindow):
             self._style_layer_item(top, image.visible, image.map_visible)
             self._style_layer_lock(top, image.rest_locked, "canvas rest transform")
             for point in points_by_image.get(image.id, []):
-                child = LayerItem(POINT_KIND, point.id, point.name)
+                child = LayerItem(POINT_KIND, point.id, self._point_text(point))
+                child.setToolTip(0, self._point_context(point))
                 rows_by_id[point.id] = child
                 self._style_layer_item(
                     child,
@@ -1401,11 +1495,9 @@ class MainWindow(QMainWindow):
                 for constraint in constraints_by_point.get(point.id, []):
                     other_id = constraint.second_point_id if constraint.first_point_id == point.id else constraint.first_point_id
                     other = points_by_id.get(other_id)
-                    other_image = images_by_id.get(other.image_id) if other is not None else None
-                    other_name = other.name if other is not None else "Missing point"
-                    image_name = other_image.name if other_image is not None else "No image"
-                    link = LayerItem(CONSTRAINT_KIND, constraint.id, f"{other_name} ({image_name}) - {constraint.kind}")
-                    link.setToolTip(0, self._link_text(constraint, {point_id: item.name for point_id, item in points_by_id.items()}))
+                    other_name = other.display_name if other is not None else "Missing point"
+                    suffix = f" · {constraint.kind}" if constraint.kind != "tie" else ""
+                    link = LayerItem(CONSTRAINT_KIND, constraint.id, f"{constraint.name} → {other_name}{suffix}")
                     child.addChild(link)
                     rows_by_id[(constraint.id, point.id)] = link
             tree.addTopLevelItem(top)
@@ -1418,6 +1510,94 @@ class MainWindow(QMainWindow):
         tree.setCurrentItem(rows_by_id.get(current_key), 0, QItemSelectionModel.SelectionFlag.NoUpdate)
         tree.blockSignals(False)
         self._sync_tree_points()
+        self._refresh_layer_errors()
+
+    def _refresh_layer_errors(self, current: bool | None = None) -> None:
+        if not hasattr(self, "image_list"):
+            return
+        feedback = self._alignment_feedback
+        if current is None:
+            current = feedback is not None and feedback.is_current(self.project)
+        tolerance = feedback.tolerance if feedback is not None else 0.5
+        constraints = {constraint.id: constraint for constraint in self.project.constraints}
+        for index in range(self.image_list.topLevelItemCount()):
+            top = self.image_list.topLevelItem(index)
+            if top.kind != IMAGE_KIND:
+                continue
+            top.set_alignment_error(
+                feedback.image_residuals.get(top.item_id) if feedback else None,
+                tolerance, current, "RMS of incident link residuals",
+            )
+            for point_index in range(top.childCount()):
+                point = top.child(point_index)
+                point.set_alignment_error(
+                    feedback.point_residuals.get(point.item_id) if feedback else None,
+                    tolerance, current, "Largest incident link residual",
+                )
+                for link_index in range(point.childCount()):
+                    link = point.child(link_index)
+                    constraint = constraints.get(link.item_id)
+                    if constraint is not None:
+                        link.setToolTip(0, self._link_tooltip(constraint, current))
+                    link.set_alignment_error(
+                        feedback.result.constraint_residuals.get(link.item_id) if feedback else None,
+                        tolerance, current, "Solved link endpoint distance",
+                    )
+
+    def _refresh_alignment_feedback(self) -> None:
+        feedback = self._alignment_feedback
+        current = feedback is not None and feedback.is_current(self.project)
+        self._refresh_layer_errors(current)
+        if not hasattr(self, "alignment_error_label"):
+            return
+        matching_layout = feedback is not None and feedback.matches_layout(self.project, current)
+        aligned = self._aligned_view_active()
+        can_show_errors = current and (not aligned or matching_layout)
+        self.alignment_errors_checkbox.setEnabled(can_show_errors)
+        residuals = {}
+        if can_show_errors and self.alignment_errors_checkbox.isChecked():
+            residuals = {
+                index: feedback.result.constraint_residuals[link.id]
+                for index, link in enumerate(self.project.constraints)
+                if link.id in feedback.result.constraint_residuals
+            }
+        self.canvas.set_constraint_residuals(residuals, feedback.tolerance if feedback else 0.5)
+        if feedback is None:
+            self.alignment_error_label.setText("Alignment: unavailable")
+            self.alignment_error_label.setToolTip("No saved or examined alignment residual report is available.")
+            return
+        state = "Current" if current else "Outdated"
+        if current and not matching_layout:
+            state = "Not applied"
+        if not aligned:
+            state += " | Rest layout"
+        value = None
+        metric = "Solve RMS"
+        constraint_ids = self._selected_constraint_ids()
+        point_ids = self._selected_point_ids()
+        image_ids = self._selected_image_ids()
+        total = len(constraint_ids) + len(point_ids) + len(image_ids)
+        if total == 1 and constraint_ids:
+            metric = "Link residual"
+            value = feedback.result.constraint_residuals.get(constraint_ids[0])
+        elif total == 1 and point_ids:
+            metric = "Point max link"
+            value = feedback.point_residuals.get(point_ids[0])
+        elif total == 1 and image_ids:
+            metric = "Image RMS"
+            value = feedback.image_residuals.get(image_ids[0])
+        elif feedback.result.constraint_residuals:
+            values = list(feedback.result.constraint_residuals.values())
+            value = sqrt(sum(residual ** 2 for residual in values) / len(values))
+        text = "--" if value is None else f"{value:.3f} scene units"
+        self.alignment_error_label.setText(f"{state} | {metric}: {text} | Target: {feedback.tolerance:g}")
+        self.alignment_error_label.setToolTip(
+            f"Last solve: {'target reached' if feedback.result.converged else 'target not reached'}\n"
+            f"Maximum link residual: {feedback.result.maximum_residual:.6f} scene units\n"
+            "Colors show the last solve's residuals, not the current rest-layout endpoint gaps.\n"
+            "Residuals measure alignment fit, not independent geographic accuracy.\n"
+            "Point values are maximum incident-link residuals, not geographic target errors."
+        )
 
     @staticmethod
     def _style_layer_item(item: LayerItem, canvas_visible: bool | None, map_visible: bool) -> None:
@@ -1542,7 +1722,8 @@ class MainWindow(QMainWindow):
             self.selected_constraint_id = None
             self._clear_image_selection(keep_context=True)
         self._refresh_canvas()
-        self._refresh_constraints()
+        self.selected_constraint_ids = self._selected_constraint_ids()
+        self._refresh_details()
 
     @property
     def selected_point_id(self) -> str | None:
@@ -1599,7 +1780,6 @@ class MainWindow(QMainWindow):
             self._clear_constraint_selection()
         if tree_points != self.selected_point_ids:
             self.selected_point_ids = tree_points
-            self.pending_point_id = None
         self._refresh_points()
 
     def _clear_image_selection(self, keep_context: bool = False) -> None:
@@ -1670,7 +1850,6 @@ class MainWindow(QMainWindow):
             self.current_image_id = last_item.data(Qt.ItemDataRole.UserRole)
         self.selected_point_ids = point_ids
         self.selected_constraint_ids = link_ids
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         if len(point_ids) == 1 and not image_ids:
             self.current_image_id = self.project.point_by_id(point_ids[0]).image_id or self.current_image_id
@@ -1702,7 +1881,6 @@ class MainWindow(QMainWindow):
         else:
             point_ids.append(point_id)
         self.selected_point_ids = point_ids
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         self.canvas.set_selected_points(set(point_ids))
         if len(point_ids) == 1:
@@ -1712,7 +1890,6 @@ class MainWindow(QMainWindow):
 
     def _clear_point_selection(self) -> None:
         self.selected_point_id = None
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         self.canvas.set_selected_points(set())
 
@@ -1802,6 +1979,7 @@ class MainWindow(QMainWindow):
         image.scale = scale
         if self._details_image() is image:
             self.image_info_label.setText(self._image_info_text(image))
+        self._refresh_alignment_feedback()
 
     def _aligned_view_active(self) -> bool:
         return self.project.canvas_state == "aligned" and any(image.has_alignment for image in self.project.images)
@@ -1862,11 +2040,12 @@ class MainWindow(QMainWindow):
         self.canvas.set_layers(layers, constraints)
         selected_image_ids = self._selected_image_ids()
         self.canvas.set_selected_images(set(selected_image_ids))
-        active_point = "__continuous_add__" if self.add_points_mode else self.pending_point_id
+        active_point = "__continuous_add__" if self.add_points_mode else None
         self.canvas.set_active_point(active_point)
         self.canvas.set_constraint_mode(self.link_points_mode)
         self.canvas.set_constraint_source(self.pending_constraint_point_id)
         self.canvas.set_selected_points(set(self._selected_point_ids()))
+        self._refresh_alignment_feedback()
         if load_errors:
             shown_errors = "; ".join(load_errors[:3])
             remaining = len(load_errors) - 3
@@ -2009,11 +2188,11 @@ class MainWindow(QMainWindow):
             self.details_stack.setCurrentIndex(4)
             self._show_multi_selection_details(image_ids, point_ids, constraint_ids)
         elif constraint is not None:
-            self.details_title.setText(f"{kind_bar_html('link')} LINK")
+            self.details_title.setText(f"{kind_bar_html('link')} LINK · {escape(constraint.name or '')}")
             self.details_stack.setCurrentIndex(3)
             self._show_constraint_details(constraint)
         elif point is not None:
-            self.details_title.setText(f"{kind_bar_html('point')} CONTROL POINT · {escape(point.name)}")
+            self.details_title.setText(f"{kind_bar_html('point')} POINT · {escape(point.display_name)}")
             self.details_stack.setCurrentIndex(2)
             self._show_point_details(point)
         elif image is not None:
@@ -2026,6 +2205,7 @@ class MainWindow(QMainWindow):
             self._show_project_details()
         self._refresh_image_view()
         self._refresh_map_points()
+        self._refresh_alignment_feedback()
         self._update_hints()
 
     def _build_image_view_panel(self) -> QWidget:
@@ -2059,6 +2239,12 @@ class MainWindow(QMainWindow):
         self.image_viewer = ImageViewer()
         self.image_viewer.polygon_drawn.connect(self._on_mask_polygon_drawn)
         self.image_viewer.point_clicked.connect(self._select_point)
+        self.image_viewer.point_observation_interaction_started.connect(self._begin_point_observation_drag)
+        self.image_viewer.point_observation_changed.connect(self._on_point_observation_changed)
+        self.image_viewer.point_observation_interaction_finished.connect(self._finish_project_edit)
+        self.image_viewer.point_observation_interaction_finished.connect(lambda *_args: self._refresh_canvas())
+        self.image_viewer.point_observation_interaction_finished.connect(lambda *_args: self._refresh_image_view())
+        self.image_viewer.point_observation_interaction_finished.connect(lambda *_args: self._refresh_map_points())
         layout.addWidget(self.image_viewer, 1)
         return panel
 
@@ -2108,6 +2294,9 @@ class MainWindow(QMainWindow):
             image.mask_mode if image is not None else "inside",
             image.mask_enabled if image is not None else False,
             self._selected_point_id(),
+            {point.id for point in self.project.control_points
+             if image is not None and (observation := point.observation_for(image.id)) is not None
+             and observation.locked},
         )
         has_image = image is not None and pixmap is not None and not pixmap.isNull()
         widgets = (self.mask_mode_combo, self.mask_enable_checkbox, self.mask_clear_button, self.mask_draw_button)
@@ -2180,29 +2369,66 @@ class MainWindow(QMainWindow):
     def _link_text(constraint: PointConstraint, point_names: dict[str, str]) -> str:
         first = point_names.get(constraint.first_point_id, "?")
         second = point_names.get(constraint.second_point_id, "?")
-        return f"{first}  ↔  {second}  ·  {constraint.kind}"
+        suffix = f" · {constraint.kind}" if constraint.kind != "tie" else ""
+        return f"{constraint.name or 'Link'} · {first} ↔ {second}{suffix}"
+
+    @staticmethod
+    def _point_text(point: GroundControlPoint) -> str:
+        return f"{point.display_name} · {point.label}" if point.label else point.display_name
+
+    def _point_context(self, point: GroundControlPoint) -> str:
+        image = next((image for image in self.project.images if image.id == point.image_id), None)
+        context = f"{image.name if image else 'No image'} / {point.display_name}"
+        if point.name != point.display_name:
+            context += f"\nUnique name: {point.name}"
+        if point.label:
+            context += f"\nLabel: {point.label}"
+        return context
+
+    def _point_choice(self, point: GroundControlPoint) -> str:
+        image = next((image for image in self.project.images if image.id == point.image_id), None)
+        return f"{image.name if image else 'No image'} · {point.display_name} [{point.name}]"
+
+    def _link_tooltip(self, constraint: PointConstraint, current: bool | None = None) -> str:
+        endpoints = []
+        for point_id in (constraint.first_point_id, constraint.second_point_id):
+            point = self.project.point_by_id(point_id)
+            endpoints.append(self._point_context(point) if point else "Missing point")
+        text = f"{constraint.name or 'Link'}: {endpoints[0]} ↔ {endpoints[1]}\nType: {constraint.kind}"
+        feedback = self._alignment_feedback
+        if feedback is not None and constraint.id in feedback.result.constraint_residuals:
+            if current is None:
+                current = feedback.is_current(self.project)
+            state = "Current" if current else "Outdated"
+            text += f"\nResidual: {feedback.result.constraint_residuals[constraint.id]:.4f} scene units ({state})"
+        return text
 
     def _fill_point_list(self, widget: QListWidget, points: list[GroundControlPoint], image_id: str | None = None) -> None:
         widget.clear()
         for point in points:
-            parts = [point.name]
-            if point.label:
-                parts.append(f'"{point.label}"')
+            parts = [self._point_text(point)]
+            if image_id is None:
+                image = next((image for image in self.project.images if image.id == point.image_id), None)
+                if image is not None:
+                    parts.append(image.name)
             observation = point.observation_for(image_id) if image_id else None
             if observation is not None:
                 parts.append(f"pixel ({observation.x:g}, {observation.y:g})")
             if point.geographic_x is not None and point.geographic_y is not None:
                 parts.append(f"map ({point.geographic_x:g}, {point.geographic_y:g})")
-            item = QListWidgetItem("  ·  ".join(parts))
+            item = QListWidgetItem("  ·  ".join(parts[:1] if image_id is not None else parts[:2]))
+            item.setToolTip(self._point_context(point) + "\n" + " · ".join(parts[1:]))
             item.setIcon(kind_icon("point"))
             item.setData(Qt.ItemDataRole.UserRole, point.id)
             widget.addItem(item)
 
     def _fill_link_list(self, widget: QListWidget, constraints: list[PointConstraint]) -> None:
         widget.clear()
-        point_names = {point.id: point.name for point in self.project.control_points}
+        point_names = {point.id: point.display_name for point in self.project.control_points}
+        current = self._alignment_feedback is not None and self._alignment_feedback.is_current(self.project)
         for constraint in constraints:
             item = QListWidgetItem(self._link_text(constraint, point_names))
+            item.setToolTip(self._link_tooltip(constraint, current))
             item.setIcon(kind_icon("link"))
             item.setData(Qt.ItemDataRole.UserRole, constraint.id)
             widget.addItem(item)
@@ -2256,16 +2482,18 @@ class MainWindow(QMainWindow):
             summary.append(f"{len(links)} links")
         self.selection_info_label.setText("  ·  ".join(summary))
         image_names = {image.id: image.name for image in self.project.images}
-        point_names = {point.id: point.name for point in self.project.control_points}
+        point_names = {point.id: point.display_name for point in self.project.control_points}
         self.selection_list.clear()
         for image in images:
             self.selection_list.addItem(QListWidgetItem(kind_icon("image"), f"Image  ·  {image.name}"))
         for point in points:
-            self.selection_list.addItem(QListWidgetItem(
-                kind_icon("point"), f"Point  ·  {point.name}  ·  {image_names.get(point.image_id, '?')}"
-            ))
+            item = QListWidgetItem(kind_icon("point"), f"{self._point_text(point)} · {image_names.get(point.image_id, '?')}")
+            item.setToolTip(self._point_context(point))
+            self.selection_list.addItem(item)
         for link in links:
-            self.selection_list.addItem(QListWidgetItem(kind_icon("link"), f"Link  ·  {self._link_text(link, point_names)}"))
+            item = QListWidgetItem(kind_icon("link"), self._link_text(link, point_names))
+            item.setToolTip(self._link_tooltip(link))
+            self.selection_list.addItem(item)
 
     def _show_image_details(self, image) -> None:
         self.image_info_label.setText(self._image_info_text(image))
@@ -2279,7 +2507,8 @@ class MainWindow(QMainWindow):
         self._fill_link_list(self.image_links_list, links)
 
     def _show_point_details(self, point: GroundControlPoint) -> None:
-        self.name_edit.setText(point.name)
+        self.name_edit.setText(point.display_name)
+        self.name_edit.setToolTip(f"Unique stored name: {point.name}")
         self.label_edit.setText(point.label or "")
         self.geo_x_edit.setText("" if point.geographic_x is None else str(point.geographic_x))
         self.geo_y_edit.setText("" if point.geographic_y is None else str(point.geographic_y))
@@ -2310,7 +2539,7 @@ class MainWindow(QMainWindow):
             combo.blockSignals(True)
             combo.clear()
             for point in self.project.control_points:
-                combo.addItem(kind_icon("point"), point.name, point.id)
+                combo.addItem(kind_icon("point"), self._point_choice(point), point.id)
         self.constraint_first_edit.setCurrentIndex(self.constraint_first_edit.findData(constraint.first_point_id))
         self.constraint_second_edit.setCurrentIndex(self.constraint_second_edit.findData(constraint.second_point_id))
         self.constraint_first_edit.blockSignals(False)
@@ -2324,9 +2553,12 @@ class MainWindow(QMainWindow):
                 where = ", ".join(
                     f"{kind_bar_html('image')} {escape(image_names.get(item.image_id, '?'))}" for item in point.observations
                 ) or "no images"
-                lines.append(f"{kind_bar_html('point')} {escape(point.name)}: {where}")
-        if self._alignment_result is not None and constraint.id in self._alignment_result.constraint_residuals:
-            lines.append(f"Alignment residual: {self._alignment_result.constraint_residuals[constraint.id]:.4f}")
+                lines.append(f"{kind_bar_html('point')} {escape(point.display_name)}: {where}")
+        feedback = self._alignment_feedback
+        if feedback is not None and constraint.id in feedback.result.constraint_residuals:
+            state = "Current" if feedback.is_current(self.project) else "Outdated"
+            residual = feedback.result.constraint_residuals[constraint.id]
+            lines.append(f"Alignment residual: {residual:.4f} scene units ({state})")
         self.constraint_info_label.setText("<br>".join(lines))
 
     def _on_detail_point_clicked(self, item: QListWidgetItem) -> None:
@@ -2357,7 +2589,6 @@ class MainWindow(QMainWindow):
         self.selected_point_id = point.id
         if point.image_id is not None:
             self.current_image_id = point.image_id
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         self.canvas.set_selected_point(point.id)
         self._refresh_details()
@@ -2394,6 +2625,7 @@ class MainWindow(QMainWindow):
         state = "locked" if locked else "unlocked"
         self.statusBar().showMessage(f"'{point.name}' position in this image is {state}.")
         self._refresh_layers()
+        self._refresh_image_view()
         self._refresh_map_points()
 
     def _begin_point_observation_drag(self, _image_id: str, _point_id: str) -> None:
@@ -2404,6 +2636,7 @@ class MainWindow(QMainWindow):
         observation = point.observation_for(image_id) if point else None
         if observation is not None and not observation.locked:
             point.set_observation(image_id, x, y)
+            self._refresh_alignment_feedback()
 
     def _on_canvas_point_selected(self, image_id: str, point_id: str) -> None:
         point = self.project.point_by_id(point_id)
@@ -2411,7 +2644,7 @@ class MainWindow(QMainWindow):
             return
         self.current_image_id = image_id
         self._select_point(point_id)
-        self.statusBar().showMessage(f"Selected '{point.name}'. Choose Arm selected point before placing or moving an observation.")
+        self.statusBar().showMessage(f"Selected '{point.name}'. Drag its marker to move the observation when unlocked.")
 
     def _set_add_points_mode(self, enabled: bool) -> None:
         if enabled and self.link_points_mode:
@@ -2425,7 +2658,6 @@ class MainWindow(QMainWindow):
             self._clear_image_selection(keep_context=True)
             self._clear_point_selection()
             self._clear_constraint_selection()
-            self.pending_point_id = None
             self.pending_constraint_point_id = None
             self.pending_constraint_image_id = None
             self.canvas.set_active_point("__continuous_add__")
@@ -2434,7 +2666,7 @@ class MainWindow(QMainWindow):
             self.instruction_label.setText("Add points is on: click any image to create a point there. Toggle it off to move images.")
             self.statusBar().showMessage("Add points is on. Click an image to add points continuously.")
         else:
-            self.canvas.set_active_point(self.pending_point_id)
+            self.canvas.set_active_point(None)
             self.instruction_label.setText("Use Add points to click control points onto images, then Link points to join matches.")
             self.statusBar().showMessage("Add points is off. Drag images to move them.")
 
@@ -2454,13 +2686,12 @@ class MainWindow(QMainWindow):
             self._clear_image_selection(keep_context=True)
             self._clear_point_selection()
             self._clear_constraint_selection()
-            self.pending_point_id = None
             self.canvas.set_active_point("__continuous_add__")
             self._refresh_details()
             self.instruction_label.setText("Link points is on: click a point, then click its match in a different image.")
             self.statusBar().showMessage("Link points is on. Click a point marker to choose the first endpoint.")
         else:
-            self.canvas.set_active_point("__continuous_add__" if self.add_points_mode else self.pending_point_id)
+            self.canvas.set_active_point("__continuous_add__" if self.add_points_mode else None)
             self.instruction_label.setText("Use Add points to click control points onto images, then Link points to join matches.")
             self.statusBar().showMessage("Link points is off.")
 
@@ -2515,6 +2746,7 @@ class MainWindow(QMainWindow):
             try:
                 name = self.project.next_control_point_name(image_id)
                 point = GroundControlPoint.create(self.project.unique_control_point_name(name))
+                point.short_name = name
                 before = self.project.to_dict()
                 self.project.add_control_point(point)
             except ValueError as error:
@@ -2538,7 +2770,8 @@ class MainWindow(QMainWindow):
         if not name:
             self._show_error("A control point needs a name.")
             return
-        if any(other.id != point.id and other.name.casefold() == name.casefold() for other in self.project.control_points):
+        renamed = name != point.display_name
+        if renamed and any(other.id != point.id and other.name.casefold() == name.casefold() for other in self.project.control_points):
             self._show_error(f"A control point named '{name}' already exists.")
             return
         try:
@@ -2563,7 +2796,9 @@ class MainWindow(QMainWindow):
         point.geographic_y = geographic_y
         if coordinates_changed:
             point.set_observation(observation.image_id, pixel_x, pixel_y)
-        point.name = name
+        if renamed:
+            point.name = name
+            point.short_name = None
         point.label = self.label_edit.text().strip() or None
         self._record_project_edit(before, "Edit control point")
         self._refresh_points(point.id)
@@ -2612,6 +2847,8 @@ class MainWindow(QMainWindow):
             self.map_crs_combo.setCurrentText(text)
 
     def _update_crs(self) -> None:
+        if self._solver_running:
+            return
         value = self.crs_edit.text().strip()
         if value and value != self.project.crs:
             try:
@@ -2625,31 +2862,60 @@ class MainWindow(QMainWindow):
                 self.crs_edit.setText(self.project.crs)
                 return
             before = self.project.to_dict()
-            self._reproject_project(transformer)
-            self.project.crs = value
-            self._resolve_world_transforms()
+            previous_report = self._georeference_result
+            previous_tolerance = self._georeference_result_tolerance
+
+            def restore() -> None:
+                self.project = Project.from_dict(before)
+                self._georeference_result = previous_report
+                self._georeference_result_tolerance = previous_tolerance
+                self.crs_edit.setText(self.project.crs)
+                self._sync_map_crs_combo(self.project.crs)
+                self._refresh_all()
+
+            try:
+                self._reproject_project(transformer)
+                self.project.crs = value
+                self._resolve_world_transforms()
+            except SolverCancelled:
+                restore()
+                self.statusBar().showMessage("CRS switch cancelled. Existing coordinates and transforms were retained.")
+                return
+            except (ValueError, RuntimeError, ImportError) as error:
+                restore()
+                self._show_error(f"Cannot switch to coordinate system '{value}': {error}")
+                return
             self._record_project_edit(before, "Change coordinate system")
             self._refresh_points(self._selected_point().id if self._selected_point() else None)
             self._refresh_world_map(fit=True)
 
     def _resolve_world_transforms(self) -> None:
         """Refit image transforms to the reprojected GCPs, since reprojection alone is only a similarity approximation."""
-        initial = {
-            image.id: (image.world_x, image.world_y, image.world_rotation, image.world_scale)
-            for image in self.project.images
-            if image.world_x is not None and image.world_y is not None
-        }
-        try:
-            with self._progress("Refitting image transforms…") as update:
-                result = simulate_georeference(
-                    self.project, initial_transforms=initial, progress=lambda fraction: update(fraction * 100)
-                )
-        except ValueError:
+        if self._solver_running:
             return
-        for image in self.project.images:
-            transform = result.transforms.get(image.id)
-            if transform is not None:
-                image.world_x, image.world_y, image.world_rotation, image.world_scale = transform
+        if not any(
+            point.geographic_x is not None and point.geographic_y is not None and point.observations
+            for point in self.project.control_points
+        ):
+            self._georeference_result = None
+            self._georeference_result_tolerance = None
+            self._update_hints()
+            return
+        self._solver_running = True
+        self._update_hints()
+        try:
+            config = self.project.georeference_settings
+            result = self._compute_solver_result("georeference", self.project, config)
+            assert isinstance(result, GeoreferenceResult)
+            self._georeference_result = result
+            self._georeference_result_tolerance = config.tolerance
+            for image in self.project.images:
+                transform = result.transforms.get(image.id)
+                if transform is not None:
+                    image.world_x, image.world_y, image.world_rotation, image.world_scale = transform
+        finally:
+            self._solver_running = False
+            self._update_hints()
 
     def _reproject_project(self, transformer: Transformer) -> None:
         for point in self.project.control_points:
@@ -2684,7 +2950,7 @@ class MainWindow(QMainWindow):
         if not target_points:
             self._show_error("Add a control point in another image before creating a link.")
             return
-        target_names = [point.name for point in target_points]
+        target_names = [self._point_choice(point) for point in target_points]
         target_name, accepted = QInputDialog.getItem(
             self,
             "Link control points",
@@ -2695,7 +2961,7 @@ class MainWindow(QMainWindow):
         )
         if not accepted:
             return
-        second_id = next(point.id for point in target_points if point.name == target_name)
+        second_id = target_points[target_names.index(target_name)].id
         try:
             constraint = PointConstraint.create(first_id, second_id)
             before = self.project.to_dict()
@@ -2704,7 +2970,6 @@ class MainWindow(QMainWindow):
             self._show_error(str(error))
             return
         self._record_project_edit(before, "Link control points")
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         self._refresh_constraints()
         self._select_constraint(constraint.id)
@@ -2737,7 +3002,6 @@ class MainWindow(QMainWindow):
         before = self.project.to_dict()
         self.project.constraints = [item for item in self.project.constraints if item.id not in constraint_ids]
         self._record_project_edit(before, "Remove point constraint")
-        self.pending_point_id = None
         self.selected_constraint_id = None
         self.canvas.set_active_point(None)
         self._refresh_constraints()
@@ -2964,7 +3228,6 @@ class MainWindow(QMainWindow):
             if not {constraint.first_point_id, constraint.second_point_id} & point_ids
         ]
         self._record_project_edit(before, "Delete control point")
-        self.pending_point_id = None
         self.canvas.set_active_point(None)
         self.selected_point_id = None
         self._refresh_points()
@@ -2975,10 +3238,12 @@ class MainWindow(QMainWindow):
         self._reset_image_loading()
         self.undo_stack.clear()
         self.project = Project()
+        self._alignment_feedback = None
+        self._georeference_result = None
+        self._georeference_result_tolerance = None
         self._image_pixmaps.clear()
         self.project_path = None
         self.current_image_id = None
-        self.pending_point_id = None
         self.selected_point_id = None
         self.selected_constraint_id = None
         self._refresh_all()
@@ -3014,11 +3279,12 @@ class MainWindow(QMainWindow):
         self.undo_stack.clear()
         self._reset_image_loading(background=True)
         self.project = project
+        self._georeference_result = None
+        self._georeference_result_tolerance = None
         self._image_pixmaps.clear()
         self._masked_pixmaps.clear()
         self.project_path = Path(path)
         self.current_image_id = project.images[0].id if project.images else None
-        self.pending_point_id = None
         self.selected_point_id = None
         self.selected_constraint_id = None
         self._refresh_all()
@@ -3150,103 +3416,243 @@ class MainWindow(QMainWindow):
             return
         self.canvas.fit_images(selected_image_ids or None)
 
-    def simulate_alignment_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Simulate image alignment")
-        dialog.resize(540, 480)
-        layout = QVBoxLayout(dialog)
+    @contextmanager
+    def _solver_progress(self, stage: str):
+        title = "Aligning images" if stage == "alignment" else "Georeferencing images"
+        dialog = QProgressDialog(title, "Cancel", 0, 100, self)
+        dialog.setWindowTitle(title)
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        self._solver_progress_dialog = dialog
+        clock = QElapsedTimer()
+        clock.start()
+        last_paint = [-1000]
 
-        settings_form = QFormLayout()
-        tolerance_spin = QDoubleSpinBox()
-        tolerance_spin.setRange(0.01, 10000.0)
-        tolerance_spin.setDecimals(2)
-        tolerance_spin.setValue(0.5)
-        tolerance_spin.setSuffix(" scene units")
-        iterations_spin = QSpinBox()
-        iterations_spin.setRange(1, 10000)
-        iterations_spin.setValue(100)
-        settings_form.addRow("Target maximum residual", tolerance_spin)
-        settings_form.addRow("Maximum iterations", iterations_spin)
-        layout.addLayout(settings_form)
+        def update(fraction: float) -> None:
+            if dialog.wasCanceled():
+                raise SolverCancelled()
+            dialog.setValue(min(99, int(fraction * 100)))
+            if clock.elapsed() - last_paint[0] >= 40:
+                last_paint[0] = clock.elapsed()
+                QApplication.processEvents()
+            if dialog.wasCanceled():
+                raise SolverCancelled()
 
-        report = QLabel("No simulation run yet.")
-        report.setWordWrap(True)
-        report.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(report, 1)
+        try:
+            dialog.show()
+            update(0)
+            yield update
+        finally:
+            dialog.close()
+            self._solver_progress_dialog = None
 
-        result: AlignmentResult | None = None
-        preview_transforms: dict[str, tuple[float, float, float, float]] | None = None
+    def run_alignment(self) -> bool:
+        return self._run_solver_pipeline(("alignment",))
 
-        def run_simulation() -> None:
-            nonlocal result, preview_transforms
-            self._set_canvas_state("rest")
-            try:
-                with self._progress("Running alignment solver…") as update:
-                    result = simulate_alignment(
-                        self.project,
-                        tolerance=tolerance_spin.value(),
-                        max_iterations=iterations_spin.value(),
-                        initial_transforms={
-                            image.id: self.canvas.image_transform(image.id)
-                            for image in self.project.images
-                            if self.canvas.image_transform(image.id) is not None
-                        },
-                        progress=lambda fraction: update(fraction * 100),
+    def run_georeference(self) -> bool:
+        return self._run_solver_pipeline(("georeference",))
+
+    def run_combined_solvers(self) -> bool:
+        return self._run_solver_pipeline(("alignment", "georeference"))
+
+    def open_solver_settings(self, stage: str) -> None:
+        if self._solver_running:
+            return
+        if stage not in ("alignment", "georeference"):
+            raise ValueError(f"Unknown solver stage: {stage}")
+        dialog = SolverSettingsDialog(stage, getattr(self.project, f"{stage}_settings"), self)
+        dialog.settings_applied.connect(lambda settings: self._apply_solver_settings(stage, settings))
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.run_requested:
+            if stage == "alignment":
+                self.run_alignment()
+            else:
+                self.run_georeference()
+
+    def _apply_solver_settings(self, stage: str, settings: SolverSettings) -> None:
+        if self._solver_running:
+            return
+        before = self.project.to_dict()
+        setattr(self.project, f"{stage}_settings", settings)
+        self._record_project_edit(before, f"Update {stage} settings")
+        self._update_hints()
+
+    def _compute_solver_result(
+        self, stage: str, candidate: Project, config: SolverSettings,
+    ) -> AlignmentResult | GeoreferenceResult:
+        with self._solver_progress(stage) as progress:
+            if stage == "alignment":
+                initial = {}
+                for image in candidate.images:
+                    displayed = self.canvas.image_transform(image.id) if not self._aligned_view_active() else None
+                    initial[image.id] = (
+                        image.position_x if image.position_x is not None else (displayed[0] if displayed else 0.0),
+                        displayed[1] if image.position_x is None and displayed else image.position_y,
+                        image.rotation, image.scale,
                     )
-            except ValueError as error:
-                QMessageBox.warning(dialog, "Cannot simulate alignment", str(error))
-                return
-            self._alignment_result = result
-            preview_transforms = result.transforms
-            anchor_names = [
-                next(image.name for image in self.project.images if image.id == image_id)
-                for image_id in result.anchor_image_ids
-            ]
-            lines = [
-                f"Iterations: {result.iterations}",
-                f"Maximum constraint residual: {result.maximum_residual:.3f} scene units",
-                f"Status: {'target reached' if result.converged else 'target not reached'}",
-                f"Fixed reference image(s): {', '.join(anchor_names)}",
-                "",
-                "Residuals by constraint:",
-            ]
-            constraint_names = {item.id: item for item in self.project.constraints}
-            point_names = {point.id: point.name for point in self.project.control_points}
+                return simulate_alignment(
+                    candidate, tolerance=config.tolerance, max_iterations=config.max_iterations,
+                    initial_transforms=initial, progress=progress,
+                )
+            initial = {
+                image.id: (image.world_x, image.world_y, image.world_rotation, image.world_scale)
+                for image in candidate.images if image.world_x is not None and image.world_y is not None
+            }
+            return simulate_georeference(
+                candidate, tolerance=config.tolerance, max_iterations=config.max_iterations,
+                initial_transforms=initial, progress=progress,
+            )
+
+    def _run_solver_pipeline(self, stages: tuple[str, ...]) -> bool:
+        if self._solver_running:
+            return False
+        self._solver_running = True
+        self._update_hints()
+        try:
+            candidate = Project.from_dict(self.project.to_dict())
+            settings = {
+                "alignment": candidate.alignment_settings,
+                "georeference": candidate.georeference_settings,
+            }
+            results: dict[str, AlignmentResult | GeoreferenceResult] = {}
+            for stage in stages:
+                config = settings[stage]
+                result = self._compute_solver_result(stage, candidate, config)
+                results[stage] = result
+                if isinstance(result, AlignmentResult):
+                    self._alignment_feedback = AlignmentFeedback.capture(self.project, result, config.tolerance)
+                    self._refresh_details()
+                else:
+                    self._georeference_result = result
+                    self._georeference_result_tolerance = config.tolerance
+                if not result.converged:
+                    decision = self._review_solver_result(stage, result)
+                    if decision == "apply":
+                        self._apply_solver_results(results, settings)
+                    elif decision == "settings":
+                        QTimer.singleShot(0, lambda chosen=stage: self.open_solver_settings(chosen))
+                    self.statusBar().showMessage(self._solver_summary(stage, result, "Target not reached"))
+                    return decision == "apply" and len(stages) == 1
+                if isinstance(result, AlignmentResult):
+                    for image in candidate.images:
+                        if image.id in result.transforms:
+                            image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale = result.transforms[image.id]
+                    candidate.canvas_state = "aligned"
+            if not all(settings[stage].auto_apply for stage in stages):
+                self.statusBar().showMessage(" | ".join(
+                    self._solver_summary(stage, results[stage], "Preview ready") for stage in stages
+                ))
+                return False
+            self._apply_solver_results(results, settings)
+            self.statusBar().showMessage(" | ".join(
+                self._solver_summary(stage, results[stage], "Applied") for stage in stages
+            ))
+            return True
+        except SolverCancelled:
+            self.statusBar().showMessage("Solver cancelled. Existing transforms were retained.")
+            return False
+        except (ValueError, RuntimeError, ImportError) as error:
+            self._show_error(f"Solver failed: {error}")
+            return False
+        finally:
+            self._solver_running = False
+            self._update_hints()
+
+    def _apply_solver_results(self, results: dict[str, AlignmentResult | GeoreferenceResult], settings: dict[str, SolverSettings]) -> None:
+        combined = len(results) > 1
+        if combined:
+            self.undo_stack.beginMacro("Align and georeference")
+        try:
+            alignment = results.get("alignment")
+            if isinstance(alignment, AlignmentResult):
+                self._apply_alignment_result(alignment, settings["alignment"].tolerance)
+            world = results.get("georeference")
+            if isinstance(world, GeoreferenceResult):
+                self._apply_georeference_result(world)
+        finally:
+            if combined:
+                self.undo_stack.endMacro()
+
+    @staticmethod
+    def _solver_summary(stage: str, result: AlignmentResult | GeoreferenceResult, state: str) -> str:
+        residuals = result.constraint_residuals if isinstance(result, AlignmentResult) else result.observation_residuals
+        rms = sqrt(sum(value ** 2 for value in residuals.values()) / len(residuals)) if residuals else 0.0
+        units = "scene units" if stage == "alignment" else "CRS units"
+        return f"{stage.title()} {state.lower()} | RMS {rms:.3f} | Max {result.maximum_residual:.3f} {units}"
+
+    def _review_solver_result(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> str:
+        box = QMessageBox(QMessageBox.Icon.Warning, "Solver target not reached",
+                          self._solver_summary(stage, result, "Target not reached"), parent=self)
+        apply_button = box.addButton("Apply best result", QMessageBox.ButtonRole.AcceptRole)
+        settings_button = box.addButton("Adjust settings", QMessageBox.ButtonRole.ActionRole)
+        discard_button = box.addButton("Discard", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(discard_button)
+        box.exec()
+        if box.clickedButton() is apply_button:
+            return "apply"
+        return "settings" if box.clickedButton() is settings_button else "discard"
+
+    def show_solver_report(self, stage: str) -> None:
+        if self._solver_running:
+            return
+        if stage not in ("alignment", "georeference"):
+            raise ValueError(f"Unknown solver stage: {stage}")
+        result = self._alignment_result if stage == "alignment" else self._georeference_result
+        if result is None:
+            return
+        units = "scene units" if stage == "alignment" else "CRS units"
+        lines = [
+            f"{stage.title()} report",
+            f"Iterations: {result.iterations}",
+            f"Status: {'target reached' if result.converged else 'target not reached'}",
+            self._solver_summary(stage, result, "Last result"),
+        ]
+        image_names = {image.id: image.name or image.id for image in self.project.images}
+        point_names = {point.id: point.name or point.id for point in self.project.control_points}
+        if isinstance(result, AlignmentResult):
+            if self._alignment_feedback is not None:
+                lines.append(f"Target tolerance: {self._alignment_feedback.tolerance:g} {units}")
+                lines.append(
+                    f"Inputs: {'current' if self._alignment_feedback.is_current(self.project) else 'changed since this result'}"
+                )
+            anchors = [image_names.get(image_id, image_id) for image_id in result.anchor_image_ids]
+            lines.extend((f"Fixed reference image(s): {', '.join(anchors)}", "", "Residuals by constraint:"))
+            constraints = {item.id: item for item in self.project.constraints}
             for constraint_id, residual in result.constraint_residuals.items():
-                constraint = constraint_names[constraint_id]
-                first_name = point_names[constraint.first_point_id]
-                second_name = point_names[constraint.second_point_id]
-                lines.append(f"{first_name} ↔ {second_name}: {residual:.3f} scene units")
-            report.setText("\n".join(lines))
-            apply_button.setEnabled(True)
-            georeference_button.setEnabled(True)
-
-        def apply_result() -> None:
-            if result is None or preview_transforms is None:
-                return
-            self._apply_alignment_result(result)
-            dialog.accept()
-
-        def run_second_stage() -> None:
-            if result is not None:
-                dialog.accept()
-                self.simulate_georeference_dialog()
-
+                constraint = constraints.get(constraint_id)
+                name = constraint_id
+                if constraint is not None:
+                    first = point_names.get(constraint.first_point_id, constraint.first_point_id)
+                    second = point_names.get(constraint.second_point_id, constraint.second_point_id)
+                    name = f"{first} <-> {second} ({constraint_id})"
+                lines.append(f"{name}: {residual:.4f} {units}")
+        else:
+            lines.extend((
+                f"CRS: {result.crs}",
+                f"Images georeferenced: {len(result.transforms)}",
+            ))
+            if self._georeference_result_tolerance is not None:
+                lines.append(f"Target tolerance: {self._georeference_result_tolerance:g} {units}")
+            lines.extend(("", "Residuals by image / control point:"))
+            for (image_id, point_id), residual in result.observation_residuals.items():
+                image_name = image_names.get(image_id, image_id)
+                point_name = point_names.get(point_id, point_id)
+                lines.append(f"{image_name} / {point_name}: {residual:.4f} {units}")
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Last {stage} report")
+        dialog.resize(640, 480)
+        layout = QVBoxLayout(dialog)
+        report = QPlainTextEdit(dialog)
+        report.setReadOnly(True)
+        report.setPlainText("\n".join(lines))
+        layout.addWidget(report, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        simulate_button = buttons.addButton("Run simulation", QDialogButtonBox.ButtonRole.ActionRole)
-        apply_button = buttons.addButton("Apply transforms", QDialogButtonBox.ButtonRole.ApplyRole)
-        georeference_button = buttons.addButton("Step 2: Georeference", QDialogButtonBox.ButtonRole.ActionRole)
-        apply_button.setEnabled(False)
-        georeference_button.setEnabled(False)
-        simulate_button.clicked.connect(run_simulation)
-        apply_button.clicked.connect(apply_result)
-        georeference_button.clicked.connect(run_second_stage)
         buttons.rejected.connect(dialog.reject)
-        dialog_layout = buttons
-        layout.addWidget(dialog_layout)
+        layout.addWidget(buttons)
         dialog.exec()
 
-    def _apply_alignment_result(self, result: AlignmentResult) -> None:
+    def _apply_alignment_result(self, result: AlignmentResult, tolerance: float = 0.5) -> None:
         before = self.project.to_dict()
         for image in self.project.images:
             transform = result.transforms.get(image.id)
@@ -3254,97 +3660,17 @@ class MainWindow(QMainWindow):
                 continue
             image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale = transform
         self.project.canvas_state = "aligned"
+        self._alignment_feedback = AlignmentFeedback.capture(self.project, result, tolerance)
         self._record_project_edit(before, "Apply simulated alignment")
         self._refresh_canvas()
-
-    def simulate_georeference_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Step 2: Georeference ({self.project.crs})")
-        dialog.resize(560, 500)
-        layout = QVBoxLayout(dialog)
-
-        settings_form = QFormLayout()
-        tolerance_spin = QDoubleSpinBox()
-        tolerance_spin.setRange(1e-8, 1_000_000.0)
-        tolerance_spin.setDecimals(6)
-        tolerance_spin.setValue(1.0)
-        tolerance_spin.setSuffix(" CRS units")
-        iterations_spin = QSpinBox()
-        iterations_spin.setRange(1, 10000)
-        iterations_spin.setValue(1000)
-        settings_form.addRow("Target maximum GCP residual", tolerance_spin)
-        settings_form.addRow("Maximum iterations", iterations_spin)
-        layout.addLayout(settings_form)
-
-        report = QLabel("This step uses control points with geographic X/Y coordinates in the project CRS.")
-        report.setWordWrap(True)
-        report.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(report, 1)
-
-        result: GeoreferenceResult | None = None
-
-        def run_georeference() -> None:
-            nonlocal result
-            initial = {
-                image.id: (image.world_x or 0.0, image.world_y or 0.0, image.world_rotation, image.world_scale)
-                for image in self.project.images
-                if image.world_x is not None and image.world_y is not None
-            }
-            try:
-                with self._progress("Running georeference solver…") as update:
-                    result = simulate_georeference(
-                        self.project,
-                        tolerance=tolerance_spin.value(),
-                        max_iterations=iterations_spin.value(),
-                        initial_transforms=initial,
-                        progress=lambda fraction: update(fraction * 100),
-                    )
-            except ValueError as error:
-                QMessageBox.warning(dialog, "Cannot georeference", str(error))
-                return
-
-            image_names = {image.id: image.name for image in self.project.images}
-            point_names = {point.id: point.name for point in self.project.control_points}
-            residual_lines = [
-                f"{image_names[image_id]} / {point_names[point_id]}: {residual:.4f} {result.crs} units"
-                for (image_id, point_id), residual in result.observation_residuals.items()
-            ]
-            solved_images = set(result.transforms)
-            unsolved_names = [image.name for image in self.project.images if image.id not in solved_images]
-            lines = [
-                f"CRS: {result.crs}",
-                f"Images georeferenced: {len(solved_images)} / {len(self.project.images)}",
-                f"Iterations: {result.iterations}",
-                f"Maximum GCP residual: {result.maximum_residual:.4f} CRS units",
-                f"Status: {'target reached' if result.converged else 'target not reached'}",
-                "",
-                "Residuals by image / control point:",
-                *residual_lines,
-            ]
-            if unsolved_names:
-                lines.extend(("", "Images without usable geographic control points:", *unsolved_names))
-            lines.extend(("", "These are world-coordinate transforms only; no raster mosaic is generated."))
-            report.setText("\n".join(lines))
-            apply_button.setEnabled(True)
-
-        def apply_georeference() -> None:
-            if result is None:
-                return
-            self._apply_georeference_result(result)
-            dialog.accept()
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        run_button = buttons.addButton("Run GCP solver", QDialogButtonBox.ButtonRole.ActionRole)
-        apply_button = buttons.addButton("Apply world transforms", QDialogButtonBox.ButtonRole.ApplyRole)
-        apply_button.setEnabled(False)
-        run_button.clicked.connect(run_georeference)
-        apply_button.clicked.connect(apply_georeference)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        dialog.exec()
+        self._refresh_details()
+        self._update_hints()
 
     def _apply_georeference_result(self, result: GeoreferenceResult) -> None:
         before = self.project.to_dict()
+        if result is not self._georeference_result:
+            self._georeference_result_tolerance = None
+        self._georeference_result = result
         self.project.crs = result.crs
         for image in self.project.images:
             transform = result.transforms.get(image.id)
@@ -3354,6 +3680,7 @@ class MainWindow(QMainWindow):
         self._record_project_edit(before, "Apply GCP georeferencing")
         self.crs_edit.setText(self.project.crs)
         self._refresh_world_map(fit=True)
+        self._update_hints()
 
     def _update_title(self) -> None:
         name = self.project_path.name if self.project_path else self.project.name

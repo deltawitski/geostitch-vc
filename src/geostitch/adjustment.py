@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, degrees, hypot, radians, sin
+from math import degrees, hypot, radians
 from typing import Callable
 
 from geostitch.models import Project
+from geostitch.transforms import apply_similarity_transform as _apply_transform
 
 ImageTransform = tuple[float, float, float, float]
 
@@ -214,15 +215,6 @@ def _image_components(adjacency: dict[str, set[str]], image_order: list[str]) ->
         component.sort(key=image_order.index)
         components.append(component)
     return components
-
-
-def _apply_transform(x: float, y: float, transform: ImageTransform) -> tuple[float, float]:
-    position_x, position_y, rotation, scale = transform
-    angle = rotation * 3.141592653589793 / 180.0
-    return (
-        position_x + scale * (cos(angle) * x - sin(angle) * y),
-        position_y + scale * (sin(angle) * x + cos(angle) * y),
-    )
 
 
 def _constraint_residuals(matches: list[_Match], transforms: dict[str, ImageTransform]) -> dict[str, float]:

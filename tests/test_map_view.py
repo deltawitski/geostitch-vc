@@ -30,6 +30,7 @@ def test_world_map_wheel_zoom_stops_at_limits_and_can_reverse(monkeypatch, direc
                             Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
                             Qt.ScrollPhase.NoScrollPhase, False)
         view.wheelEvent(event)
+        view._zoom_animation.setCurrentTime(view.ZOOM_ANIMATION_MS)
 
     try:
         minimum, maximum = view._scale_limits()

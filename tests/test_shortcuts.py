@@ -36,7 +36,8 @@ def test_point_rows_expand_to_incident_constraints_and_preserve_expansion(tmp_pa
         rows = point_rows()
         assert [rows[point.id].childCount() for point in points] == [2, 1, 1, 0]
         assert rows[points[0].id].child(0).item_id == links[0].id
-        assert "second (second.png)" in rows[points[0].id].child(0).text(0)
+        assert rows[points[0].id].child(0).text(0) == "L1 → second"
+        assert "second.png / second" in rows[points[0].id].child(0).toolTip(0)
         rows[points[0].id].setExpanded(True)
         rows[points[1].id].setExpanded(False)
         points[1].name = "renamed"
@@ -45,7 +46,7 @@ def test_point_rows_expand_to_incident_constraints_and_preserve_expansion(tmp_pa
         rows = point_rows()
         assert rows[points[0].id].isExpanded()
         assert not rows[points[1].id].isExpanded()
-        assert "renamed (second.png) - updated" == rows[points[0].id].child(0).text(0)
+        assert "L1 → renamed · updated" == rows[points[0].id].child(0).text(0)
         window.project.constraints.remove(links[0])
         window._refresh_layers()
         assert [point_rows()[point.id].childCount() for point in points] == [1, 0, 1, 0]
@@ -460,8 +461,10 @@ def test_toolbar_exposes_common_actions_and_menus_have_visible_hover_highlight(t
     stylesheet = app.styleSheet()
 
     toolbar_actions = window.findChild(QToolBar, "mainToolbar").actions()
-    for key in ("add_points", "link_points", "simulate_alignment", "georeference"):
+    for key in ("add_points", "link_points"):
         assert window.shortcut_actions[key] in toolbar_actions
+    for stage, key in (("alignment", "simulate_alignment"), ("georeference", "georeference")):
+        assert window.solver_buttons[stage].run_button.defaultAction() is window.shortcut_actions[key]
     assert "QMenuBar::item:selected" in stylesheet
     assert "QMenu::item:selected" in stylesheet
     assert window.shortcut_actions["save_project"].shortcut().toString() == "Ctrl+S"

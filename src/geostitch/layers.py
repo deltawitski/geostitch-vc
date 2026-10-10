@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QIcon, QPixmap
 from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTreeWidget, QTreeWidgetItem
 
+from geostitch.alignment_feedback import residual_color
 from geostitch.icons import kind_icon
 
 ID_ROLE = Qt.ItemDataRole.UserRole
@@ -17,7 +19,7 @@ class LayerItem(QTreeWidgetItem):
     """Tree row for an image or control point; `data(role)` defaults to the first column."""
 
     def __init__(self, kind: str, item_id: str, text: str):
-        super().__init__([text, "", "", ""])
+        super().__init__([text, "", "", "", ""])
         self.setData(0, ID_ROLE, item_id)
         self.setData(0, KIND_ROLE, kind)
         self.setIcon(0, kind_icon({VECTOR_KIND: "geojson"}.get(kind, kind)))
@@ -38,6 +40,26 @@ class LayerItem(QTreeWidgetItem):
     def item_id(self) -> str:
         return self.data(0, ID_ROLE)
 
+    def set_alignment_error(self, value: float | None, tolerance: float, current: bool, description: str) -> None:
+        column = LayerTree.ERROR_COLUMN
+        self.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.setText(column, "--" if value is None else f"{value:.3f}")
+        color = QColor(residual_color(value, tolerance) if value is not None and current else "#7a848a")
+        self.setForeground(column, QBrush(color))
+        if value is None:
+            self.setIcon(column, QIcon())
+            self.setToolTip(column, "No alignment residual available for this item.")
+            return
+        swatch = QPixmap(4, 12)
+        swatch.fill(color)
+        self.setIcon(column, QIcon(swatch))
+        state = "Current solve" if current else "Outdated solve: observations, links or rest transforms changed"
+        self.setToolTip(column, (
+            f"{description}: {value:.6f} scene units\n{state}\n"
+            f"Green <= {tolerance:g}; amber <= {tolerance * 2:g}; red > {tolerance * 2:g} scene units.\n"
+            "Alignment fit, not independent geographic accuracy."
+        ))
+
 
 class LayerTree(QTreeWidget):
     """Images and GeoJSON layers as drag-reorderable top-level rows (top row is drawn in front), images holding their control points."""
@@ -48,12 +70,14 @@ class LayerTree(QTreeWidget):
     EYE_COLUMN = 1
     MAP_COLUMN = 2
     LOCK_COLUMN = 3
+    ERROR_COLUMN = 4
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._control_click_active = False
-        self.setColumnCount(4)
-        self.setHeaderHidden(True)
+        self.setColumnCount(5)
+        self.setHeaderLabels(["Layer", "", "", "", "Error"])
+        self.setHeaderHidden(False)
         self.setIndentation(16)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDragEnabled(True)
@@ -66,9 +90,12 @@ class LayerTree(QTreeWidget):
         header.setSectionResizeMode(self.EYE_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(self.MAP_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(self.LOCK_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(self.ERROR_COLUMN, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(self.EYE_COLUMN, 32)
         self.setColumnWidth(self.MAP_COLUMN, 32)
         self.setColumnWidth(self.LOCK_COLUMN, 32)
+        self.setColumnWidth(self.ERROR_COLUMN, 80)
+        self.headerItem().setToolTip(self.ERROR_COLUMN, "Alignment residuals in scene units; image RMS, point maximum, link distance.")
 
     def _image_rows(self) -> list[LayerItem]:
         """Image rows from the bottom layer up, skipping GeoJSON rows."""

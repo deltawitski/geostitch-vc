@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+
+if TYPE_CHECKING:
+    from geostitch.alignment_feedback import AlignmentFeedback
 
 
 @dataclass
@@ -79,6 +84,11 @@ class GroundControlPoint:
     label: str | None = None
     visible: bool = True
     map_visible: bool = True
+    short_name: str | None = None
+
+    @property
+    def display_name(self) -> str:
+        return self.short_name or self.name
 
     @property
     def image_id(self) -> str | None:
@@ -113,6 +123,7 @@ class PointConstraint:
     first_point_id: str
     second_point_id: str
     kind: str = "tie"
+    name: str | None = None
 
     @classmethod
     def create(cls, first_point_id: str, second_point_id: str, kind: str = "tie") -> PointConstraint:
@@ -126,6 +137,29 @@ class PointConstraint:
         )
 
 
+@dataclass(frozen=True)
+class SolverSettings:
+    tolerance: float = 0.5
+    max_iterations: int = 100
+    auto_apply: bool = True
+
+    def __post_init__(self) -> None:
+        if not isfinite(self.tolerance) or self.tolerance <= 0:
+            raise ValueError("Solver tolerance must be finite and greater than zero.")
+        if not isinstance(self.max_iterations, int) or isinstance(self.max_iterations, bool) or not 1 <= self.max_iterations <= 10000:
+            raise ValueError("Maximum solver iterations must be an integer from 1 to 10000.")
+        if not isinstance(self.auto_apply, bool):
+            raise ValueError("Automatic application must be true or false.")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], defaults: SolverSettings) -> SolverSettings:
+        if not isinstance(data, dict):
+            raise ValueError("Solver settings must be an object.")
+        return cls(float(data.get("tolerance", defaults.tolerance)),
+                   data.get("max_iterations", defaults.max_iterations),
+                   data.get("auto_apply", defaults.auto_apply))
+
+
 @dataclass
 class Project:
     name: str = "Untitled project"
@@ -137,6 +171,10 @@ class Project:
     layer_order: list[str] = field(default_factory=list)
     views: dict[str, Any] = field(default_factory=dict)
     canvas_state: str = "rest"
+    alignment_feedback: AlignmentFeedback | None = None
+    alignment_settings: SolverSettings = field(default_factory=SolverSettings)
+    georeference_settings: SolverSettings = field(default_factory=lambda: SolverSettings(1.0, 1000))
+    next_link_number: int = 1
 
     def add_image(self, path: str | Path) -> ImageRecord:
         resolved = str(Path(path).expanduser().resolve())
@@ -162,12 +200,12 @@ class Project:
         image = next((item for item in self.images if item.id == image_id), None)
         if image is None:
             raise ValueError("Select an image before generating a control-point name.")
-        prefix = Path(image.name).stem or "image"
-        used_names = {point.name.casefold() for point in self.control_points}
-        number = sum(point.observation_for(image_id) is not None for point in self.control_points) + 1
-        while f"{prefix}-{number:03d}".casefold() in used_names:
-            number += 1
-        return f"{prefix}-{number:03d}"
+        numbers = [
+            int(match.group(1))
+            for point in self.control_points if point.image_id == image_id
+            if (match := re.fullmatch(r"P(\d+)", point.display_name, re.IGNORECASE)) is not None
+        ]
+        return f"P{max(numbers, default=0) + 1}"
 
     def unique_control_point_name(self, name: str) -> str:
         """Return `name`, or the next free name by incrementing its trailing number."""
@@ -203,11 +241,21 @@ class Project:
             for item in self.constraints
         ):
             raise ValueError("Those points are already connected by this constraint.")
+        used_names = {item.name for item in self.constraints}
+        if constraint.name is None:
+            while f"L{self.next_link_number}" in used_names:
+                self.next_link_number += 1
+            constraint.name = f"L{self.next_link_number}"
+            self.next_link_number += 1
+        elif constraint.name in used_names:
+            raise ValueError("Link names must be unique.")
+        if match := re.fullmatch(r"L(\d+)", constraint.name):
+            self.next_link_number = max(self.next_link_number, int(match.group(1)) + 1)
         self.constraints.append(constraint)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 13,
+            "version": 17,
             "name": self.name,
             "crs": self.crs,
             "images": [json.loads(json.dumps(vars(image))) for image in self.images],
@@ -215,6 +263,7 @@ class Project:
                 {
                     "id": point.id,
                     "name": point.name,
+                    "short_name": point.short_name,
                     "label": point.label,
                     "visible": point.visible,
                     "map_visible": point.map_visible,
@@ -225,15 +274,21 @@ class Project:
                 for point in self.control_points
             ],
             "constraints": [vars(constraint).copy() for constraint in self.constraints],
+            "next_link_number": self.next_link_number,
             "vector_layers": [vars(layer).copy() for layer in self.vector_layers],
             "layer_order": self.stacked_layer_ids(),
             "views": json.loads(json.dumps(self.views)),
             "canvas_state": self.canvas_state,
+            "alignment_feedback": self.alignment_feedback.to_dict() if self.alignment_feedback is not None else None,
+            "solver_settings": {
+                "alignment": vars(self.alignment_settings).copy(),
+                "georeference": vars(self.georeference_settings).copy(),
+            },
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
-        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
             raise ValueError("This project uses an unsupported file version.")
         project = cls(name=data.get("name", "Untitled project"), crs=data.get("crs", "EPSG:4326"))
         project.images = [ImageRecord(**image) for image in data.get("images", [])]
@@ -245,10 +300,23 @@ class Project:
         views = data.get("views", {})
         project.views = views if isinstance(views, dict) else {}
         project.canvas_state = "aligned" if data.get("canvas_state") == "aligned" else "rest"
+        feedback = data.get("alignment_feedback")
+        if feedback is not None and not isinstance(feedback, dict):
+            raise ValueError("Saved alignment feedback must be an object.")
+        if feedback is not None:
+            from geostitch.alignment_feedback import AlignmentFeedback
+
+            project.alignment_feedback = AlignmentFeedback.from_dict(feedback)
+        settings = data.get("solver_settings", {})
+        if not isinstance(settings, dict):
+            raise ValueError("Project solver settings must be an object.")
+        project.alignment_settings = SolverSettings.from_dict(settings.get("alignment", {}), project.alignment_settings)
+        project.georeference_settings = SolverSettings.from_dict(settings.get("georeference", {}), project.georeference_settings)
         project.control_points = [
             GroundControlPoint(
                 id=point["id"],
                 name=point["name"],
+                short_name=point.get("short_name"),
                 label=point.get("label"),
                 visible=bool(point.get("visible", True)),
                 map_visible=bool(point.get("map_visible", True)),
@@ -261,6 +329,10 @@ class Project:
         image_ids = {image.id for image in project.images}
         if any(observation.image_id not in image_ids for point in project.control_points for observation in point.observations):
             raise ValueError("A control point refers to an image that is not in this project.")
+        next_number = data.get("next_link_number", 1)
+        if not isinstance(next_number, int) or isinstance(next_number, bool) or next_number < 1:
+            raise ValueError("Invalid next link number.")
+        project.next_link_number = next_number
         for constraint_data in data.get("constraints", []):
             project.add_constraint(PointConstraint(**constraint_data))
         project._split_shared_points()
@@ -295,12 +367,17 @@ class Project:
         old_constraints, self.constraints = self.constraints, []
         linked: set[tuple[frozenset[str], str]] = set()
 
-        def link(first: GroundControlPoint, second: GroundControlPoint, kind: str) -> bool:
+        def link(first: GroundControlPoint, second: GroundControlPoint, kind: str,
+             original: PointConstraint | None = None) -> bool:
             key = (frozenset((first.id, second.id)), kind)
             if first.id == second.id or key in linked:
                 return False
             linked.add(key)
-            self.constraints.append(PointConstraint.create(first.id, second.id, kind))
+            constraint = PointConstraint.create(first.id, second.id, kind)
+            if original is not None:
+                constraint.id = original.id
+                constraint.name = original.name
+            self.add_constraint(constraint)
             return True
 
         for group in groups.values():
@@ -313,6 +390,6 @@ class Project:
             for first in first_group:
                 for second in second_group:
                     if first.image_id != second.image_id:
-                        created = link(first, second, constraint.kind) or created
+                        created = link(first, second, constraint.kind, constraint if not created else None) or created
             if not created:
-                link(first_group[0], second_group[0], constraint.kind)
+                link(first_group[0], second_group[0], constraint.kind, constraint)

@@ -1,10 +1,11 @@
 from __future__ import annotations
+from collections import OrderedDict
 
 from math import ceil, floor, isfinite, log2
 
 import numpy as np
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QPoint, QPointF, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
 from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkRequest
 from PySide6.QtWidgets import (
@@ -31,6 +32,8 @@ class WorldMapView(QGraphicsView):
     coordinate_picked = Signal(float, float)
     MAX_VERTICES_PER_REDRAW = 400_000
     TILE_FADE_MS = 220
+    ZOOM_ANIMATION_MS = 160
+    MAX_CACHED_TILES = 128
     MAX_POINTS_PER_REDRAW = 50_000
 
     # Invert, then rotate hue 180 degrees (CSS `invert(1) hue-rotate(180deg)`) so the map goes dark but keeps its hues.
@@ -43,8 +46,22 @@ class WorldMapView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._dark_mode = False
+        self._closed = False
         self._zoom = 2
+        self._zoom_target: float | None = None
+        self._zoom_cursor = QPoint()
+        self._zoom_anchor = QPointF()
+        self._zoom_animation = QVariantAnimation(self)
+        self._zoom_animation.setDuration(self.ZOOM_ANIMATION_MS)
+        self._zoom_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._zoom_animation.valueChanged.connect(self._step_zoom)
+        self._zoom_animation.finished.connect(self._finish_zoom)
+        self._tile_update_timer = QTimer(self)
+        self._tile_update_timer.setSingleShot(True)
+        self._tile_update_timer.setInterval(60)
+        self._tile_update_timer.timeout.connect(self._update_visible_tiles)
         self._tile_items: dict[tuple[int, int, int], QGraphicsPixmapItem] = {}
+        self._tile_cache: OrderedDict[tuple[int, int, int], QPixmap] = OrderedDict()
         self._needed_tiles: set[tuple[int, int, int]] = set()
         self._fades: dict = {}
         self._fade_clock = QElapsedTimer()
@@ -121,6 +138,8 @@ class WorldMapView(QGraphicsView):
         self._dark_mode = enabled
         self.setBackgroundBrush(QBrush(QColor("#20272b" if enabled else "#d9e4df")))
         self._style_attribution()
+        self._fades.clear()
+        self._fade_timer.stop()
         for item in self._tile_items.values():
             self._scene.removeItem(item)
         self._tile_items.clear()
@@ -288,6 +307,7 @@ class WorldMapView(QGraphicsView):
         return longitude, latitude
 
     def fit_world(self) -> None:
+        self._stop_zoom()
         world = QRectF(-self.WORLD_ORIGIN, -self.WORLD_ORIGIN, self.WORLD_ORIGIN * 2, self.WORLD_ORIGIN * 2)
         bounds = self._world_image_bounds()
         bounds = world if bounds is None else bounds.intersected(world)
@@ -312,6 +332,7 @@ class WorldMapView(QGraphicsView):
                 rects.append(QRectF(marker.scenePos(), marker.scenePos()))
         if not rects:
             return
+        self._stop_zoom()
         left = min(rect.left() for rect in rects)
         right = max(rect.right() for rect in rects)
         top = min(rect.top() for rect in rects)
@@ -337,6 +358,7 @@ class WorldMapView(QGraphicsView):
             return
         if scale <= 0 or not all(isfinite(value) for value in (scale, center_x, center_y)):
             return
+        self._stop_zoom()
         minimum, maximum = self._scale_limits()
         scale = min(maximum, max(minimum, scale))
         center_x = min(self.WORLD_ORIGIN, max(-self.WORLD_ORIGIN, center_x))
@@ -429,12 +451,17 @@ class WorldMapView(QGraphicsView):
         }
         for key in list(self._tile_items):
             if key not in needed and key[0] == self._zoom:
-                item = self._tile_items.pop(key)
-                self._scene.removeItem(item)
+                self._remove_tile(key)
         self._needed_tiles = needed
+        self._restack_tiles()
         self._prune_stale_tiles()
         for zoom, x, y in needed:
             if (zoom, x, y) in self._tile_items or (zoom, x, y) in self._pending_tiles:
+                continue
+            key = (zoom, x, y)
+            if key in self._tile_cache:
+                self._tile_cache.move_to_end(key)
+                self._show_tile(key, self._tile_cache[key], fade=False)
                 continue
             url = QUrl(f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png")
             request = QNetworkRequest(url)
@@ -442,6 +469,7 @@ class WorldMapView(QGraphicsView):
             reply = self._manager.get(request)
             reply.setProperty("tileKey", (zoom, x, y))
             self._pending_tiles.add((zoom, x, y))
+        self._prune_stale_tiles()
 
     def _on_tile_loaded(self, reply) -> None:
         key_value = reply.property("tileKey")
@@ -453,21 +481,39 @@ class WorldMapView(QGraphicsView):
         data = reply.readAll()
         if reply.error() == reply.NetworkError.NoError:
             pixmap = QPixmap()
-            if pixmap.loadFromData(bytes(data)) and key[0] == self._zoom:
-                if self._dark_mode:
-                    pixmap = self._darken(pixmap)
-                zoom, tile_x, tile_y = key
-                tile_count = 1 << zoom
-                tile_span = 2.0 * self.WORLD_ORIGIN / tile_count
-                item = self._scene.addPixmap(pixmap)
-                item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-                item.setOffset(0.0, 0.0)
-                item.setScale(tile_span / self.TILE_SIZE)
-                item.setPos(-self.WORLD_ORIGIN + tile_x * tile_span, -self.WORLD_ORIGIN + tile_y * tile_span)
-                item.setZValue(-1000 + zoom)
-                self._tile_items[key] = item
-                self._fade_in(item)
+            if pixmap.loadFromData(bytes(data)):
+                self._tile_cache[key] = pixmap
+                self._tile_cache.move_to_end(key)
+                while len(self._tile_cache) > self.MAX_CACHED_TILES:
+                    self._tile_cache.popitem(last=False)
+                if not self._closed and key[0] == self._zoom and (not self._needed_tiles or key in self._needed_tiles):
+                    self._show_tile(key, pixmap)
         reply.deleteLater()
+
+    def _show_tile(self, key: tuple[int, int, int], pixmap: QPixmap, fade: bool = True) -> None:
+        if key in self._tile_items:
+            return
+        if self._dark_mode:
+            pixmap = self._darken(pixmap)
+        zoom, tile_x, tile_y = key
+        tile_span = 2.0 * self.WORLD_ORIGIN / (1 << zoom)
+        item = self._scene.addPixmap(pixmap)
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        item.setScale(tile_span / self.TILE_SIZE)
+        item.setPos(-self.WORLD_ORIGIN + tile_x * tile_span, -self.WORLD_ORIGIN + tile_y * tile_span)
+        self._tile_items[key] = item
+        self._restack_tiles()
+        if fade:
+            self._fade_in(item)
+
+    def _restack_tiles(self) -> None:
+        for key, item in self._tile_items.items():
+            item.setZValue(-900 if key[0] == self._zoom else -1000 + key[0])
+
+    def _remove_tile(self, key: tuple[int, int, int]) -> None:
+        item = self._tile_items.pop(key)
+        self._fades.pop(item, None)
+        self._scene.removeItem(item)
 
     def _fade_in(self, item: QGraphicsPixmapItem) -> None:
         item.setOpacity(0.0)
@@ -491,7 +537,7 @@ class WorldMapView(QGraphicsView):
         if self._fades or not self._needed_tiles.issubset(self._tile_items):
             return
         for key in [key for key in self._tile_items if key[0] != self._zoom]:
-            self._scene.removeItem(self._tile_items.pop(key))
+            self._remove_tile(key)
 
     def _style_attribution(self) -> None:
         text, background = ("#d5dedb", "rgba(32, 39, 43, 170)") if self._dark_mode else ("#172522", "rgba(255, 255, 255, 170)")
@@ -507,11 +553,13 @@ class WorldMapView(QGraphicsView):
     def event(self, event) -> bool:
         handled = super().event(event)
         if event.type() == QEvent.Type.DevicePixelRatioChange and hasattr(self, "_manager"):
+            self._stop_zoom()
             self._clamp_view_scale()
             self._update_visible_tiles()
         return handled
 
     def resizeEvent(self, event) -> None:
+        self._stop_zoom()
         super().resizeEvent(event)
         self._clamp_view_scale()
         self._update_visible_tiles()
@@ -519,32 +567,72 @@ class WorldMapView(QGraphicsView):
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
-        self._update_visible_tiles()
+        if self._zoom_target is None:
+            self._tile_update_timer.start()
         self._position_attribution()
 
     def wheelEvent(self, event) -> None:
-        if event.angleDelta().y() == 0:
+        delta = event.angleDelta().y() / 120.0
+        if not delta and event.pixelDelta().y():
+            delta = event.pixelDelta().y() / 240.0
+        if delta == 0:
             event.accept()
             return
         scale = self.transform().m11()
         minimum, maximum = self._scale_limits()
-        factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
-        bounded = min(maximum, max(minimum, scale * factor))
-        if bounded == scale:
+        target = self._zoom_target if self._zoom_target is not None else scale
+        bounded = min(maximum, max(minimum, target * 1.2 ** min(8.0, max(-8.0, delta))))
+        if bounded == target:
             event.accept()
             return
-        old_zoom = self._zoom
-        scene_anchor = self.mapToScene(event.position().toPoint())
-        factor = bounded / scale
-        self.scale(factor, factor)
-        self._zoom = self._zoom_for_scale(self.transform().m11())
-        if self._zoom != old_zoom:
-            self._update_visible_tiles()
-        delta = self.mapToScene(event.position().toPoint()) - scene_anchor
-        self.translate(delta.x(), delta.y())
+        self._zoom_animation.stop()
+        self._tile_update_timer.stop()
+        self._zoom_target = bounded
+        self._zoom_cursor = event.position().toPoint()
+        self._zoom_anchor = self.mapToScene(self._zoom_cursor)
+        self._zoom_animation.setStartValue(scale)
+        self._zoom_animation.setEndValue(bounded)
+        self._zoom_animation.start()
+        event.accept()
+
+    def _step_zoom(self, scale: float) -> None:
+        if self._zoom_target is None:
+            return
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.scale(scale / self.transform().m11(), scale / self.transform().m11())
+        shift = self.mapFromScene(self._zoom_anchor) - self._zoom_cursor
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + shift.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + shift.y())
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self._position_attribution()
         self._schedule_vector_update()
-        event.accept()
+
+    def _finish_zoom(self) -> None:
+        self._zoom_target = None
+        self._tile_update_timer.stop()
+        self._update_visible_tiles()
+
+    def _stop_zoom(self) -> None:
+        self._zoom_animation.stop()
+        self._zoom_target = None
+        self._tile_update_timer.stop()
+
+    def closeEvent(self, event) -> None:
+        self._closed = True
+        self._stop_zoom()
+        self._fade_timer.stop()
+        for item in self._fades:
+            item.setOpacity(1)
+        self._fades.clear()
+        self._vector_timer.stop()
+        super().closeEvent(event)
+
+    def showEvent(self, event) -> None:
+        reopening = self._closed
+        self._closed = False
+        super().showEvent(event)
+        if reopening:
+            self._tile_update_timer.start()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self._pick_mode:
@@ -554,6 +642,8 @@ class WorldMapView(QGraphicsView):
             event.accept()
             return
         if event.button() == Qt.MouseButton.MiddleButton:
+            self._stop_zoom()
+            self._tile_update_timer.start()
             self._panning = True
             self._last_pan_position = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)

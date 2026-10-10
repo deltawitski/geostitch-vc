@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import cos, degrees, hypot, radians, sin
+from math import degrees, hypot, radians
 from cmath import phase
 from typing import Callable
 
 from geostitch.models import Project
+from geostitch.transforms import apply_similarity_transform as _apply_world_transform
 
 WorldTransform = tuple[float, float, float, float]
 ObservationKey = tuple[str, str]
@@ -268,14 +269,4 @@ def _chunk_frames(project: Project) -> tuple[dict[str, str], dict[str, WorldTran
                 image.aligned_scale if image.has_alignment else image.scale,
             )
     return chunk_of, frames
-
-
-def _apply_world_transform(x: float, y: float, transform: WorldTransform) -> tuple[float, float]:
-    world_x, world_y, rotation, scale = transform
-    angle = radians(rotation)
-    return (
-        world_x + scale * (cos(angle) * x - sin(angle) * y),
-        world_y + scale * (sin(angle) * x + cos(angle) * y),
-    )
-
 
