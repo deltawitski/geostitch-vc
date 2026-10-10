@@ -1,8 +1,10 @@
+from dataclasses import replace
+
 import pytest
 
 from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QPlainTextEdit, QStyleFactory
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageBox, QPlainTextEdit, QStyleFactory
 
 from geostitch.app import MainWindow
 from geostitch.alignment_feedback import AlignmentFeedback
@@ -112,6 +114,85 @@ def test_last_reports_are_on_demand_and_read_only(solver_window, monkeypatch, st
     assert reports[0][0]
     assert "Residuals by" in reports[0][1]
     assert ("scene units" if stage == "alignment" else "CRS units") in reports[0][1]
+
+
+@pytest.mark.parametrize("stage", ["alignment", "georeference"])
+@pytest.mark.parametrize("status, expected", [
+    (0, "Increase Maximum iterations"),
+    (1, "More iterations alone are unlikely to help"),
+    (2, "numerical stagnation"),
+    (3, "numerical stagnation"),
+    (4, "numerical stagnation"),
+    (-1, "Check inputs and initial transforms"),
+    (None, "Rerun the solver to capture its stop reason"),
+])
+def test_reports_distinguish_stop_reason_from_target_and_recommend_changes(
+    solver_window, monkeypatch, stage, status, expected,
+):
+    app, window, images, alignment, world, errors = solver_window
+    result = replace(
+        alignment if stage == "alignment" else world,
+        converged=False, iterations=7, optimizer_status=status,
+        optimizer_message="Captured stop reason" if status is not None else "",
+        max_iterations=321,
+    )
+    window.project.alignment_feedback = AlignmentFeedback.capture(window.project, result if stage == "alignment" else alignment, 0.5)
+    window._georeference_result = result if stage == "georeference" else world
+    window.project.alignment_settings = SolverSettings(0.25, 999, True)
+    window.project.georeference_settings = SolverSettings(0.25, 999, True)
+    reports = []
+
+    def inspect(dialog):
+        reports.append(dialog.findChild(QPlainTextEdit).toPlainText())
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", inspect)
+    window.show_solver_report(stage)
+
+    assert len(reports) == 1
+    text = reports[0]
+    assert "Status: target not reached" in text
+    assert "Function evaluations: 7 / 321" in text
+    assert "Optimizer stop:" in text
+    assert expected in text
+    if status is not None:
+        assert "Optimizer message: Captured stop reason" in text
+        assert "relaxing it does not improve the fit" in text
+        assert ("Link Review" if stage == "alignment" else "project CRS") in text
+    else:
+        assert "Optimizer stop: Unavailable for this result" in text
+    if status != 0:
+        assert "Increase Maximum iterations and rerun" not in text
+
+
+@pytest.mark.parametrize("stage", ["alignment", "georeference"])
+@pytest.mark.parametrize("status", [0, 1])
+def test_target_miss_review_shows_stop_reason_and_guidance(solver_window, monkeypatch, stage, status):
+    app, window, images, alignment, world, errors = solver_window
+    result = replace(
+        alignment if stage == "alignment" else world,
+        converged=False, optimizer_status=status, optimizer_message="Captured reason", max_iterations=100,
+    )
+    messages = []
+
+    def inspect(box):
+        messages.append(box.informativeText())
+        return 0
+
+    monkeypatch.setattr(QMessageBox, "exec", inspect)
+    assert window._review_solver_result(stage, result) == "discard"
+    assert len(messages) == 1
+    assert "Optimizer message: Captured reason" in messages[0]
+    assert ("Increase Maximum iterations" if status == 0 else "stationary least-squares fit") in messages[0]
+
+
+def test_target_reached_report_does_not_suggest_solver_changes(solver_window):
+    app, window, images, alignment, world, errors = solver_window
+    result = replace(alignment, optimizer_status=1, optimizer_message="gtol satisfied")
+    text = "\n".join(window._solver_termination_lines("alignment", result))
+    assert "Target reached; no solver-setting change is needed" in text
+    assert "Increase Maximum iterations" not in text
+    assert "relax" not in text
 
 
 def test_saved_solver_settings_are_restored_on_reopen(solver_window, tmp_path):

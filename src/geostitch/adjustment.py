@@ -17,6 +17,9 @@ class AlignmentResult:
     iterations: int
     converged: bool
     anchor_image_ids: tuple[str, ...]
+    optimizer_status: int | None = None
+    optimizer_message: str = ""
+    max_iterations: int | None = None
 
     @property
     def maximum_residual(self) -> float:
@@ -180,9 +183,13 @@ def simulate_alignment(
         transforms = unpack(optimization.x.tolist())
         iterations_run = optimization.nfev
         optimizer_converged = optimization.success
+        optimizer_status = int(optimization.status)
+        optimizer_message = str(optimization.message)
     else:
         iterations_run = 0
         optimizer_converged = True
+        optimizer_status = None
+        optimizer_message = "No variable transforms required optimization."
 
     residuals = _constraint_residuals(matches, transforms)
     converged = optimizer_converged and bool(residuals) and max(residuals.values()) <= tolerance
@@ -193,6 +200,9 @@ def simulate_alignment(
         iterations=iterations_run,
         converged=converged,
         anchor_image_ids=anchor_ids,
+        optimizer_status=optimizer_status,
+        optimizer_message=optimizer_message,
+        max_iterations=max_iterations,
     )
 
 

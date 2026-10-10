@@ -90,6 +90,9 @@ class AlignmentFeedback:
                 "iterations": self.result.iterations,
                 "converged": self.result.converged,
                 "anchor_image_ids": list(self.result.anchor_image_ids),
+                "optimizer_status": self.result.optimizer_status,
+                "optimizer_message": self.result.optimizer_message,
+                "max_iterations": self.result.max_iterations,
             },
             "tolerance": self.tolerance,
             "input_signature": [[list(entry) for entry in group] for group in self.input_signature],
@@ -127,9 +130,25 @@ class AlignmentFeedback:
         anchors = saved_result["anchor_image_ids"]
         if not isinstance(anchors, list) or not all(isinstance(image_id, str) for image_id in anchors):
             raise ValueError("Invalid alignment reference image ids.")
+        optimizer_status = saved_result.get("optimizer_status")
+        if optimizer_status is not None and (
+            not isinstance(optimizer_status, int) or isinstance(optimizer_status, bool)
+            or optimizer_status not in (-1, 0, 1, 2, 3, 4)
+        ):
+            raise ValueError("Invalid alignment optimizer status.")
+        optimizer_message = saved_result.get("optimizer_message", "")
+        if not isinstance(optimizer_message, str):
+            raise ValueError("Invalid alignment optimizer message.")
+        max_iterations = saved_result.get("max_iterations")
+        if max_iterations is not None and (
+            not isinstance(max_iterations, int) or isinstance(max_iterations, bool)
+            or not 1 <= max_iterations <= 10000
+        ):
+            raise ValueError("Invalid alignment evaluation limit.")
         result = AlignmentResult(
             transforms, _read_residuals(saved_result["constraint_residuals"]),
             iterations, saved_result["converged"], tuple(anchors),
+            optimizer_status, optimizer_message, max_iterations,
         )
         groups = data["input_signature"]
         if not isinstance(groups, list) or len(groups) != 3:

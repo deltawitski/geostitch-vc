@@ -4361,9 +4361,72 @@ class MainWindow(QMainWindow):
         units = "scene units" if stage == "alignment" else "CRS units"
         return f"{stage.title()} {state.lower()} | RMS {rms:.3f} | Max {result.maximum_residual:.3f} {units}"
 
+    @staticmethod
+    def _solver_termination_lines(stage: str, result: AlignmentResult | GeoreferenceResult) -> list[str]:
+        limit = f" / {result.max_iterations}" if result.max_iterations is not None else ""
+        reasons = {
+            -1: "Optimizer could not proceed",
+            0: "Evaluation limit reached",
+            1: "Stationary solution (small error gradient, gtol)",
+            2: "Negligible improvement in squared error (ftol)",
+            3: "Very small transform changes (xtol)",
+            4: "Negligible improvement and very small transform changes (ftol and xtol)",
+        }
+        reason = reasons.get(result.optimizer_status, "Unavailable for this result")
+        lines = [
+            f"Function evaluations: {result.iterations}{limit}",
+            "The Maximum iterations setting limits function evaluations, not a required iteration count.",
+            f"Optimizer stop: {reason}",
+        ]
+        if result.optimizer_message:
+            lines.append(f"Optimizer message: {result.optimizer_message}")
+        if result.converged:
+            lines.append("Next steps: Target reached; no solver-setting change is needed for this fit.")
+            return lines
+        if result.optimizer_status == 0:
+            lines.append(
+                "Next steps: Increase Maximum iterations and rerun to allow more optimization. "
+                "This does not guarantee that the residual target is achievable."
+            )
+        elif result.optimizer_status == 1:
+            lines.append(
+                "Next steps: The optimizer found a stationary least-squares fit, not necessarily a global minimum. "
+                "More iterations alone are unlikely to help; check the largest residuals for conflicting observations."
+            )
+        elif result.optimizer_status in (2, 3, 4):
+            lines.append(
+                "Next steps: Improvement or transform updates became too small. This may be a best fit, "
+                "a local minimum, or numerical stagnation; the stop reason alone cannot distinguish them. "
+                "Check the largest residuals and initial transforms before increasing Maximum iterations."
+            )
+        elif result.optimizer_status is None:
+            lines.append("Next steps: Rerun the solver to capture its stop reason before changing solver settings.")
+            return lines
+        else:
+            lines.append("Next steps: Check inputs and initial transforms in Image > Solver diagnostics before rerunning.")
+        if stage == "alignment":
+            lines.append(
+                "Review high-error links in Link Review and correct mismatched or misplaced endpoints. "
+                "Use distinct, well-spread matches; single-match pairs keep rotation and scale fixed. "
+                "Check the fixed reference image and initial layout; alignment scale is limited to 0.05-20."
+            )
+        else:
+            lines.append(
+                "Check high-error control points, the project CRS, coordinate units, and pixel locations. "
+                "Use distinct, well-spread controls. Linked images are fitted as rigid groups; "
+                "review alignment first if a group's internal geometry is wrong."
+            )
+        lines.append(
+            "Run Image > Solver diagnostics to check control geometry. The similarity model cannot correct "
+            "shear, perspective, or local distortion. Only relax the target maximum residual if the "
+            "remaining error is acceptable; relaxing it does not improve the fit."
+        )
+        return lines
+
     def _review_solver_result(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> str:
         box = QMessageBox(QMessageBox.Icon.Warning, "Solver target not reached",
                           self._solver_summary(stage, result, "Target not reached"), parent=self)
+        box.setInformativeText("\n".join(self._solver_termination_lines(stage, result)))
         apply_button = box.addButton("Apply best result", QMessageBox.ButtonRole.AcceptRole)
         settings_button = box.addButton("Adjust settings", QMessageBox.ButtonRole.ActionRole)
         discard_button = box.addButton("Discard", QMessageBox.ButtonRole.RejectRole)
@@ -4384,9 +4447,10 @@ class MainWindow(QMainWindow):
         units = "scene units" if stage == "alignment" else "CRS units"
         lines = [
             f"{stage.title()} report",
-            f"Iterations: {result.iterations}",
             f"Status: {'target reached' if result.converged else 'target not reached'}",
             self._solver_summary(stage, result, "Last result"),
+            *self._solver_termination_lines(stage, result),
+            "",
         ]
         image_names = {image.id: image.name or image.id for image in self.project.images}
         point_names = {point.id: point.name or point.id for point in self.project.control_points}

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from geostitch.adjustment import AlignmentResult
@@ -94,6 +96,46 @@ def test_feedback_version_two_saves_only_original_inputs_and_result():
     assert data["version"] == 2
     assert set(data) == {"version", "result", "tolerance", "input_signature"}
     assert AlignmentFeedback.from_dict(data) == feedback
+
+
+def test_feedback_preserves_optimizer_diagnostics_in_saved_project():
+    project, images, points, links, result = make_feedback_project()
+    result = replace(result, optimizer_status=1, optimizer_message="gtol satisfied", max_iterations=321)
+    project.alignment_feedback = AlignmentFeedback.capture(project, result, 0.5)
+
+    restored = Project.from_dict(project.to_dict())
+
+    assert restored.alignment_feedback.result == result
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_feedback_without_optimizer_diagnostics_loads_as_unknown(version):
+    project, images, points, links, result = make_feedback_project()
+    data = AlignmentFeedback.capture(project, result, 0.5).to_dict()
+    data["version"] = version
+    for field in ("optimizer_status", "optimizer_message", "max_iterations"):
+        data["result"].pop(field)
+
+    restored = AlignmentFeedback.from_dict(data)
+
+    assert restored.result == result
+    assert restored.result.optimizer_status is None
+    assert restored.result.optimizer_message == ""
+    assert restored.result.max_iterations is None
+
+
+@pytest.mark.parametrize("field, value", [
+    ("optimizer_status", True), ("optimizer_status", 5), ("optimizer_status", "1"),
+    ("optimizer_message", None), ("optimizer_message", []),
+    ("max_iterations", False), ("max_iterations", 0), ("max_iterations", 10001),
+    ("max_iterations", 1.5),
+])
+def test_feedback_rejects_invalid_optimizer_diagnostics(field, value):
+    project, images, points, links, result = make_feedback_project()
+    data = AlignmentFeedback.capture(project, result, 0.5).to_dict()
+    data["result"][field] = value
+    with pytest.raises(ValueError):
+        AlignmentFeedback.from_dict(data)
 
 
 @pytest.mark.parametrize("version", [1, 2])

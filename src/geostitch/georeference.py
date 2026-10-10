@@ -19,6 +19,9 @@ class GeoreferenceResult:
     iterations: int
     converged: bool
     crs: str
+    optimizer_status: int | None = None
+    optimizer_message: str = ""
+    max_iterations: int | None = None
 
     @property
     def maximum_residual(self) -> float:
@@ -200,6 +203,9 @@ def simulate_georeference(
         iterations=optimization.nfev,
         converged=optimization.success and max(observation_residuals.values(), default=0.0) <= tolerance,
         crs=project.crs,
+        optimizer_status=int(optimization.status),
+        optimizer_message=str(optimization.message),
+        max_iterations=max_iterations,
     )
 
 
