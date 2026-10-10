@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
-    QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QStyleFactory, QToolButton, QVBoxLayout,
 )
 
@@ -11,9 +11,9 @@ from geostitch.icons import DEFAULT_KIND_COLORS
 
 
 class AppearanceDialog(QDialog):
-    applied = Signal(str, str, object)
+    applied = Signal(str, str, object, bool)
 
-    def __init__(self, style: str, scheme: str, colors: dict[str, str], parent=None):
+    def __init__(self, style: str, scheme: str, colors: dict[str, str], parent=None, *, dark_map: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Appearance")
         self.setMinimumWidth(360)
@@ -29,6 +29,10 @@ class AppearanceDialog(QDialog):
         self.scheme_combo.setCurrentIndex(max(0, self.scheme_combo.findData(scheme)))
         form.addRow("Qt style", self.style_combo)
         form.addRow("Color scheme", self.scheme_combo)
+        self.dark_map_checkbox = QCheckBox("Dark map")
+        self.dark_map_checkbox.setToolTip("Show the OpenStreetMap tiles in a dark colour scheme")
+        self.dark_map_checkbox.setChecked(dark_map)
+        form.addRow("World Map", self.dark_map_checkbox)
         layout.addLayout(form)
         group = QGroupBox("Symbol colors")
         color_form = QFormLayout(group)
@@ -71,11 +75,13 @@ class AppearanceDialog(QDialog):
     def restore_defaults(self) -> None:
         self.style_combo.setCurrentText("Fusion")
         self.scheme_combo.setCurrentIndex(0)
+        self.dark_map_checkbox.setChecked(False)
         self.colors = DEFAULT_KIND_COLORS.copy()
         self._refresh_swatches()
 
     def apply(self) -> None:
-        self.applied.emit(self.style_combo.currentText(), self.scheme_combo.currentData(), dict(self.colors))
+        self.applied.emit(self.style_combo.currentText(), self.scheme_combo.currentData(),
+                  dict(self.colors), self.dark_map_checkbox.isChecked())
 
     def _accept(self) -> None:
         self.apply()

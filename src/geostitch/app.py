@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from html import escape
 from math import atan2, ceil, cos, degrees, hypot, isfinite, radians, sin, sqrt
 from pathlib import Path
+from PySide6.QtGui import QActionGroup
 
 from geostitch.adjustment import AlignmentResult, simulate_alignment
 from geostitch.alignment_feedback import AlignmentFeedback
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressDialog,
@@ -396,37 +398,13 @@ class MainWindow(QMainWindow):
         canvas_panel = QWidget()
         canvas_layout = QVBoxLayout(canvas_panel)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_header = QHBoxLayout()
-        canvas_header.setContentsMargins(6, 4, 6, 0)
-        canvas_header.addWidget(QLabel("Layout"))
-        self.alignment_toggle_button = QToolButton()
+        self.alignment_toggle_button = self.canvas.alignment_toggle_button
         self.alignment_toggle_button.setDefaultAction(self.toggle_alignment_action)
-        self.alignment_toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        canvas_header.addWidget(self.alignment_toggle_button)
-        self.canvas_clip_checkbox = QCheckBox("Show clipping")
-        self.canvas_clip_checkbox.setChecked(False)
-        self.canvas_clip_checkbox.setToolTip("Hide the parts of images outside their clip polygons; turn off to see full images")
-        self.canvas_clip_checkbox.toggled.connect(lambda _checked: self._refresh_canvas())
-        canvas_header.addWidget(self.canvas_clip_checkbox)
-        canvas_header.addStretch(1)
-        canvas_layout.addLayout(canvas_header)
+        self.canvas_clip_button = self.canvas.clipping_toggle_button
+        self.canvas_clip_button.toggled.connect(lambda _checked: self._refresh_canvas())
         canvas_layout.addWidget(self.canvas, 1)
-        error_row = QHBoxLayout()
-        error_row.setContentsMargins(6, 0, 6, 4)
-        self.alignment_errors_checkbox = QCheckBox("Alignment errors")
-        self.alignment_errors_checkbox.setChecked(True)
-        self.alignment_errors_checkbox.setToolTip(
-            "Color links by the latest solve tolerance: green within target, amber within twice target, red above. "
-            "In rest layout, colors show solve residuals, not the displayed endpoint gaps."
-        )
-        self.alignment_errors_checkbox.toggled.connect(lambda _checked: self._refresh_alignment_feedback())
-        error_row.addWidget(self.alignment_errors_checkbox)
-        self.alignment_error_label = QLabel("Alignment: unavailable")
-        self.alignment_error_label.setWordWrap(True)
-        self.alignment_error_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.alignment_error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        error_row.addWidget(self.alignment_error_label, 1)
-        canvas_layout.addLayout(error_row)
+        self.alignment_errors_button = self.canvas.alignment_errors_button
+        self.alignment_errors_button.toggled.connect(lambda _checked: self._refresh_alignment_feedback())
         self.canvas_dock = self._create_panel_dock("canvasDock", "Image Canvas", canvas_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.canvas_dock)
         self.splitDockWidget(self.image_dock, self.canvas_dock, Qt.Orientation.Horizontal)
@@ -435,21 +413,9 @@ class MainWindow(QMainWindow):
         world_map_panel = QWidget()
         world_map_layout = QVBoxLayout(world_map_panel)
         world_map_layout.setContentsMargins(6, 6, 6, 6)
-        map_toolbar = QHBoxLayout()
-        self.map_points_checkbox = QCheckBox("Show control points")
-        self.map_points_checkbox.setToolTip(
-            "Point color: has map coordinates. Lighter: placed through its image's world transform. "
-            "Square: locked in its image. Circle: unlocked."
-        )
-        self.map_points_checkbox.toggled.connect(lambda _checked: self._refresh_map_points())
-        map_toolbar.addWidget(self.map_points_checkbox)
-        self.map_dark_checkbox = QCheckBox("Dark map")
-        self.map_dark_checkbox.setToolTip("Show the OpenStreetMap tiles in a dark colour scheme")
-        self.map_dark_checkbox.setChecked(self._settings.value("map/dark", False, type=bool))
-        self.world_map.set_dark_mode(self.map_dark_checkbox.isChecked())
-        self.map_dark_checkbox.toggled.connect(self._on_map_dark_toggled)
-        map_toolbar.addWidget(self.map_dark_checkbox)
-        map_toolbar.addStretch(1)
+        self.map_points_button = self.world_map.points_toggle_button
+        self.map_points_button.toggled.connect(lambda _checked: self._refresh_map_points())
+        self.world_map.set_dark_mode(self._dark_map)
         self.map_crs_combo = QComboBox()
         self.map_crs_combo.setEditable(True)
         self.map_crs_combo.setToolTip("Project coordinate system")
@@ -457,9 +423,6 @@ class MainWindow(QMainWindow):
         self.map_crs_combo.setCurrentText(self.project.crs)
         self.map_crs_combo.activated.connect(self._on_map_crs_chosen)
         self.map_crs_combo.lineEdit().editingFinished.connect(self._on_map_crs_chosen)
-        map_toolbar.addWidget(QLabel("CRS"))
-        map_toolbar.addWidget(self.map_crs_combo)
-        world_map_layout.addLayout(map_toolbar)
         world_map_layout.addWidget(self.world_map, 1)
         self.world_map.coordinate_picked.connect(self._on_world_coordinate_picked)
         self.world_map_dock = self._create_panel_dock("worldMapDock", "World Map", world_map_panel)
@@ -479,6 +442,18 @@ class MainWindow(QMainWindow):
         self.hint_label = QLabel()
         self.hint_label.setObjectName("shortcutHints")
         self.statusBar().addPermanentWidget(self.hint_label)
+        self.status_crs_widget = QWidget()
+        crs_layout = QHBoxLayout(self.status_crs_widget)
+        crs_layout.setContentsMargins(8, 0, 0, 0)
+        crs_layout.setSpacing(6)
+        crs_label = QLabel("CRS")
+        crs_label.setBuddy(self.map_crs_combo)
+        self.map_crs_combo.setAccessibleName("Project coordinate system")
+        self.map_crs_combo.setMinimumContentsLength(12)
+        self.map_crs_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        crs_layout.addWidget(crs_label)
+        crs_layout.addWidget(self.map_crs_combo)
+        self.statusBar().addPermanentWidget(self.status_crs_widget)
         for signal in (
             self.image_list.itemSelectionChanged,
             self.add_points_action.toggled,
@@ -487,10 +462,6 @@ class MainWindow(QMainWindow):
         ):
             signal.connect(lambda *_args: self._update_hints())
         self.statusBar().showMessage("Import images to begin a project.")
-
-    def _on_map_dark_toggled(self, enabled: bool) -> None:
-        self._settings.setValue("map/dark", enabled)
-        self.world_map.set_dark_mode(enabled)
 
     def _build_details_panel(self) -> QWidget:
         self.details_stack = QStackedWidget()
@@ -763,7 +734,7 @@ class MainWindow(QMainWindow):
         self.solver_toolbar_actions: dict[str, QAction] = {}
         groups = (
             ("new_project", "open_project", "save_project"),
-            ("import_images", "export_images", "arrange_images", "fit_images", "toggle_alignment"),
+            ("import_images", "export_images", "arrange_images", "fit_images"),
             ("lasso_select", "add_points", "link_points", "pick_gcp", "toggle_lock", "delete_point"),
             ("simulate_alignment", "georeference", "align_georeference"),
             ("undo", "redo"),
@@ -1090,27 +1061,31 @@ class MainWindow(QMainWindow):
         self._qt_style = styles.get(saved_style.casefold(), "Fusion")
         saved_scheme = str(self._settings.value("appearance/scheme", "dark"))
         self._color_scheme = saved_scheme if saved_scheme in ("dark", "native") else "dark"
+        self._dark_map = self._settings.value("map/dark", False, type=bool)
         colors = {kind: str(self._settings.value(f"appearance/colors/{kind}", default))
                   for kind, default in DEFAULT_KIND_COLORS.items()}
         set_symbol_colors(colors)
 
     def open_appearance_settings(self) -> None:
-        dialog = AppearanceDialog(self._qt_style, self._color_scheme, KIND_COLORS, self)
+        dialog = AppearanceDialog(self._qt_style, self._color_scheme, KIND_COLORS, self, dark_map=self._dark_map)
         dialog.applied.connect(self._apply_appearance)
         dialog.exec()
 
-    def _apply_appearance(self, style: str, scheme: str, colors: dict[str, str]) -> None:
+    def _apply_appearance(self, style: str, scheme: str, colors: dict[str, str], dark_map: bool | None = None) -> None:
         styles = {name.casefold(): name for name in QStyleFactory.keys()}
         if style.casefold() not in styles or scheme not in ("dark", "native"):
             return
         self._settings.setValue("appearance/style", styles[style.casefold()])
         self._settings.setValue("appearance/scheme", scheme)
+        if dark_map is not None:
+            self._settings.setValue("map/dark", dark_map)
         for kind, default in DEFAULT_KIND_COLORS.items():
             color = QColor(colors.get(kind, default))
             self._settings.setValue(f"appearance/colors/{kind}", color.name() if color.isValid() else default)
         self._settings.sync()
         self._load_appearance()
         self._apply_style()
+        self.world_map.set_dark_mode(self._dark_map)
         self._refresh_layers(force=True)
         self._refresh_canvas()
         self._refresh_details()
@@ -1122,6 +1097,12 @@ class MainWindow(QMainWindow):
             self.shortcut_actions[key].setIcon(make_icon("lasso" if key == "lasso_select" and self.lasso_action.isChecked() else glyph))
         self.canvas.setBackgroundBrush(QBrush(QColor("#20272b") if self._color_scheme == "dark" else QApplication.palette().base().color()))
         self.image_viewer.setBackgroundBrush(self.canvas.backgroundBrush())
+        self.map_points_button.setIcon(make_icon("pick_gcp"))
+        self.canvas_clip_button.setIcon(make_icon("clipping"))
+        self.alignment_errors_button.setIcon(make_icon("link_points"))
+        for button, glyph in ((self.mask_draw_button, "polygon"), (self.mask_clear_button, "delete"),
+                              (self.mask_mode_button, "clipping"), (self.mask_enable_button, "eye_canvas")):
+            button.setIcon(make_icon(glyph))
 
     def _apply_style(self) -> None:
         application = QApplication.instance()
@@ -1332,9 +1313,9 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_map_points(self) -> None:
-        if not hasattr(self, "world_map") or not hasattr(self, "map_points_checkbox"):
+        if not hasattr(self, "world_map") or not hasattr(self, "map_points_button"):
             return
-        if not self.map_points_checkbox.isChecked():
+        if not self.map_points_button.isChecked():
             self.world_map.set_control_points([])
             return
         try:
@@ -1548,56 +1529,20 @@ class MainWindow(QMainWindow):
         feedback = self._alignment_feedback
         current = feedback is not None and feedback.is_current(self.project)
         self._refresh_layer_errors(current)
-        if not hasattr(self, "alignment_error_label"):
+        if not hasattr(self, "alignment_errors_button"):
             return
         matching_layout = feedback is not None and feedback.matches_layout(self.project, current)
         aligned = self._aligned_view_active()
         can_show_errors = current and (not aligned or matching_layout)
-        self.alignment_errors_checkbox.setEnabled(can_show_errors)
+        self.alignment_errors_button.setEnabled(can_show_errors)
         residuals = {}
-        if can_show_errors and self.alignment_errors_checkbox.isChecked():
+        if can_show_errors and self.alignment_errors_button.isChecked():
             residuals = {
                 index: feedback.result.constraint_residuals[link.id]
                 for index, link in enumerate(self.project.constraints)
                 if link.id in feedback.result.constraint_residuals
             }
         self.canvas.set_constraint_residuals(residuals, feedback.tolerance if feedback else 0.5)
-        if feedback is None:
-            self.alignment_error_label.setText("Alignment: unavailable")
-            self.alignment_error_label.setToolTip("No saved or examined alignment residual report is available.")
-            return
-        state = "Current" if current else "Outdated"
-        if current and not matching_layout:
-            state = "Not applied"
-        if not aligned:
-            state += " | Rest layout"
-        value = None
-        metric = "Solve RMS"
-        constraint_ids = self._selected_constraint_ids()
-        point_ids = self._selected_point_ids()
-        image_ids = self._selected_image_ids()
-        total = len(constraint_ids) + len(point_ids) + len(image_ids)
-        if total == 1 and constraint_ids:
-            metric = "Link residual"
-            value = feedback.result.constraint_residuals.get(constraint_ids[0])
-        elif total == 1 and point_ids:
-            metric = "Point max link"
-            value = feedback.point_residuals.get(point_ids[0])
-        elif total == 1 and image_ids:
-            metric = "Image RMS"
-            value = feedback.image_residuals.get(image_ids[0])
-        elif feedback.result.constraint_residuals:
-            values = list(feedback.result.constraint_residuals.values())
-            value = sqrt(sum(residual ** 2 for residual in values) / len(values))
-        text = "--" if value is None else f"{value:.3f} scene units"
-        self.alignment_error_label.setText(f"{state} | {metric}: {text} | Target: {feedback.tolerance:g}")
-        self.alignment_error_label.setToolTip(
-            f"Last solve: {'target reached' if feedback.result.converged else 'target not reached'}\n"
-            f"Maximum link residual: {feedback.result.maximum_residual:.6f} scene units\n"
-            "Colors show the last solve's residuals, not the current rest-layout endpoint gaps.\n"
-            "Residuals measure alignment fit, not independent geographic accuracy.\n"
-            "Point values are maximum incident-link residuals, not geographic target errors."
-        )
 
     @staticmethod
     def _style_layer_item(item: LayerItem, canvas_visible: bool | None, map_visible: bool) -> None:
@@ -2012,7 +1957,7 @@ class MainWindow(QMainWindow):
         layers = []
         load_errors = []
         for image in self.project.images:
-            show_clip = not hasattr(self, "canvas_clip_checkbox") or self.canvas_clip_checkbox.isChecked()
+            show_clip = self.canvas_clip_button.isChecked()
             pixmap, error = (
                 self._display_pixmap_for_image(image) if show_clip else self._pixmap_for_image(image)
             )
@@ -2212,31 +2157,26 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
-        row = QHBoxLayout()
-        self.mask_draw_button = QPushButton("Draw clip polygon")
-        self.mask_draw_button.setCheckable(True)
-        self.mask_draw_button.setToolTip(
-            "Click to add vertices; double-click, Enter or click the first vertex to finish. "
-            "Right-click or Backspace removes the last vertex, Esc cancels."
-        )
-        self.mask_draw_button.toggled.connect(self._on_mask_draw_toggled)
-        self.mask_clear_button = QPushButton("Clear polygon")
-        self.mask_clear_button.clicked.connect(self._clear_mask)
-        self.mask_mode_combo = QComboBox()
-        self.mask_mode_combo.addItem("Show inside polygon", "inside")
-        self.mask_mode_combo.addItem("Show outside polygon", "outside")
-        self.mask_mode_combo.currentIndexChanged.connect(self._on_mask_mode_changed)
-        self.mask_enable_checkbox = QCheckBox("Apply clip")
-        self.mask_enable_checkbox.setToolTip("Hide the clipped part wherever this image is shown or exported")
-        self.mask_enable_checkbox.toggled.connect(self._on_mask_enabled_toggled)
-        fit_button = QPushButton("Fit")
-        fit_button.clicked.connect(lambda: self.image_viewer.fit_image())
-        for widget in (self.mask_draw_button, self.mask_clear_button, self.mask_mode_combo, self.mask_enable_checkbox):
-            row.addWidget(widget)
-        row.addStretch(1)
-        row.addWidget(fit_button)
-        layout.addLayout(row)
         self.image_viewer = ImageViewer()
+        self.mask_draw_button = self.image_viewer.draw_polygon_button
+        self.mask_draw_button.toggled.connect(self._on_mask_draw_toggled)
+        self.mask_clear_button = self.image_viewer.clear_polygon_button
+        self.mask_clear_button.clicked.connect(self._clear_mask)
+        self.mask_mode_button = self.image_viewer.clip_mode_button
+        mode_menu = QMenu(self.mask_mode_button)
+        mode_group = QActionGroup(mode_menu)
+        mode_group.setExclusive(True)
+        self.mask_mode_actions: dict[str, QAction] = {}
+        for mode, text in (("inside", "Show inside polygon"), ("outside", "Show outside polygon")):
+            action = mode_menu.addAction(text)
+            action.setCheckable(True)
+            mode_group.addAction(action)
+            action.triggered.connect(lambda _checked=False, selected_mode=mode: self._on_mask_mode_changed(selected_mode))
+            self.mask_mode_actions[mode] = action
+        self.mask_mode_button.setMenu(mode_menu)
+        self.mask_mode_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.mask_enable_button = self.image_viewer.apply_clip_button
+        self.mask_enable_button.toggled.connect(self._on_mask_enabled_toggled)
         self.image_viewer.polygon_drawn.connect(self._on_mask_polygon_drawn)
         self.image_viewer.point_clicked.connect(self._select_point)
         self.image_viewer.point_observation_interaction_started.connect(self._begin_point_observation_drag)
@@ -2299,18 +2239,21 @@ class MainWindow(QMainWindow):
              and observation.locked},
         )
         has_image = image is not None and pixmap is not None and not pixmap.isNull()
-        widgets = (self.mask_mode_combo, self.mask_enable_checkbox, self.mask_clear_button, self.mask_draw_button)
+        widgets = (self.mask_mode_button, self.mask_enable_button, self.mask_clear_button, self.mask_draw_button)
         for widget in widgets:
             widget.blockSignals(True)
-        self.mask_mode_combo.setCurrentIndex(max(0, self.mask_mode_combo.findData(image.mask_mode)) if image else 0)
-        self.mask_enable_checkbox.setChecked(bool(image and image.mask_enabled))
+        mode = image.mask_mode if image else "inside"
+        for selected_mode, action in self.mask_mode_actions.items():
+            action.setChecked(selected_mode == mode)
+        self.mask_mode_button.setToolTip(f"Clip mode: {mode} polygon")
+        self.mask_enable_button.setChecked(bool(image and image.mask_enabled))
         if not has_image:
             self.mask_draw_button.setChecked(False)
         for widget in widgets:
             widget.blockSignals(False)
         self.mask_draw_button.setEnabled(has_image)
-        self.mask_mode_combo.setEnabled(has_image)
-        self.mask_enable_checkbox.setEnabled(has_image and len(image.mask_polygon) >= 3)
+        self.mask_mode_button.setEnabled(has_image)
+        self.mask_enable_button.setEnabled(has_image and len(image.mask_polygon) >= 3)
         self.mask_clear_button.setEnabled(has_image and bool(image.mask_polygon))
         self.image_view_dock.setWindowTitle(f"Image View · {image.name}" if image is not None else "Image View")
 
@@ -2346,9 +2289,8 @@ class MainWindow(QMainWindow):
         self._record_project_edit(before, "Clear clip polygon")
         self._refresh_mask_displays()
 
-    def _on_mask_mode_changed(self, _index: int) -> None:
+    def _on_mask_mode_changed(self, mode: str) -> None:
         image = self._current_image_record()
-        mode = self.mask_mode_combo.currentData()
         if image is None or image.mask_mode == mode:
             return
         before = self.project.to_dict()

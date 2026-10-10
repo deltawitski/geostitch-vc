@@ -10,6 +10,47 @@ from geostitch.image_view import ImageViewer
 from geostitch.models import GroundControlPoint
 
 
+@pytest.mark.parametrize("zoom", [0.2, 1.0, 5.0])
+def test_image_view_placeholder_keeps_screen_size_after_deselection(zoom):
+    app = QApplication.instance() or QApplication([])
+    view = ImageViewer()
+    view.resize(800, 600)
+    view.show()
+    app.processEvents()
+    try:
+        placeholder = view._placeholder_label
+        expected = placeholder.geometry()
+        assert placeholder.isVisible()
+        assert placeholder.font().pointSizeF() >= 14
+        pixmap = QPixmap(200, 150)
+        pixmap.fill(QColor("white"))
+        view.set_image("image", pixmap, [], [], "inside", False)
+        assert not placeholder.isVisible()
+        view.scale(zoom, zoom)
+        view.set_image(None, None, [], [], "inside", False)
+        assert placeholder.isVisible()
+        assert placeholder.geometry() == expected
+        view.scale(2, 2)
+        assert placeholder.geometry() == expected
+        view.translate(100, -150)
+        assert placeholder.geometry() == expected
+        start = view.viewport().rect().center()
+        end = start + QPoint(40, 30)
+        QTest.mousePress(view.viewport(), Qt.MouseButton.MiddleButton, pos=start)
+        event = QMouseEvent(QEvent.Type.MouseMove, QPointF(end),
+                    QPointF(view.viewport().mapToGlobal(end)), Qt.MouseButton.NoButton,
+                    Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(view.viewport(), event)
+        QTest.mouseRelease(view.viewport(), Qt.MouseButton.MiddleButton, pos=end)
+        assert placeholder.geometry() == expected
+        assert placeholder.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        view.resize(480, 320)
+        app.processEvents()
+        assert placeholder.geometry() == view.viewport().rect()
+    finally:
+        view.close()
+
+
 def move_with_left_button(view, position):
     event = QMouseEvent(
         QEvent.Type.MouseMove, QPointF(position),

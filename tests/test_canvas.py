@@ -1068,7 +1068,7 @@ def test_clip_polygon_masks_display_pixmaps_and_is_undoable(tmp_path):
     pixmap.fill(QColor("red"))
     assert pixmap.save(str(image_path))
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
-    assert not window.canvas_clip_checkbox.isChecked()
+    assert not window.canvas_clip_button.isChecked()
     image = window.project.add_image(image_path)
     window.current_image_id = image.id
     window._refresh_all()
@@ -1079,11 +1079,11 @@ def test_clip_polygon_masks_display_pixmaps_and_is_undoable(tmp_path):
     displayed, _error = window._display_pixmap_for_image(image)
     assert displayed.toImage().pixelColor(20, 20).alpha() == 255
     assert displayed.toImage().pixelColor(80, 70).alpha() == 0
-    assert image.mask_enabled and window.mask_enable_checkbox.isChecked()
-    window.mask_mode_combo.setCurrentIndex(1)
+    assert image.mask_enabled and window.mask_enable_button.isChecked()
+    window.mask_mode_actions["outside"].trigger()
     displayed, _error = window._display_pixmap_for_image(image)
     assert displayed.toImage().pixelColor(20, 20).alpha() == 0
-    window.mask_enable_checkbox.setChecked(False)
+    window.mask_enable_button.setChecked(False)
     assert window._display_pixmap_for_image(image)[0].toImage().pixelColor(80, 70).alpha() == 255
     window.undo_stack.undo()
     window.undo_stack.undo()

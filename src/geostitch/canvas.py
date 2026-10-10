@@ -12,12 +12,14 @@ from PySide6.QtWidgets import (
     QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
+    QHBoxLayout,
     QWidget,
 )
 
 from geostitch.icons import KIND_COLORS
 from geostitch.alignment_feedback import residual_color
 from geostitch.view_navigation import zoom_at_cursor
+from geostitch.view_controls import overlay_toggle
 
 
 class _Magnifier(QWidget):
@@ -163,6 +165,41 @@ class ImageCanvas(QGraphicsView):
         self._last_pan_position = None
         self._dragged_image_id: str | None = None
         self._read_only = False
+        self.view_controls = QWidget(self.viewport())
+        controls_layout = QHBoxLayout(self.view_controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        self.alignment_toggle_button = overlay_toggle(
+            self.view_controls, "aligned", "Aligned layout\nToggle between the arranged rest layout and the solver-aligned layout.",
+        )
+        self.clipping_toggle_button = overlay_toggle(
+            self.view_controls, "clipping", "Show clipping\nHide the parts of images outside their clip polygons; turn off to see full images.",
+        )
+        self.alignment_errors_button = overlay_toggle(
+            self.view_controls, "link_points", "Alignment errors\n"
+            "Color links by the latest solve tolerance: green within target, amber within twice target, red above. "
+            "In rest layout, colors show solve residuals, not the displayed endpoint gaps.",
+        )
+        self.alignment_errors_button.setChecked(True)
+        controls_layout.addWidget(self.alignment_toggle_button)
+        controls_layout.addWidget(self.clipping_toggle_button)
+        controls_layout.addWidget(self.alignment_errors_button)
+        self.view_controls.setFixedSize(120, 36)
+        self._position_view_controls()
+
+    def _position_view_controls(self) -> None:
+        self.view_controls.move(max(0, self.viewport().width() - self.view_controls.width() - 8), 8)
+        self.view_controls.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "view_controls"):
+            self._position_view_controls()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        if hasattr(self, "view_controls"):
+            self._position_view_controls()
 
     def set_layers(self, layers: list[dict], constraints: list[tuple[str, str]] | None = None) -> None:
         previous_selected_ids = set(self._selected_image_ids)

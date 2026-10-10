@@ -50,6 +50,75 @@ def test_appearance_dialog_color_picker_apply_cancel_and_defaults(monkeypatch):
         dialog.close()
 
 
+def test_dark_map_preference_moves_to_appearance_and_respects_apply_cancel(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    settings_path = str(tmp_path / "dark-map.ini")
+    settings = QSettings(settings_path, QSettings.Format.IniFormat)
+    settings.setValue("map/dark", True)
+    window = MainWindow(settings)
+    try:
+        assert window.world_map._dark_mode
+        assert not hasattr(window, "map_dark_checkbox")
+
+        def cancel(dialog):
+            assert dialog.dark_map_checkbox.isChecked()
+            dialog.dark_map_checkbox.setChecked(False)
+            dialog.reject()
+            return dialog.result()
+
+        monkeypatch.setattr(AppearanceDialog, "exec", cancel)
+        window.open_appearance_settings()
+        assert window.world_map._dark_mode
+        assert settings.value("map/dark", type=bool)
+
+        def apply_then_cancel(dialog):
+            assert dialog.dark_map_checkbox.isChecked()
+            dialog.dark_map_checkbox.setChecked(False)
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Apply).click()
+            assert not window.world_map._dark_mode
+            dialog.dark_map_checkbox.setChecked(True)
+            dialog.reject()
+            return dialog.result()
+
+        monkeypatch.setattr(AppearanceDialog, "exec", apply_then_cancel)
+        window.open_appearance_settings()
+        assert not window.world_map._dark_mode
+        assert not settings.value("map/dark", type=bool)
+    finally:
+        window.close()
+    restored = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
+    try:
+        assert not restored.world_map._dark_mode
+
+        def accept(dialog):
+            dialog.dark_map_checkbox.setChecked(True)
+            dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+            return dialog.result()
+
+        monkeypatch.setattr(AppearanceDialog, "exec", accept)
+        restored.open_appearance_settings()
+        assert restored.world_map._dark_mode
+        assert restored._settings.value("map/dark", type=bool)
+    finally:
+        restored.close()
+
+
+def test_appearance_restore_defaults_resets_dark_map_without_applying():
+    app = QApplication.instance() or QApplication([])
+    dialog = AppearanceDialog("Fusion", "dark", DEFAULT_KIND_COLORS, dark_map=True)
+    applied = []
+    dialog.applied.connect(lambda *args: applied.append(args))
+    try:
+        assert dialog.dark_map_checkbox.isChecked()
+        dialog.restore_defaults()
+        assert not dialog.dark_map_checkbox.isChecked()
+        assert applied == []
+        dialog.apply()
+        assert applied[0][3] is False
+    finally:
+        dialog.close()
+
+
 def test_file_settings_menu_and_appearance_persistence(tmp_path):
     app = QApplication.instance() or QApplication([])
     settings_path = str(tmp_path / "appearance.ini")
@@ -157,7 +226,7 @@ def test_appearance_colors_update_all_views_without_changing_project_or_selectio
         VectorGeometry(points=[(0, 0)]), "EPSG:3857", "EPSG:3857",
     )
     window._refresh_all()
-    window.map_points_checkbox.setChecked(True)
+    window.map_points_button.setChecked(True)
     window._on_canvas_area_selected([images[0].id], [(images[1].id, points[1].id)], [0], False)
     snapshot = window.project.to_dict()
     selection = (window._selected_image_ids(), window._selected_point_ids(), window._selected_constraint_ids())

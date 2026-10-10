@@ -198,6 +198,21 @@ def _draw_eye_map_off(p: QPainter) -> None:
     _draw_eye_map(p, True)
 
 
+def _draw_polygon(painter: QPainter) -> None:
+    vertices = [QPointF(9, 12), QPointF(35, 7), QPointF(42, 30), QPointF(19, 41)]
+    painter.drawPolygon(QPolygonF(vertices))
+    painter.setBrush(_ACCENT)
+    for vertex in vertices:
+        painter.drawEllipse(vertex, 3, 3)
+
+
+def _draw_clipping(painter: QPainter) -> None:
+    painter.drawPolyline(QPolygonF([QPointF(5, 13), QPointF(35, 13), QPointF(35, 43)]))
+    painter.drawPolyline(QPolygonF([QPointF(13, 5), QPointF(13, 35), QPointF(43, 35)]))
+    painter.setPen(QPen(_ACCENT, 3.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.drawLine(QPointF(35, 13), QPointF(35, 35))
+
+
 def _draw_alignment(p: QPainter) -> None:
     dashed = QPen(_COLOR, 3, Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap)
     p.setPen(dashed)
@@ -293,6 +308,8 @@ _GLYPHS = {
     "eye_map_off": _draw_eye_map_off,
     "alignment": _draw_alignment,
     "aligned": _draw_aligned,
+    "clipping": _draw_clipping,
+    "polygon": _draw_polygon,
     "georeference": _draw_georeference,
     "settings": _draw_settings,
     "combined_solve": _draw_combined_solve,

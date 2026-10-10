@@ -10,12 +10,16 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
+    QHBoxLayout,
+    QLabel,
+    QWidget,
 )
 
 from geostitch.canvas import _Magnifier
 from geostitch.masking import hidden_path, polygon_path
 from geostitch.icons import KIND_COLORS
 from geostitch.view_navigation import zoom_at_cursor
+from geostitch.view_controls import overlay_toggle
 
 _ACCENT = QColor("#76cbb0")
 
@@ -57,6 +61,34 @@ class ImageViewer(QGraphicsView):
         self._draft: list[QPointF] = []
         self._cursor_scene: QPointF | None = None
         self._draft_item: QGraphicsPathItem | None = None
+        self._placeholder_label = QLabel("Select an image to view it here", self.viewport())
+        self._placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder_label.setWordWrap(True)
+        self._placeholder_label.setContentsMargins(20, 20, 20, 20)
+        self._placeholder_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        font = self._placeholder_label.font()
+        font.setPointSizeF(max(14.0, font.pointSizeF() + 2.0))
+        self._placeholder_label.setFont(font)
+        self._placeholder_label.setStyleSheet(
+            f"color: #899994; background: transparent; font-size: {font.pointSizeF():g}pt;"
+        )
+        self.view_controls = QWidget(self.viewport())
+        controls_layout = QHBoxLayout(self.view_controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        self.draw_polygon_button = overlay_toggle(
+            self.view_controls, "polygon", "Draw clip polygon\nClick to add vertices; double-click, Enter or the first vertex finishes. "
+            "Right-click or Backspace removes the last vertex; Esc cancels.",
+        )
+        self.clear_polygon_button = overlay_toggle(self.view_controls, "delete", "Clear clip polygon", checkable=False)
+        self.clip_mode_button = overlay_toggle(self.view_controls, "clipping", "Clip mode: inside polygon", checkable=False)
+        self.apply_clip_button = overlay_toggle(
+            self.view_controls, "eye_canvas", "Apply clip\nHide the clipped part wherever this image is shown or exported.",
+        )
+        for button in (self.draw_polygon_button, self.clear_polygon_button, self.clip_mode_button, self.apply_clip_button):
+            controls_layout.addWidget(button)
+            button.setEnabled(False)
+        self.view_controls.setFixedSize(162, 36)
         self._placeholder()
 
     def _placeholder(self) -> None:
@@ -66,9 +98,29 @@ class ImageViewer(QGraphicsView):
         self._draft_item = None
         self._image_rect = QRectF()
         self._image_key = None
-        text = self._scene.addSimpleText("Select an image to view it here")
-        text.setBrush(QBrush(QColor("#899994")))
-        self._scene.setSceneRect(text.boundingRect())
+        self._scene.setSceneRect(QRectF())
+        self._placeholder_label.setGeometry(self.viewport().rect())
+        self._placeholder_label.show()
+        self._placeholder_label.raise_()
+        self._position_view_controls()
+
+    def _position_view_controls(self) -> None:
+        self.view_controls.move(max(0, self.viewport().width() - self.view_controls.width() - 8), 8)
+        self.view_controls.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_placeholder_label"):
+            self._placeholder_label.setGeometry(self.viewport().rect())
+        if hasattr(self, "view_controls"):
+            self._position_view_controls()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        if hasattr(self, "_placeholder_label"):
+            self._placeholder_label.setGeometry(self.viewport().rect())
+        if hasattr(self, "view_controls"):
+            self._position_view_controls()
 
     def has_image(self) -> bool:
         return not self._image_rect.isEmpty()
@@ -92,6 +144,7 @@ class ImageViewer(QGraphicsView):
             self._placeholder()
             return
         same_image = key == self._image_key
+        self._placeholder_label.hide()
         self._scene.clear()
         self._point_items.clear()
         self._locked_points = set(locked_point_ids or ())

@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QStandardPaths
 from geostitch.icons import KIND_COLORS
+from geostitch.view_controls import overlay_toggle
 
 
 class WorldMapView(QGraphicsView):
@@ -101,6 +102,11 @@ class WorldMapView(QGraphicsView):
         self._manager.finished.connect(self._on_tile_loaded)
         self._attribution = QLabel("\u00a9 OpenStreetMap contributors", self.viewport())
         self._attribution.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.points_toggle_button = overlay_toggle(self.viewport(), "pick_gcp",
+            "Show control points\n"
+            "Point color: has map coordinates. Lighter: placed through its image's world transform. "
+            "Square: locked in its image. Circle: unlocked."
+        )
         self._style_attribution()
         self._attribution.adjustSize()
         self._attribution.raise_()
@@ -549,6 +555,8 @@ class WorldMapView(QGraphicsView):
         self._attribution.move(
             viewport_rect.right() - self._attribution.width() + 1, viewport_rect.bottom() - self._attribution.height() + 1
         )
+        self.points_toggle_button.move(max(0, viewport_rect.width() - self.points_toggle_button.width() - 8), 8)
+        self.points_toggle_button.raise_()
 
     def event(self, event) -> bool:
         handled = super().event(event)

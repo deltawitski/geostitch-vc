@@ -51,7 +51,7 @@ Instead of stitching pixels, you work **virtually**:
 
 The window appears before automatically reopening the last project. Saved-project images decode on background workers and appear progressively; the layer tree is available while they load. SciPy's optimizer and image-export dependencies load only when those commands are used. GeoJSON loading already runs on background workers.
 
-Open **File > Settings > Appearance** (also available under **Settings**) to choose an installed Qt style, the GeoStitch dark scheme or Qt's default palette, and symbol colors for images, control points, links, and GeoJSON layers. Color swatches open a color picker. Apply updates the views immediately; OK applies and closes; Cancel discards changes not yet applied. Restore Defaults resets the dialog to Fusion, the dark scheme, and the original symbol colors. Appearance preferences are saved independently of projects.
+Open **File > Settings > Appearance** (also available under **Settings**) to choose an installed Qt style, the GeoStitch dark scheme or Qt's default palette, the **Dark map** option for OpenStreetMap tiles, and symbol colors for images, control points, links, and GeoJSON layers. Dark map is independent of the application's color scheme. Color swatches open a color picker. Apply updates the views immediately; OK applies and closes; Cancel discards changes not yet applied. Restore Defaults resets the dialog to Fusion, the dark application scheme, light map tiles, and the original symbol colors. Appearance preferences are saved independently of projects.
 
 ## 🔄 Workflow
 
@@ -68,7 +68,7 @@ flowchart LR
 
 ### 1. 📥 Import images
 
-Use **File → Import images** (`Ctrl+I`) or drag files into the window. New layers are laid out in a balanced, near-square grid. Choose the project **coordinate system** (for example `EPSG:32610`) in the details panel or the map toolbar.
+Use **File → Import images** (`Ctrl+I`) or drag files into the window. New layers are laid out in a balanced, near-square grid. Choose the project **coordinate system** (for example `EPSG:32610`) in the details panel or the CRS selector at the bottom-right of the status bar. The selector remains available when the World Map panel is hidden.
 
 ### 2. 🧲 Arrange and position
 
@@ -94,7 +94,7 @@ The solver toolbar group contains three controls: **Align**, **Georeference**, a
 
 **Align + Georeference** computes alignment first and uses that fresh layout for georeferencing. When both stages reach their targets and automatic application is enabled for both, the transforms apply together as one undo step. Preview mode in either solver leaves both sets of transforms unchanged. A missed target stops for review with **Apply best result**, **Adjust settings**, or **Discard**; the combined run does not continue past an alignment target miss. Cancellation or solver failure retains existing transforms.
 
-The Layers **Error** column shows alignment residuals in **scene units**: RMS of incident links for each image, the largest incident-link residual for each point, and the solved endpoint distance for each link. Hover over a value for its full precision and meaning. The canvas **Alignment errors** toggle colors links green within the solve's target tolerance, amber within twice that tolerance, and red above it. Selected links keep a thicker solid stroke and highlight both endpoints; the canvas readout follows the selected image, point, or link.
+The Layers **Error** column shows alignment residuals in **scene units**: RMS of incident links for each image, the largest incident-link residual for each point, and the solved endpoint distance for each link. Hover over a value for its full precision and meaning. Selected-link details also show the numerical residual and its current/outdated state. The canvas **Alignment errors** toggle colors links green within the solve's target tolerance, amber within twice that tolerance, and red above it. Selected links keep a thicker solid stroke and highlight both endpoints.
 
 Changing observations, links, or rest transforms marks the previous solve **Outdated**, grays its Layers values, and turns off residual coloring. Undoing those changes restores current results. Coloring is available in both rest and aligned layouts, including current simulations that have not been applied in rest mode. In rest mode, colors show the last solve's residuals, not the gaps between the displayed endpoints. The aligned layout must match the solve to show its colors. Saving a project also saves the last examined residual report, target tolerance, and original solve inputs. Reopening restores the same values and current/outdated state without rerunning the solver, including unapplied simulations. Older projects without a saved report show unavailable errors until alignment is run and the project is saved again. These values measure alignment fit, not independent geographic accuracy; point values are link errors, not geographic target errors.
 
@@ -143,6 +143,12 @@ All shortcuts can be changed in **Settings → Keyboard shortcuts...** (duplicat
 **Mouse:** wheel to zoom, middle-drag to pan. In select mode, `Ctrl` adds to the selection and `Shift` drags over images.
 
 World Map wheel zoom is animated around the cursor and supports fractional wheel input. Tile requests settle after zoom motion instead of restarting on every frame. Existing tiles remain visible while replacements fade in, including when zooming out; a bounded decoded-tile cache makes returning to recently viewed areas quicker. Fit, pan, and restored views stop pending zoom motion.
+
+The checkable control-point button over the World Map's top-right corner shows or hides point markers. Its highlighted state indicates that points are shown; hover for the marker legend.
+
+The Image Canvas has three checkable buttons in its top-right corner: **Aligned layout** switches between rest and solver-aligned transforms (also available with `A`), **Show clipping** previews clip polygons, and **Alignment errors** colors links using the latest solve residuals. Highlighted means the option is enabled. The layout button is disabled until aligned transforms are available; the error button is disabled when the residual report is unavailable or outdated. Numerical errors are available in the Layers **Error** column, its tooltips, and selected-link details.
+
+Image View uses the same top-right overlay style for **Draw clip polygon**, **Clear polygon**, the **inside/outside clip-mode menu**, and **Apply clip**. Hover for each control's name; draw and apply controls highlight when enabled. The Fit button is omitted because **Fit current view** (`Ctrl+Shift+F`) already fits the image when Image View is active.
 
 ---
 

@@ -4,8 +4,9 @@ from unittest.mock import patch
 import pytest
 
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QColor, QFontMetrics, QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtTest import QTest
 
 from geostitch.app import MainWindow
 from geostitch.alignment_feedback import AlignmentFeedback
@@ -95,18 +96,38 @@ def test_canvas_residual_colors_preserve_selection_and_toggle(solved_window):
     app, window, images, points, links, result = solved_window
     assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
     assert window.canvas._constraint_items[1].pen().color() == QColor("#d44f54")
+
+
+def test_alignment_errors_overlay_click_toggles_link_colors(solved_window):
+    app, window, images, points, links, result = solved_window
+    window.show()
+    window.canvas_dock.show()
+    window.canvas_dock.raise_()
+    app.processEvents()
+    button = window.alignment_errors_button
+    assert isinstance(button, QToolButton)
+    assert window.canvas.viewport().isAncestorOf(button)
+    assert button.isCheckable() and button.isChecked() and button.isEnabled()
+    assert not button.icon().isNull()
+    assert "Alignment errors" in button.toolTip()
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert not button.isChecked()
+    assert window.canvas._constraint_items[0].pen().color() == QColor(KIND_COLORS["link"])
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton)
+    assert button.isChecked()
+    assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
     window._select_constraint(links[1].id)
     selected = window.canvas._constraint_items[1]
     assert selected.pen().color() == QColor("#d44f54")
     assert selected.pen().widthF() == 4
     assert selected.pen().style() == Qt.PenStyle.SolidLine
-    assert "Link residual: 1.200 scene units" in window.alignment_error_label.text()
-    assert "Current" in window.alignment_error_label.text()
+    assert window._alignment_feedback.is_current(window.project)
+    assert "Alignment residual: 1.2000 scene units (Current)" in window.constraint_info_label.text()
     assert window.canvas._point_items[(images[0].id, points[0].id)].pen().widthF() == 3
-    window.alignment_errors_checkbox.setChecked(False)
+    window.alignment_errors_button.setChecked(False)
     assert window.canvas._constraint_items[1].pen().color() == QColor(KIND_COLORS["link"])
     assert window.canvas._constraint_items[1].pen().widthF() == 4
-    window.alignment_errors_checkbox.setChecked(True)
+    window.alignment_errors_button.setChecked(True)
     assert window.canvas._constraint_items[1].pen().color() == QColor("#d44f54")
 
 
@@ -114,22 +135,25 @@ def test_canvas_residual_colors_preserve_selection_and_toggle(solved_window):
 def test_canvas_colors_current_results_in_both_layouts_but_not_outdated(solved_window, layout):
     app, window, images, points, links, result = solved_window
     window._set_canvas_state(layout)
-    if layout == "rest":
-        assert "Rest layout" in window.alignment_error_label.text()
-    assert window.alignment_errors_checkbox.isEnabled()
+    assert window.project.canvas_state == layout
+    assert window._alignment_feedback.is_current(window.project)
+    assert window._alignment_feedback.matches_layout(window.project)
+    assert window.alignment_errors_button.isEnabled()
     assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
     assert window.canvas._constraint_items[1].pen().color() == QColor("#d44f54")
-    window.alignment_errors_checkbox.setChecked(False)
+    window.alignment_errors_button.setChecked(False)
     assert window.canvas._constraint_items[0].pen().color() == QColor(KIND_COLORS["link"])
-    window.alignment_errors_checkbox.setChecked(True)
+    window.alignment_errors_button.setChecked(True)
     assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
     window._begin_point_observation_drag(images[0].id, points[0].id)
     window._on_point_observation_changed(images[0].id, points[0].id, 21, 30)
     window._finish_project_edit()
-    assert "Outdated" in window.alignment_error_label.text()
+    assert not window._alignment_feedback.is_current(window.project)
+    assert "Outdated" in window.image_list.item(0).child(0).toolTip(LayerTree.ERROR_COLUMN)
     assert window.canvas._constraint_items[0].pen().color() == QColor(KIND_COLORS["link"])
     window.undo_stack.undo()
-    assert "Current" in window.alignment_error_label.text()
+    assert window._alignment_feedback.is_current(window.project)
+    assert "Current" in window.image_list.item(0).child(0).toolTip(LayerTree.ERROR_COLUMN)
     assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
 
 
@@ -137,21 +161,24 @@ def test_rest_layout_can_show_unapplied_solve_residuals(solved_window):
     app, window, images, points, links, result = solved_window
     window._set_canvas_state("rest")
     window.undo_stack.undo()
+    assert window.project.canvas_state == "rest"
+    assert window._alignment_feedback.is_current(window.project)
     assert not window._alignment_feedback.matches_layout(window.project)
-    assert window.alignment_errors_checkbox.isEnabled()
-    assert "Not applied" in window.alignment_error_label.text()
+    assert window.alignment_errors_button.isEnabled()
+    assert window.image_list.item(0).child(0).text(LayerTree.ERROR_COLUMN) == "1.200"
     assert window.canvas._constraint_items[0].pen().color() == QColor("#2f9e68")
     assert window.canvas._constraint_items[1].pen().color() == QColor("#d44f54")
 
 
-def test_canvas_readout_follows_point_and_image_selection(solved_window):
+def test_layers_errors_follow_selection(solved_window):
     app, window, images, points, links, result = solved_window
     window._select_point(points[0].id)
-    assert "Point max link: 1.200 scene units" in window.alignment_error_label.text()
+    assert window._selected_point_id() == points[0].id
+    assert window.image_list.selected_point_items()[0].text(LayerTree.ERROR_COLUMN) == "1.200"
     window._on_canvas_image_selected(images[0].id)
-    assert "Image RMS: 0.875 scene units" in window.alignment_error_label.text()
+    assert window.image_list.currentItem().text(LayerTree.ERROR_COLUMN) == "0.875"
     window._on_canvas_image_selected(images[2].id)
-    assert "Image RMS: --" in window.alignment_error_label.text()
+    assert window.image_list.currentItem().text(LayerTree.ERROR_COLUMN) == "--"
 
 
 def test_real_solver_residuals_feed_both_views(solved_window):
@@ -165,12 +192,13 @@ def test_real_solver_residuals_feed_both_views(solved_window):
         assert row.text(LayerTree.ERROR_COLUMN) == f"{residual:.3f}"
         assert window.canvas._constraint_items[index].pen().color() == QColor(residual_color(residual, 0.25))
     window._select_constraint(links[0].id)
-    assert "Target: 0.25" in window.alignment_error_label.text()
-    assert "scene units" in window.constraint_info_label.text()
+    assert window._alignment_feedback.tolerance == 0.25
+    residual = actual.constraint_residuals[links[0].id]
+    assert f"Alignment residual: {residual:.4f} scene units (Current)" in window.constraint_info_label.text()
 
 
 @pytest.mark.parametrize("width", [900, 1400])
-def test_canvas_error_readout_fits_available_space(solved_window, width):
+def test_canvas_fills_panel(solved_window, width):
     app, window, images, points, links, result = solved_window
     window.resize(width, 800)
     window.show()
@@ -178,12 +206,13 @@ def test_canvas_error_readout_fits_available_space(solved_window, width):
     window.canvas_dock.raise_()
     window._select_constraint(links[1].id)
     app.processEvents()
-    label = window.alignment_error_label
-    text_bounds = QFontMetrics(label.font()).boundingRect(
-        label.contentsRect(), Qt.TextFlag.TextWordWrap, label.text(),
-    )
-    assert text_bounds.height() <= label.contentsRect().height()
-    assert not label.geometry().intersects(window.alignment_errors_checkbox.geometry())
+    layout = window.canvas_dock.widget().layout()
+    assert layout.count() == 1
+    assert layout.itemAt(0).widget() is window.canvas
+    assert not hasattr(window, "alignment_error_label")
+    button = window.alignment_errors_button
+    button_bounds = button.rect().translated(button.mapTo(window.canvas.viewport(), button.rect().topLeft()))
+    assert window.canvas.viewport().rect().contains(button_bounds)
     assert window.image_list.columnWidth(LayerTree.ERROR_COLUMN) >= 80
 
 
@@ -215,13 +244,14 @@ def test_reopening_project_restores_examined_errors(solved_window, tmp_path, mon
         row = reopened.image_list.item(0).child(0)
         assert row.text(LayerTree.ERROR_COLUMN) == "1.200"
         assert ("Outdated" in row.toolTip(LayerTree.ERROR_COLUMN)) is outdated
-        assert reopened.alignment_errors_checkbox.isEnabled() is not outdated
+        assert reopened.alignment_errors_button.isEnabled() is not outdated
         reopened._image_pixmaps = dict(window._image_pixmaps)
         reopened._refresh_canvas()
         color = KIND_COLORS["link"] if outdated else "#d44f54"
         assert reopened.canvas._constraint_items[1].pen().color() == QColor(color)
         reopened._select_constraint(links[1].id)
-        assert "Link residual: 1.200 scene units" in reopened.alignment_error_label.text()
+        state = "Outdated" if outdated else "Current"
+        assert f"Alignment residual: 1.2000 scene units ({state})" in reopened.constraint_info_label.text()
     finally:
         reopened.close()
 
@@ -238,8 +268,9 @@ def test_reopening_project_restores_unapplied_report(solved_window, tmp_path):
         assert reopened._alignment_feedback is not None
         assert reopened._alignment_feedback.is_current(reopened.project)
         assert not reopened._alignment_feedback.matches_layout(reopened.project)
-        assert "Not applied" in reopened.alignment_error_label.text()
-        assert reopened.alignment_errors_checkbox.isEnabled()
+        assert reopened.project.canvas_state == "rest"
+        assert reopened.image_list.item(0).child(0).text(LayerTree.ERROR_COLUMN) == "1.200"
+        assert reopened.alignment_errors_button.isEnabled()
     finally:
         reopened.close()
 
@@ -256,7 +287,7 @@ def test_startup_reopen_restores_saved_feedback(solved_window, tmp_path):
         assert reopened._alignment_result == result
         assert reopened._alignment_feedback.is_current(reopened.project)
         assert reopened.image_list.item(0).child(0).text(LayerTree.ERROR_COLUMN) == "1.200"
-        assert reopened.alignment_errors_checkbox.isEnabled()
+        assert reopened.alignment_errors_button.isEnabled()
     finally:
         reopened.close()
 
@@ -272,5 +303,4 @@ def test_opening_older_project_clears_previous_feedback(solved_window, tmp_path)
     assert window._alignment_feedback is None
     assert window._alignment_result is None
     assert window.image_list.item(0).child(0).text(LayerTree.ERROR_COLUMN) == "--"
-    assert "unavailable" in window.alignment_error_label.text()
-    assert not window.alignment_errors_checkbox.isEnabled()
+    assert not window.alignment_errors_button.isEnabled()
