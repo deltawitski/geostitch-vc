@@ -593,7 +593,7 @@ class MainWindow(QMainWindow):
             self.link_points_action.toggled,
             self.undo_stack.indexChanged,
         ):
-            signal.connect(lambda *_args: self._update_hints())
+            signal.connect(self._update_hints)
         self.statusBar().showMessage("Import images to begin a project.")
 
     def _build_details_panel(self) -> QWidget:
@@ -780,8 +780,8 @@ class MainWindow(QMainWindow):
         redo_action = self._register_shortcut_action("redo", "Redo", self.undo_stack.redo)
         self.undo_stack.canUndoChanged.connect(undo_action.setEnabled)
         self.undo_stack.canRedoChanged.connect(redo_action.setEnabled)
-        self.undo_stack.undoTextChanged.connect(lambda text: undo_action.setText(f"Undo {text}" if text else "Undo"))
-        self.undo_stack.redoTextChanged.connect(lambda text: redo_action.setText(f"Redo {text}" if text else "Redo"))
+        self.undo_stack.undoTextChanged.connect(self._update_undo_text)
+        self.undo_stack.redoTextChanged.connect(self._update_redo_text)
         undo_action.setEnabled(False)
         redo_action.setEnabled(False)
         edit_menu.addAction(undo_action)
@@ -902,6 +902,12 @@ class MainWindow(QMainWindow):
             self.shortcut_actions[key].setIcon(make_icon(self.TOOLBAR_INFO[key][0]))
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
         self.main_toolbar = toolbar
+
+    def _update_undo_text(self, text: str) -> None:
+        self.shortcut_actions["undo"].setText(f"Undo {text}" if text else "Undo")
+
+    def _update_redo_text(self, text: str) -> None:
+        self.shortcut_actions["redo"].setText(f"Redo {text}" if text else "Redo")
 
     def _refresh_action_tooltips(self) -> None:
         for key, (_icon, description) in self.TOOLBAR_INFO.items():

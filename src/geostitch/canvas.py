@@ -250,6 +250,7 @@ class ImageCanvas(QGraphicsView):
         previous_layers = self._layers
         self._layers = {}
         layout_x = 0.0
+        poses_changed = False
         for index, layer in enumerate(valid_layers):
             image_id = layer["id"]
             if layer.get("rest_locked", False):
@@ -270,6 +271,11 @@ class ImageCanvas(QGraphicsView):
             x = layer["position_x"] if layer["position_x"] is not None else layout_x
             dragging = self._dragged_image_id is not None and image_id in previous_selected_ids
             if not dragging:
+                poses_changed |= (
+                    pixmap_item.pos() != QPointF(x, layer["position_y"])
+                    or pixmap_item.rotation() != layer["rotation"]
+                    or pixmap_item.scale() != layer["scale"]
+                )
                 pixmap_item.setPos(x, layer["position_y"])
                 pixmap_item.setRotation(layer["rotation"])
                 pixmap_item.setScale(layer["scale"])
@@ -301,6 +307,8 @@ class ImageCanvas(QGraphicsView):
         self._redraw_constraints()
         self.set_constraint_source(self._constraint_source_id)
         self._refresh_transform_handles()
+        if poses_changed:
+            self.viewport().update()
 
     def set_selection_mode(self, mode: str) -> None:
         self._selection_mode = "lasso" if mode == "lasso" else "rect"

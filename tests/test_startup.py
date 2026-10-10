@@ -8,13 +8,40 @@ from time import monotonic
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSettings, QTimer, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QUndoCommand
 from PySide6.QtWidgets import QApplication
+from shiboken6 import delete
 
 import geostitch.app as app_module
 from geostitch.app import MainWindow
 from geostitch.models import Project
 from geostitch.project_io import save_project, save_recovery
+
+
+def test_window_deletion_with_undo_history_does_not_call_deleted_widgets(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    exceptions = []
+    monkeypatch.setattr(sys, "excepthook", lambda *exception: exceptions.append(exception))
+    window = MainWindow(QSettings(str(tmp_path / "teardown.ini"), QSettings.Format.IniFormat))
+    window.undo_stack.push(QUndoCommand("Test edit"))
+    assert window.shortcut_actions["undo"].text() == "Undo Test edit"
+    window.undo_stack.undo()
+    assert window.shortcut_actions["undo"].text() == "Undo"
+    assert window.shortcut_actions["redo"].text() == "Redo Test edit"
+    window.undo_stack.redo()
+    assert window.shortcut_actions["undo"].text() == "Undo Test edit"
+    assert window.shortcut_actions["redo"].text() == "Redo"
+    undo_stack = window.undo_stack
+    undo_stack.setParent(None)
+    window._mark_project_saved()
+    window.close()
+    delete(window)
+    try:
+        undo_stack.clear()
+        app.processEvents()
+        assert exceptions == []
+    finally:
+        delete(undo_stack)
 
 
 def test_window_startup_does_not_import_solver_or_export_dependencies(tmp_path):

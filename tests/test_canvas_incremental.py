@@ -3,12 +3,13 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QPointF, QSize
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtCore import QPointF, QRectF, QSize
+from PySide6.QtGui import QColor, QPixmap, QRegion
 from PySide6.QtWidgets import QApplication
 from shiboken6 import delete
 
 from geostitch.canvas import ImageCanvas
+from geostitch.image_item import SourceImageItem
 
 
 @pytest.fixture
@@ -27,12 +28,16 @@ def layer(image_id="first", position=0, points=None):
             "rotation": 0, "scale": 1, "points": points or []}
 
 
-def test_unchanged_refresh_preserves_image_items(canvas):
+def test_unchanged_refresh_preserves_image_items(canvas, monkeypatch):
     layers = [layer(), layer("second", 200)]
     canvas.set_layers(layers)
     first, second = canvas._layers.values()
     canvas.set_selected_images({"first"})
-    canvas.set_layers(layers)
+    repaint_requests = []
+    with monkeypatch.context() as scoped:
+        scoped.setattr(canvas.viewport(), "update", lambda: repaint_requests.append(True))
+        canvas.set_layers(layers)
+        assert repaint_requests == []
     assert canvas._layers["first"] is first
     assert canvas._layers["second"] is second
     assert canvas._selected_image_ids == {"first"}
@@ -52,6 +57,51 @@ def test_reused_image_updates_preview_bounds_pose_and_order(canvas):
     assert item.pixmap().toImage().pixelColor(10, 10) == QColor("blue")
     assert canvas.image_transform("first") == (50, 60, 90, 2)
     assert item.zValue() > canvas._layers["second"].zValue()
+
+
+@pytest.mark.parametrize("transparent, detail_regions", [(True, []), (False, [QRectF(20, 20, 60, 40)])])
+def test_preview_with_transparency_does_not_obscure_old_layout(transparent, detail_regions):
+    app = QApplication.instance() or QApplication([])
+    pixmap = QPixmap(100, 80)
+    pixmap.fill(QColor("transparent" if transparent else "red"))
+    item = SourceImageItem(pixmap, QSize(300, 240))
+    item.set_detail_regions(detail_regions)
+    assert item.opaqueArea().isEmpty()
+    assert item.shape().boundingRect() == QRectF(0, 0, 300, 240)
+
+
+def test_reused_preview_repaints_full_old_footprint_when_layout_changes():
+    class PaintTrackingCanvas(ImageCanvas):
+        def paintEvent(self, event):
+            self.painted_region |= event.region()
+            super().paintEvent(event)
+
+    app = QApplication.instance() or QApplication([])
+    canvas = PaintTrackingCanvas()
+    canvas.painted_region = QRegion()
+    canvas.resize(800, 400)
+    preview = layer()
+    preview["source_size"] = QSize(300, 240)
+    canvas.set_layers([preview])
+    canvas.show()
+    canvas.centerOn(300, 120)
+    app.processEvents()
+    app.processEvents()
+    item = canvas._layers["first"]
+    try:
+        for position in (400, 0, 400, 0):
+            old_position = item.mapToScene(QPointF(250, 200))
+            old_pixel = canvas.mapFromScene(old_position)
+            assert canvas.viewport().rect().contains(old_pixel)
+            canvas.painted_region = QRegion()
+            canvas.set_layers([dict(preview, position_x=position)])
+            app.processEvents()
+            app.processEvents()
+            assert canvas._layers["first"] is item
+            assert canvas.painted_region.contains(old_pixel)
+    finally:
+        canvas.close()
+        delete(canvas)
 
 
 def test_removing_selected_layer_cleans_overlays_and_preserves_other_image(canvas):

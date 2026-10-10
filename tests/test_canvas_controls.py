@@ -1,10 +1,67 @@
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QColor, QPixmap
+import pytest
+
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt
+from PySide6.QtGui import QColor, QPixmap, QRegion
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolButton
 
 from geostitch.adjustment import AlignmentResult
 from geostitch.app import MainWindow
+
+
+@pytest.mark.parametrize("operation", ["toggle", "solve", "undo_redo"])
+def test_layout_switch_repaints_entire_canvas(tmp_path, operation):
+    class PaintTracker(QObject):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.region = QRegion()
+
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Type.Paint:
+                self.region |= event.region()
+            return False
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(QSettings(str(tmp_path / "layout-repaint.ini"), QSettings.Format.IniFormat))
+    image = window.project.add_image(tmp_path / "image.png")
+    image.position_x = 0
+    pixmap = QPixmap(100, 80)
+    pixmap.fill(QColor("red"))
+    window._image_pixmaps[image.id] = pixmap
+    window._refresh_all()
+    window.show()
+    window.canvas_dock.show()
+    window.canvas_dock.raise_()
+    window._apply_alignment_result(AlignmentResult({image.id: (200, 30, 15, 1)}, {}, 1, True, (image.id,)))
+    if operation == "solve":
+        window._set_canvas_state("rest")
+    window.canvas.centerOn(150, 80)
+    app.processEvents()
+    app.processEvents()
+    viewport = window.canvas.viewport()
+    tracker = PaintTracker(viewport)
+    viewport.installEventFilter(tracker)
+    item = window.canvas._layers[image.id]
+    try:
+        for index in range(4):
+            tracker.region = QRegion()
+            if operation == "toggle":
+                window._set_canvas_state("rest" if index % 2 == 0 else "aligned")
+            elif operation == "solve":
+                result = AlignmentResult({image.id: (200 + index * 20, 30, 15, 1)}, {}, 1, True, (image.id,))
+                window._apply_alignment_result(result)
+            elif index % 2 == 0:
+                window.undo_stack.undo()
+            else:
+                window.undo_stack.redo()
+            app.processEvents()
+            app.processEvents()
+            assert tracker.region == QRegion(viewport.rect())
+            assert window.canvas._layers[image.id] is item
+            assert window.canvas.image_transform(image.id) == window._canvas_pose(window.project.images[0])
+    finally:
+        viewport.removeEventFilter(tracker)
+        window.close()
 
 
 def test_canvas_overlay_buttons_toggle_layout_and_clipping(tmp_path):

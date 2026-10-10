@@ -18,6 +18,11 @@ class SourceImageItem(QGraphicsPixmapItem):
         path.addRect(self._source_rect)
         return path
 
+    def opaqueArea(self) -> QPainterPath:
+        if self.pixmap().hasAlphaChannel() or self._detail_regions:
+            return QPainterPath()
+        return self.shape()
+
     def paint(self, painter: QPainter, option, widget=None) -> None:
         painter.save()
         if self._detail_regions:
