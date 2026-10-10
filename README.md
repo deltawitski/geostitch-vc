@@ -51,6 +51,16 @@ Instead of stitching pixels, you work **virtually**:
 
 The window appears before automatically reopening the last project. Saved-project images decode on background workers and appear progressively; the layer tree is available while they load. SciPy's optimizer and image-export dependencies load only when those commands are used. GeoJSON loading already runs on background workers.
 
+Shared canvas and world-map images use previews capped at 2048 pixels on the longest edge. Their graphics bounds, point observations, clip polygons, arrangement, and geographic footprints remain in the original, EXIF-oriented image pixel coordinates. Display resampling never changes source files or export resolution.
+
+Canvas refreshes reuse image items, point markers, link lines, selection outlines, and transform handles instead of clearing the whole scene. Geometry, visibility, locking, layer order, and residual styles update in place; removed items are cleaned up individually. Background refreshes preserve ongoing point and image drags when their objects remain in the project. Point lookup for links is indexed, and marker styling is batched once per layer refresh.
+
+Image View and Link Review show a Preview, Native detail, or Native resolution indicator. Visible views request native detail on a background worker when their zoom exceeds the preview's pixel density. Native pixmaps share a 256 MiB retention budget, with one native decoder running at a time. Images that do not fit as whole native pixmaps load visible source regions as 512-pixel tiles instead. Tile retention uses up to 64 MiB of the shared budget, prioritizes regions near the viewport center, and reuses overlapping tiles while panning. If the visible regions exceed the remaining budget, surrounding areas stay preview-backed until their tiles are prioritized.
+
+Zooming out, hiding the view, or changing selection releases unneeded native detail. Tiles preserve EXIF orientation, alpha, original pixel coordinates, clipping, zoom, and draggable markers. Preview memory still scales with project image count. Region decoding uses Qt clip rectangles with a Pillow fallback, but some codecs require full-size temporary buffers while decoding; the retention budget is not a cap on total process memory.
+
+Opening an associated `.gsp` file in Windows opens that project instead of the last-used project. The Windows installer registers the association. You can also open a project with `python -m geostitch "path/to/project.gsp"`. If the requested file cannot be opened, the app reports the error without reopening a different project.
+
 Open **File > Settings > Appearance** (also available under **Settings**) to choose an installed Qt style, the GeoStitch dark scheme or Qt's default palette, the **Dark map** option for OpenStreetMap tiles, and symbol colors for images, control points, links, and GeoJSON layers. Dark map is independent of the application's color scheme. Color swatches open a color picker. Apply updates the views immediately; OK applies and closes; Cancel discards changes not yet applied. Restore Defaults resets the dialog to Fusion, the dark application scheme, light map tiles, and the original symbol colors. Appearance preferences are saved independently of projects.
 
 ## 🔄 Workflow
@@ -91,6 +101,14 @@ In the Layers panel, expand a linked control point to see its constraints. Links
 **Image > Align** (`Ctrl+Shift+M`) runs immediately with the current project settings. It jointly fits all linked observations for each connected image group, solving translation, rotation and uniform scale with bounded least squares. One reference image per group stays fixed. Results apply automatically when the target tolerance is reached and can be undone. Use **Toggle aligned / rest layout** (`A`) to flip between the arranged and aligned canvas.
 
 The solver toolbar group contains three controls: **Align**, **Georeference**, and **Align + Georeference**. Align and Georeference each have a small settings gear in their bottom-right corner; clicking the main icon runs the solver, while clicking the gear opens its settings. Settings dialogs offer **Apply**, **Run**, and **Cancel** for tolerance, maximum iterations, and automatic application. Apply saves settings without running; Run saves and executes. Uncheck automatic application to compute a preview without changing transforms. Settings are saved per project. Detailed results are available through the Image menu's last-report commands; alignment reports are saved with projects, while georeferencing reports describe the latest run in the current session.
+
+**Image > Solver diagnostics...** checks the current control network without running an optimizer or changing the project. Filter by alignment or georeferencing, inspect a finding's recommendation, and choose **Select affected items** to select its images, points, and links in the Layers tree and fit them on the canvas. Missing source files are warnings because solvers can still use stored observations; pixel review and export require repaired file references.
+
+Manual solver runs stop before computation for blocking issues such as absent usable links or geographic controls, invalid coordinates, invalid group frames, or an invalid geographic CRS. Combined runs check both stages before starting, so missing geographic controls do not leave alignment applied. Warnings do not add confirmation dialogs or prevent existing translation-only solves; the final status reports how many readiness warnings were found.
+
+Diagnostics flag disconnected alignment groups, unlinked images, pairs with only one match, repeated endpoint pixel locations, minimal local redundancy, geographic groups without controls, single-location geographic control, duplicated geographic targets, and incomplete geographic coordinates. Geographic-control clustering is flagged when known source dimensions show a spread below 10% of the image diagonal. Connected geographic groups use the same frame geometry as the solver, rather than counting controls separately per image. The diagnostics dialog describes the current layout; combined runs refresh geographic checks on their newly aligned candidate before georeferencing.
+
+These checks describe available geometry, not measured positional accuracy. Two distinct control locations can determine a similarity transform; collinearity alone is not treated as a blocking error for this transform model. A low solve residual or an empty diagnostics list is not a certificate of geographic accuracy.
 
 **Align + Georeference** computes alignment first and uses that fresh layout for georeferencing. When both stages reach their targets and automatic application is enabled for both, the transforms apply together as one undo step. Preview mode in either solver leaves both sets of transforms unchanged. A missed target stops for review with **Apply best result**, **Adjust settings**, or **Discard**; the combined run does not continue past an alignment target miss. Cancellation or solver failure retains existing transforms.
 
@@ -161,8 +179,25 @@ Image View uses the same top-right overlay style for **Draw clip polygon**, **Cl
 | **Image View**     | Single-image view for precise point placement                                                                      |
 | **Control Points** | Points and links for the active image, with editable pixel and map coordinates, names, labels and constraint types |
 | **World Map**      | OpenStreetMap basemap with solved image footprints, GeoJSON overlays, and coordinate picking                       |
+| **Link Review**    | Searchable, sortable link list and side-by-side endpoint images for correcting observations                       |
 
 Panels can be docked, floated, closed, or split by dragging a title bar to another panel's edge. The layout is restored on next launch; use **View → Reset panel layout** to return to the default.
+
+### Layers filtering
+
+The Layers panel has a case-insensitive search box, an image selector, and point-status filters for **Missing coordinates**, **With coordinates**, **Unlinked points**, and **Linked points**. Search matches image and vector names or paths, unique and displayed point names, labels, and link names or types. Link matches retain endpoint and parent-image context. Choose an image to restrict the result to that image, and combine it with search or a point-status filter. A point missing either geographic coordinate counts as Missing coordinates; Unlinked means it has no incident point constraint.
+
+Filtering affects only tree rows, not canvas/map visibility or project data. The summary reports matching layers and points. Existing selections remain selected even outside the results, with a **selected outside filter** count; editing, deleting, or locking still applies to that selection, not all matching rows. Use the normal Deselect all command to clear it. Layer drag-reordering is disabled while any filter is active.
+
+Matching branches expand to reveal results. The reset icon clears search, image scope, and point status together and restores the expansion state from before filtering. Filters stay active through tree refreshes and undo/redo; coordinate, label, and link edits update their results. Removing a scoped image returns the image selector to All images. Filters are workspace UI state only and are not saved in project files or restored on application startup.
+
+### Linked-point review
+
+Open **View > Link Review** to review linked observations side by side. The panel is hidden by default. Selecting a link in its table selects the same link in the Layers tree and canvas; selecting a link elsewhere updates the review panel. Each image centers on its endpoint, with independent zoom and pan. Drag an unlocked marker to correct its pixel observation; the correction is one undoable edit, and the link remains selected. Locked observations cannot be dragged. The center icon or **Fit current view** recenters both endpoints without changing their zoom.
+
+Search by link name or type, image name, point name, or point label. Click column headings to sort; residuals sort numerically, with largest errors first by default. **Above threshold** filters links above the chosen value in scene units; **No residual** finds links absent from the last alignment report. Previous and next arrows follow the current filtered and sorted list. A selected link remains visible in the endpoint views even if a filter excludes its table row.
+
+Residuals are from the last examined alignment result, not newly computed distances. Edits mark those values **Outdated** and gray them until a new alignment is examined or undo restores its original inputs. Reviewing links and changing filters do not modify the project. Source images load through the existing background loader, and the review controls are disabled while a solver runs.
 
 > [!NOTE]
 > Map tiles are fetched from `tile.openstreetmap.org` and cached locally, so an internet connection is needed for uncached areas. © OpenStreetMap contributors.
@@ -186,6 +221,14 @@ Every image with a solved world transform is written to the folder you choose as
 
 Clipped images additionally produce a `_cutline.geojson` (and a `_mask.png` for formats without alpha).
 
+Export runs on a background worker using a snapshot of the project at the start of the batch. You can continue navigating or editing the project without changing the export in progress. The format and destination folder are remembered for the next export.
+
+The nonmodal progress dialog and **File > Cancel export** can request cancellation. The current image finishes first; subsequent images are skipped, and completed outputs remain available. Closing the application during export offers cancellation and keeps the window open until the current image finishes; close it again afterward.
+
+Existing output images and metadata sidecars require explicit overwrite confirmation. Expand the confirmation dialog's details to inspect the conflicting paths. Each image and its sidecars are encoded in a temporary staging folder before publication. Failed publication attempts restore previous outputs where possible; if restoration fails, the error lists retained backup files in the output folder. Any incomplete outputs that could not be removed are also listed. Source images cannot be overwritten by export. Output publication also supports drives without hard-link support.
+
+After output has been written, **File > Open export folder** opens its destination. The completion message reports how many images were exported, and failures are listed separately. Cancellation is not an interruption of a codec operation, so very large images may take time to finish before the export stops.
+
 ---
 
 ## 💾 Project files
@@ -194,8 +237,22 @@ Projects are saved as versioned JSON `.gsp` files containing image paths and tra
 
 Changing the project CRS refits world transforms using the saved georeferencing tolerance and iteration limit, with the same cancellable progress as the normal solver. Cancelling or failing the refit restores the previous CRS, coordinates, transforms, and report. A completed CRS change remains a single undo step; automatic-application settings for manual previews do not suppress the refit needed for the new coordinate system.
 
+### Saving and recovery
+
+- **File > Recent projects** lists the ten most recently opened or saved projects, with folder context and full-path tooltips to distinguish matching filenames. Successful opens and saves move entries to the top; failed opens or saves and cancelled project switches leave the history unchanged. Missing files remain marked Missing. The menu refreshes when opened, and older settings seed the list from the previous last-used project.
+- **Clear recent projects** clears only the navigation history, not files, the current project, or the last-project startup setting. **File > Open project folder** opens the saved project's containing folder; it is unavailable for untitled projects. Recent-project selection uses the same Save, Discard, and Cancel protection as normal opening.
+- An asterisk in the window title marks unsaved document changes. Close, New, and Open offer Save, Discard, or Cancel. Cancelling the save dialog or failing to save keeps the current project open. Panning, zooming, and switching between rest and aligned views do not mark the document modified.
+- Saves use a temporary file and atomic replacement. The previous successful save is retained as `<project>.gsp.bak`; select Project backup in the Open dialog to open it, then use Save As to save a `.gsp` project.
+- Modified projects get a separate recovery snapshot every minute, unless a solver or grouped edit is running. These snapshots do not overwrite the saved project and are removed after a successful save or an intentional discard. Changes since the most recent snapshot may still be lost in a crash.
+- After an interrupted session, opening the same project offers its newer recovery snapshot. **File > Recover project...** also lists available snapshots, including untitled projects and copies whose source files are missing or corrupt. Recovered work stays marked unsaved until explicitly saved.
+- Recovery snapshots live in the application's local data directory under `recovery`. They contain project data and file references, not copies of the source images.
+
 > [!WARNING]
 > Projects reference the **original image files on disk**. Moving or renaming them breaks the references.
+
+Use **File > Repair missing images...** to repair broken references. **Search folder...** searches the chosen folder and its subfolders on a background worker, matching original filenames without regard to case. Unique matches appear as proposed replacements; duplicate filenames require an explicit choice. Each row also has a **Locate** folder button for moved or renamed files. Review the paths and select **Apply** to repair all chosen rows, or **Cancel** to leave the project unchanged. Unresolved images can be repaired later.
+
+Repairs keep image IDs, names, transforms, masks, and control-point observations intact, and are recorded as one undoable project edit. Repaired images reload in the background. Choose the same original image, not a resized or different image: existing observations remain in the original pixel coordinate system. Save the project to persist the new paths.
 
 Older files with multi-image points are split into linked per-image points on load.
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import hypot
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
@@ -20,6 +20,7 @@ from geostitch.masking import hidden_path, polygon_path
 from geostitch.icons import KIND_COLORS
 from geostitch.view_navigation import zoom_at_cursor
 from geostitch.view_controls import overlay_toggle
+from geostitch.image_item import SourceImageItem
 
 _ACCENT = QColor("#76cbb0")
 
@@ -32,6 +33,7 @@ class ImageViewer(QGraphicsView):
     point_observation_interaction_started = Signal(str, str)
     point_observation_changed = Signal(str, str, float, float)
     point_observation_interaction_finished = Signal(str, str)
+    resolution_changed = Signal()
     POINT_DRAG_THRESHOLD = 5
     CLOSE_DISTANCE_PIXELS = 10.0
 
@@ -53,6 +55,10 @@ class ImageViewer(QGraphicsView):
         self._image_rect = QRectF()
         self._image_key: str | None = None
         self._point_items: dict[str, QGraphicsEllipseItem] = {}
+        self._detail_tiles: dict[tuple[int, int, int, int], QPixmap] = {}
+        self._tile_items: dict[tuple[int, int, int, int], QGraphicsPixmapItem] = {}
+        self._preview_bitmap_size = None
+        self._raster_item: SourceImageItem | None = None
         self._locked_points: set[str] = set()
         self._pending_point_drag: tuple[str, QPoint] | None = None
         self._dragged_point_id: str | None = None
@@ -72,6 +78,10 @@ class ImageViewer(QGraphicsView):
         self._placeholder_label.setStyleSheet(
             f"color: #899994; background: transparent; font-size: {font.pointSizeF():g}pt;"
         )
+        self.resolution_label = QLabel(self.viewport())
+        self.resolution_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.resolution_label.setStyleSheet("color: #e8efeb; background: #20272b; padding: 3px 6px;")
+        self.resolution_label.hide()
         self.view_controls = QWidget(self.viewport())
         controls_layout = QHBoxLayout(self.view_controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
@@ -92,6 +102,9 @@ class ImageViewer(QGraphicsView):
         self._placeholder()
 
     def _placeholder(self) -> None:
+        self._detail_tiles.clear()
+        self._tile_items.clear()
+        self._raster_item = None
         self._scene.clear()
         self._point_items.clear()
         self._locked_points.clear()
@@ -102,11 +115,14 @@ class ImageViewer(QGraphicsView):
         self._placeholder_label.setGeometry(self.viewport().rect())
         self._placeholder_label.show()
         self._placeholder_label.raise_()
+        self.resolution_label.hide()
         self._position_view_controls()
 
     def _position_view_controls(self) -> None:
         self.view_controls.move(max(0, self.viewport().width() - self.view_controls.width() - 8), 8)
         self.view_controls.raise_()
+        self.resolution_label.move(8, max(8, self.viewport().height() - self.resolution_label.height() - 8))
+        self.resolution_label.raise_()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -114,6 +130,8 @@ class ImageViewer(QGraphicsView):
             self._placeholder_label.setGeometry(self.viewport().rect())
         if hasattr(self, "view_controls"):
             self._position_view_controls()
+        if hasattr(self, "_image_key") and self._image_key is not None:
+            self.resolution_changed.emit()
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
@@ -121,6 +139,8 @@ class ImageViewer(QGraphicsView):
             self._placeholder_label.setGeometry(self.viewport().rect())
         if hasattr(self, "view_controls"):
             self._position_view_controls()
+        if hasattr(self, "_image_key") and self._image_key is not None:
+            self.resolution_changed.emit()
 
     def has_image(self) -> bool:
         return not self._image_rect.isEmpty()
@@ -135,6 +155,7 @@ class ImageViewer(QGraphicsView):
         enabled: bool,
         selected_point_id: str | None = None,
         locked_point_ids: set[str] | None = None,
+        source_size: QSize | None = None,
     ) -> None:
         """`points` are (id, name, x, y) in image pixels; the view keeps its zoom while `key` is unchanged."""
         if key != self._image_key or pixmap is None or pixmap.isNull():
@@ -144,23 +165,33 @@ class ImageViewer(QGraphicsView):
             self._placeholder()
             return
         same_image = key == self._image_key
+        if not same_image:
+            self._detail_tiles.clear()
+        self._tile_items.clear()
         self._placeholder_label.hide()
         self._scene.clear()
         self._point_items.clear()
         self._locked_points = set(locked_point_ids or ())
         self._draft_item = None
         self._image_key = key
-        self._image_rect = QRectF(0.0, 0.0, pixmap.width(), pixmap.height())
-        margin = max(pixmap.width(), pixmap.height()) * 4.0
+        size = source_size if source_size is not None and source_size.isValid() else pixmap.size()
+        self._preview_bitmap_size = pixmap.size()
+        if pixmap.size() == size:
+            self._detail_tiles.clear()
+        self._image_rect = QRectF(0.0, 0.0, size.width(), size.height())
+        margin = max(size.width(), size.height()) * 4.0
         self._scene.setSceneRect(self._image_rect.adjusted(-margin, -margin, margin, margin))
 
-        item = QGraphicsPixmapItem(pixmap)
+        item = SourceImageItem(pixmap, size)
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
         self._scene.addItem(item)
+        self._raster_item = item
+        self._draw_detail_tiles()
+        self._update_resolution_label()
 
         if len(polygon) >= 3:
             if enabled:
-                dim = QGraphicsPathItem(hidden_path(pixmap.width(), pixmap.height(), polygon, mode))
+                dim = QGraphicsPathItem(hidden_path(size.width(), size.height(), polygon, mode))
                 dim.setPen(QPen(Qt.PenStyle.NoPen))
                 dim.setBrush(QBrush(QColor(0, 0, 0, 170)))
                 dim.setZValue(10)
@@ -197,9 +228,48 @@ class ImageViewer(QGraphicsView):
             *([self._draft_item] if self._draft_item is not None else []),
         ]
 
+    def set_detail_tiles(self, tiles: dict[tuple[int, int, int, int], QPixmap]) -> None:
+        if not self.has_image():
+            return
+        signature = {key: pixmap.cacheKey() for key, pixmap in tiles.items()}
+        previous = {key: pixmap.cacheKey() for key, pixmap in self._detail_tiles.items()}
+        if signature == previous:
+            return
+        for item in self._tile_items.values():
+            self._scene.removeItem(item)
+        self._tile_items.clear()
+        self._detail_tiles = dict(tiles)
+        self._draw_detail_tiles()
+        self._update_resolution_label()
+
+    def _draw_detail_tiles(self) -> None:
+        if self._raster_item is not None:
+            self._raster_item.set_detail_regions([QRectF(*region) for region in self._detail_tiles])
+        for region, pixmap in self._detail_tiles.items():
+            item = QGraphicsPixmapItem(pixmap)
+            item.setPos(region[0], region[1])
+            item.setZValue(1)
+            item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+            self._scene.addItem(item)
+            self._tile_items[region] = item
+
+    def _update_resolution_label(self) -> None:
+        native = self._preview_bitmap_size == self._image_rect.size().toSize()
+        self.resolution_label.setText("Native resolution" if native else "Native detail" if self._detail_tiles else "Preview")
+        size = self._preview_bitmap_size
+        self.resolution_label.setToolTip(
+            f"Displayed {size.width()} x {size.height()} pixels with {len(self._detail_tiles)} native tiles; "
+            f"source {self._image_rect.width():g} x {self._image_rect.height():g} pixels"
+        )
+        self.resolution_label.adjustSize()
+        self.resolution_label.show()
+        self._position_view_controls()
+
     def fit_image(self) -> None:
         if self.has_image():
             self.fitInView(self._image_rect.adjusted(-20, -20, 20, 20), Qt.AspectRatioMode.KeepAspectRatio)
+            self.resolution_changed.emit()
 
     def set_drawing(self, enabled: bool) -> None:
         if enabled and not self.has_image():
@@ -387,4 +457,5 @@ class ImageViewer(QGraphicsView):
         cursor = zoom_at_cursor(self, event, factor)
         if self._dragged_point_id is not None:
             self._move_point_marker(cursor)
+        self.resolution_changed.emit()
         event.accept()

@@ -45,6 +45,10 @@ def test_map_points_overlay_button_toggles_markers_without_picking_coordinates(t
 def test_map_points_overlay_stays_top_right_during_navigation_and_resize(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = MainWindow(QSettings(str(tmp_path / "map-position.ini"), QSettings.Format.IniFormat))
+    point = GroundControlPoint.create("Map point")
+    window.project.add_control_point(point)
+    window._select_point(point.id)
+    window.pick_gcp_action.setChecked(True)
     view = window.world_map
     window.show()
     window.world_map_dock.setFloating(True)
@@ -53,17 +57,24 @@ def test_map_points_overlay_stays_top_right_during_navigation_and_resize(tmp_pat
     app.processEvents()
     try:
         button = window.map_points_button
+        hint = window.map_tool_hint
         assert button.x() == view.viewport().width() - button.width() - 8
         assert button.y() == 8
+        assert hint.pos().x() == 8
+        assert hint.pos().y() == 8
+        expected_hint = hint.geometry()
         expected = button.geometry()
         view.scale(2, 2)
         view.horizontalScrollBar().setValue(view.horizontalScrollBar().value() + 30)
         view.verticalScrollBar().setValue(view.verticalScrollBar().value() + 20)
         assert button.geometry() == expected
+        assert hint.geometry() == expected_hint
         window.world_map_dock.resize(480, 320)
         app.processEvents()
         assert button.x() == view.viewport().width() - button.width() - 8
         assert button.y() == 8
         assert view.viewport().rect().contains(button.geometry())
+        assert hint.pos().x() == 8
+        assert hint.pos().y() == 8
     finally:
         window.close()

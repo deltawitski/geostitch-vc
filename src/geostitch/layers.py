@@ -75,6 +75,7 @@ class LayerTree(QTreeWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._control_click_active = False
+        self._filter_active = False
         self.setColumnCount(5)
         self.setHeaderLabels(["Layer", "", "", "", "Error"])
         self.setHeaderHidden(False)
@@ -110,18 +111,26 @@ class LayerTree(QTreeWidget):
         rows = self._image_rows()
         return rows[row] if 0 <= row < len(rows) else None
 
+    def selected_rows(self) -> list[LayerItem]:
+        return [self.itemFromIndex(index) for index in self.selectionModel().selectedRows(0)]
+
+    def set_filter_active(self, active: bool) -> None:
+        self._filter_active = active
+        self.setDragEnabled(not active)
+        self.setAcceptDrops(not active)
+
     def selectedItems(self) -> list[LayerItem]:
         """Selected image rows only; use `selected_point_items` for control points."""
-        return [item for item in super().selectedItems() if item.kind == IMAGE_KIND]
+        return [item for item in self.selected_rows() if item.kind == IMAGE_KIND]
 
     def selected_point_items(self) -> list[LayerItem]:
-        return [item for item in super().selectedItems() if item.kind == POINT_KIND]
+        return [item for item in self.selected_rows() if item.kind == POINT_KIND]
 
     def selected_vector_items(self) -> list[LayerItem]:
-        return [item for item in super().selectedItems() if item.kind == VECTOR_KIND]
+        return [item for item in self.selected_rows() if item.kind == VECTOR_KIND]
 
     def selected_constraint_items(self) -> list[LayerItem]:
-        return [item for item in super().selectedItems() if item.kind == CONSTRAINT_KIND]
+        return [item for item in self.selected_rows() if item.kind == CONSTRAINT_KIND]
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -169,6 +178,9 @@ class LayerTree(QTreeWidget):
             event.accept()
 
     def dropEvent(self, event) -> None:
+        if self._filter_active:
+            event.ignore()
+            return
         # Reordering is applied by the owner; ignoring the action stops Qt from removing the dragged rows.
         event.setDropAction(Qt.DropAction.IgnoreAction)
         event.accept()

@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QStandardPaths
 from geostitch.icons import KIND_COLORS
-from geostitch.view_controls import overlay_toggle
+from geostitch.view_controls import ActiveToolHint, overlay_toggle
 
 
 class WorldMapView(QGraphicsView):
@@ -107,6 +107,7 @@ class WorldMapView(QGraphicsView):
             "Point color: has map coordinates. Lighter: placed through its image's world transform. "
             "Square: locked in its image. Circle: unlocked."
         )
+        self.active_tool_hint = ActiveToolHint(self.viewport())
         self._style_attribution()
         self._attribution.adjustSize()
         self._attribution.raise_()
@@ -389,6 +390,8 @@ class WorldMapView(QGraphicsView):
         return bounds
 
     def _refresh_image_items(self) -> None:
+        from geostitch.image_item import SourceImageItem
+
         for item in self._image_items.values():
             self._scene.removeItem(item)
         self._image_items.clear()
@@ -400,14 +403,15 @@ class WorldMapView(QGraphicsView):
             if not all(isfinite(value) and abs(value) <= self.WORLD_ORIGIN * 4 for corner in corners for value in corner):
                 continue
             top_left, top_right, bottom_left = corners
-            item = QGraphicsPixmapItem(pixmap)
+            item = SourceImageItem(pixmap, image.get("source_size"))
+            width, height = item.boundingRect().width(), item.boundingRect().height()
             item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             item.setTransformOriginPoint(0.0, 0.0)
             item.setTransform(QTransform(
-                (top_right[0] - top_left[0]) / max(1, pixmap.width()),
-                -(top_right[1] - top_left[1]) / max(1, pixmap.width()),
-                (bottom_left[0] - top_left[0]) / max(1, pixmap.height()),
-                -(bottom_left[1] - top_left[1]) / max(1, pixmap.height()),
+                (top_right[0] - top_left[0]) / max(1, width),
+                -(top_right[1] - top_left[1]) / max(1, width),
+                (bottom_left[0] - top_left[0]) / max(1, height),
+                -(bottom_left[1] - top_left[1]) / max(1, height),
                 top_left[0],
                 -top_left[1],
             ))
@@ -557,6 +561,8 @@ class WorldMapView(QGraphicsView):
         )
         self.points_toggle_button.move(max(0, viewport_rect.width() - self.points_toggle_button.width() - 8), 8)
         self.points_toggle_button.raise_()
+        self.active_tool_hint.move(8, 8)
+        self.active_tool_hint.raise_()
 
     def event(self, event) -> bool:
         handled = super().event(event)

@@ -17,9 +17,10 @@ from PySide6.QtWidgets import (
 )
 
 from geostitch.icons import KIND_COLORS
+from geostitch.image_item import SourceImageItem
 from geostitch.alignment_feedback import residual_color
 from geostitch.view_navigation import zoom_at_cursor
-from geostitch.view_controls import overlay_toggle
+from geostitch.view_controls import ActiveToolHint, overlay_toggle
 
 
 class _Magnifier(QWidget):
@@ -127,6 +128,7 @@ class ImageCanvas(QGraphicsView):
         self._locked_images: set[str] = set()
         self._points: dict[tuple[str, str], tuple[float, float]] = {}
         self._point_items: dict[tuple[str, str], QGraphicsEllipseItem] = {}
+        self._point_keys_by_id: dict[str, tuple[str, str]] = {}
         self._locked_points: set[tuple[str, str]] = set()
         self._dragged_point_key: tuple[str, str] | None = None
         self._magnifier = _Magnifier(self)
@@ -149,6 +151,7 @@ class ImageCanvas(QGraphicsView):
         self._constraint_residuals: dict[int, float] = {}
         self._residual_tolerance = 0.5
         self._constraint_items: list[QGraphicsLineItem] = []
+        self._constraint_lines: dict[tuple[str, str, int], QGraphicsLineItem] = {}
         self._selected_constraint_indices: set[int] = set()
         self._active_image_id: str | None = None
         self._selected_image_ids: set[str] = set()
@@ -185,11 +188,14 @@ class ImageCanvas(QGraphicsView):
         controls_layout.addWidget(self.clipping_toggle_button)
         controls_layout.addWidget(self.alignment_errors_button)
         self.view_controls.setFixedSize(120, 36)
+        self.active_tool_hint = ActiveToolHint(self.viewport())
         self._position_view_controls()
 
     def _position_view_controls(self) -> None:
         self.view_controls.move(max(0, self.viewport().width() - self.view_controls.width() - 8), 8)
         self.view_controls.raise_()
+        self.active_tool_hint.move(8, 8)
+        self.active_tool_hint.raise_()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -203,33 +209,57 @@ class ImageCanvas(QGraphicsView):
 
     def set_layers(self, layers: list[dict], constraints: list[tuple[str, str]] | None = None) -> None:
         previous_selected_ids = set(self._selected_image_ids)
-        self._selection_outlines.clear()
-        self._marquee_item = None
-        self._marquee_origin = None
-        self._scene.clear()
-        self._layers.clear()
         self._locked_images.clear()
-        self._points.clear()
-        self._point_items.clear()
         self._locked_points.clear()
-        self._dragged_point_key = None
-        self._transform_handles.clear()
-        self._transform_connector = None
-        self._active_transform_handle = None
-        self._constraint_items.clear()
         self._constraints = []
-        self._active_image_id = None
-        self._selected_image_ids = set()
         valid_layers = [layer for layer in layers if not layer["pixmap"].isNull()]
+        valid_ids = {layer["id"] for layer in valid_layers}
+        if self._active_image_id not in valid_ids:
+            self._active_transform_handle = None
+        if self._dragged_image_id not in valid_ids:
+            self._dragged_image_id = None
+        for outline in list(self._selection_outlines):
+            if outline.parentItem().data(0) not in valid_ids:
+                self._scene.removeItem(outline)
+                outline.setParentItem(None)
+                self._selection_outlines.remove(outline)
+        valid_point_keys = {(layer["id"], point[0]) for layer in valid_layers for point in layer["points"]}
+        for key in list(self._point_items):
+            if key not in valid_point_keys:
+                self._scene.removeItem(self._point_items.pop(key))
+                self._points.pop(key, None)
+                self._point_keys_by_id.pop(key[1], None)
+        if self._dragged_point_key not in valid_point_keys:
+            self._dragged_point_key = None
+            self._magnifier.hide()
+        if self._pending_point_drag is not None and self._pending_point_drag[0] not in valid_point_keys:
+            self._pending_point_drag = None
+        for image_id in list(self._layers):
+            if image_id not in valid_ids:
+                self._scene.removeItem(self._layers.pop(image_id))
         if not valid_layers:
+            if self._marquee_item is not None:
+                self._scene.removeItem(self._marquee_item)
+            self._marquee_item = None
+            self._marquee_origin = None
+            self._marquee_active = False
+            self._apply_image_selection(set())
+            self._redraw_constraints()
             return
 
+        previous_layers = self._layers
+        self._layers = {}
         layout_x = 0.0
         for index, layer in enumerate(valid_layers):
             image_id = layer["id"]
             if layer.get("rest_locked", False):
                 self._locked_images.add(image_id)
-            pixmap_item = QGraphicsPixmapItem(layer["pixmap"])
+            pixmap_item = previous_layers.get(image_id)
+            if pixmap_item is None:
+                pixmap_item = SourceImageItem(layer["pixmap"], layer.get("source_size"))
+                self._scene.addItem(pixmap_item)
+            else:
+                pixmap_item.set_source_image(layer["pixmap"], layer.get("source_size"))
             pixmap_item.setData(0, image_id)
             pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
             pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not self._read_only and image_id not in self._locked_images)
@@ -238,11 +268,12 @@ class ImageCanvas(QGraphicsView):
             pixmap_item.setZValue(index)
             pixmap_item.setVisible(layer.get("visible", True))
             x = layer["position_x"] if layer["position_x"] is not None else layout_x
-            pixmap_item.setPos(x, layer["position_y"])
-            pixmap_item.setRotation(layer["rotation"])
-            pixmap_item.setScale(layer["scale"])
-            layout_x = x + layer["pixmap"].width() * layer["scale"] + 40.0
-            self._scene.addItem(pixmap_item)
+            dragging = self._dragged_image_id is not None and image_id in previous_selected_ids
+            if not dragging:
+                pixmap_item.setPos(x, layer["position_y"])
+                pixmap_item.setRotation(layer["rotation"])
+                pixmap_item.setScale(layer["scale"])
+            layout_x = x + pixmap_item.boundingRect().width() * layer["scale"] + 40.0
             self._layers[image_id] = pixmap_item
             for point_data in layer["points"]:
                 visible = True
@@ -253,7 +284,16 @@ class ImageCanvas(QGraphicsView):
                 else:
                     point_id, pixel_x, pixel_y = point_data
                     locked = False
-                self._add_point_marker(pixmap_item, point_id, pixel_x, pixel_y, locked, visible)
+                key = (image_id, point_id)
+                marker = self._point_items.get(key)
+                if marker is None:
+                    self._add_point_marker(pixmap_item, point_id, pixel_x, pixel_y, locked, visible)
+                else:
+                    self._points[key] = (pixel_x, pixel_y)
+                    marker.setPos(pixmap_item.mapToScene(QPointF(pixel_x, pixel_y)))
+                    marker.setVisible(visible)
+                    if locked:
+                        self._locked_points.add(key)
 
         for first_id, second_id in constraints or []:
             self._constraints.append((first_id, second_id))
@@ -363,30 +403,39 @@ class ImageCanvas(QGraphicsView):
         key = (parent.data(0), point_id)
         self._points[key] = (x, y)
         self._point_items[key] = marker
+        self._point_keys_by_id[point_id] = key
         if locked:
             self._locked_points.add(key)
-        self._refresh_marker_styles()
 
     def _apply_image_selection(self, image_ids: set[str]) -> None:
+        previous_active = self._active_image_id
         self._selected_image_ids = {image_id for image_id in image_ids if image_id in self._layers}
         # Transform handles only make sense for a single image.
         self._active_image_id = next(iter(self._selected_image_ids)) if len(self._selected_image_ids) == 1 else None
+        if previous_active != self._active_image_id:
+            self._active_transform_handle = None
         for index, (image_id, item) in enumerate(self._layers.items()):
             selected = image_id in self._selected_image_ids
             item.setSelected(selected)
             item.setZValue(index)
-        for outline in self._selection_outlines:
-            self._scene.removeItem(outline)
-        self._selection_outlines.clear()
+        previous_outlines = {outline.parentItem().data(0): outline for outline in self._selection_outlines}
+        self._selection_outlines = []
         for image_id in self._selected_image_ids:
             item = self._layers[image_id]
-            outline = QGraphicsRectItem(item.boundingRect(), item)
+            outline = previous_outlines.pop(image_id, None)
+            if outline is None:
+                outline = QGraphicsRectItem(item.boundingRect(), item)
+            else:
+                outline.setRect(item.boundingRect())
             pen = QPen(QColor(KIND_COLORS["image"]), 2)
             pen.setCosmetic(True)
             outline.setPen(pen)
             outline.setBrush(QBrush(Qt.BrushStyle.NoBrush))
             outline.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             self._selection_outlines.append(outline)
+        for outline in previous_outlines.values():
+            self._scene.removeItem(outline)
+            outline.setParentItem(None)
         self._refresh_transform_handles()
 
     def set_selected_images(self, image_ids: set[str]) -> None:
@@ -787,10 +836,10 @@ class ImageCanvas(QGraphicsView):
             self._transform_connector = None
 
     def _refresh_transform_handles(self) -> None:
-        self._clear_transform_handles()
         image_id = self._active_image_id
         item = self._layers.get(image_id) if image_id else None
         if item is None or self._read_only or self._active_image_id in self._locked_images or not item.isVisible():
+            self._clear_transform_handles()
             return
         bounds = item.boundingRect()
         corners = (
@@ -806,14 +855,20 @@ class ImageCanvas(QGraphicsView):
         rotate_position = item.mapToScene(QPointF(bounds.center().x(), bounds.top() - 32.0 / max(item.scale(), 0.05)))
         connector_pen = QPen(QColor(KIND_COLORS["image"]), 1)
         connector_pen.setCosmetic(True)
-        self._transform_connector = self._scene.addLine(
-            top_center.x(), top_center.y(), rotate_position.x(), rotate_position.y(), connector_pen
-        )
+        if self._transform_connector is None:
+            self._transform_connector = QGraphicsLineItem()
+            self._scene.addItem(self._transform_connector)
+        self._transform_connector.setLine(top_center.x(), top_center.y(), rotate_position.x(), rotate_position.y())
+        self._transform_connector.setPen(connector_pen)
         self._transform_connector.setZValue(3999)
         self._add_transform_handle("rotate", rotate_position, QColor(KIND_COLORS["image"]))
 
     def _add_transform_handle(self, kind: str, position: QPointF, color: QColor) -> None:
-        handle = QGraphicsEllipseItem(-6, -6, 12, 12)
+        handle = next((handle for handle in self._transform_handles if handle.data(0) == kind), None)
+        if handle is None:
+            handle = QGraphicsEllipseItem(-6, -6, 12, 12)
+            self._scene.addItem(handle)
+            self._transform_handles.append(handle)
         handle.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
         handle.setPos(position)
         handle.setPen(QPen(QColor("#12201e"), 1.5))
@@ -823,8 +878,6 @@ class ImageCanvas(QGraphicsView):
         handle.setData(1, self._active_image_id)
         handle.setToolTip("Drag to rotate" if kind == "rotate" else "Drag to scale image")
         handle.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._scene.addItem(handle)
-        self._transform_handles.append(handle)
 
     def _transform_handle_at(self, viewport_position: QPoint) -> str | None:
         nearest_kind = None
@@ -904,7 +957,7 @@ class ImageCanvas(QGraphicsView):
             marker.setPos(scene_position)
 
     def _scene_position_for_point(self, point_id: str):
-        point_key = next((key for key in self._points if key[1] == point_id), None)
+        point_key = self._point_keys_by_id.get(point_id)
         if point_key is None:
             return None
         image_id, _point_id = point_key
@@ -946,10 +999,15 @@ class ImageCanvas(QGraphicsView):
         return best_index
 
     def _redraw_constraints(self) -> None:
-        for item in self._constraint_items:
-            self._scene.removeItem(item)
-        self._constraint_items.clear()
+        previous = self._constraint_lines
+        self._constraint_lines = {}
+        self._constraint_items = []
+        occurrences: dict[tuple[str, str], int] = {}
         for index, (first_id, second_id) in enumerate(self._constraints):
+            pair = (first_id, second_id)
+            occurrence = occurrences.get(pair, 0)
+            occurrences[pair] = occurrence + 1
+            key = (first_id, second_id, occurrence)
             first = self._scene_position_for_point(first_id)
             second = self._scene_position_for_point(second_id)
             if first is None or second is None:
@@ -960,8 +1018,18 @@ class ImageCanvas(QGraphicsView):
             pen = QPen(QColor(color), 4 if selected else 2,
                        Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine)
             pen.setCosmetic(True)
-            line = self._scene.addLine(first.x(), first.y(), second.x(), second.y(), pen)
+            line = previous.pop(key, None)
+            if line is None:
+                line = QGraphicsLineItem()
+                self._scene.addItem(line)
+            line.setLine(first.x(), first.y(), second.x(), second.y())
+            line.setPen(pen)
             if residual is not None:
                 line.setToolTip(f"Link residual: {residual:.6f} scene units\nTarget: {self._residual_tolerance:g} scene units")
+            else:
+                line.setToolTip("")
             line.setZValue(2500 if selected else 2000)
             self._constraint_items.append(line)
+            self._constraint_lines[key] = line
+        for line in previous.values():
+            self._scene.removeItem(line)

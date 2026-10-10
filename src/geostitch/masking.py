@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap, QPolygonF
 
 
@@ -27,7 +27,9 @@ def hidden_path(width: float, height: float, points: list[list[float]], mode: st
     return full.subtracted(visible_path(width, height, points, mode))
 
 
-def masked_pixmap(pixmap: QPixmap, points: list[list[float]], mode: str) -> QPixmap:
+def masked_pixmap(pixmap: QPixmap, points: list[list[float]], mode: str, source_size: QSize | None = None) -> QPixmap:
+    if source_size is not None and source_size.isValid():
+        points = [[x * pixmap.width() / source_size.width(), y * pixmap.height() / source_size.height()] for x, y in points]
     result = QPixmap(pixmap.size())
     result.fill(Qt.GlobalColor.transparent)
     painter = QPainter(result)

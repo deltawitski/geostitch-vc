@@ -119,15 +119,18 @@ def test_appearance_restore_defaults_resets_dark_map_without_applying():
         dialog.close()
 
 
-def test_file_settings_menu_and_appearance_persistence(tmp_path):
+def test_settings_menu_and_appearance_persistence(tmp_path):
     app = QApplication.instance() or QApplication([])
     settings_path = str(tmp_path / "appearance.ini")
     window = MainWindow(QSettings(settings_path, QSettings.Format.IniFormat))
     try:
-        assert window.appearance_action in window.file_settings_menu.actions()
-        assert window.shortcut_settings_action in window.file_settings_menu.actions()
+        settings_menu = next(
+            action.menu() for action in window.menuBar().actions() if action.text() == "Settings"
+        )
         file_menu = window.menuBar().actions()[0].menu()
-        assert window.file_settings_menu.menuAction() in file_menu.actions()
+        assert window.appearance_action in settings_menu.actions()
+        assert window.shortcut_settings_action in settings_menu.actions()
+        assert all(action.menu() is None or action.text() != "Settings" for action in file_menu.actions())
         colors = dict(DEFAULT_KIND_COLORS, point="#f02040", image="#2030f0")
         window._apply_appearance("Fusion", "native", colors)
         assert app.styleSheet() == ""

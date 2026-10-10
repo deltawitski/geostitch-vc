@@ -630,6 +630,11 @@ def test_continuous_add_mode_creates_sequenced_points_in_clicked_images(tmp_path
     window.canvas.fit_images()
     app.processEvents()
     window.add_points_action.setChecked(True)
+    assert window.canvas_tool_hint.isVisible()
+    assert "ADD POINTS" in window.canvas_tool_hint.message_label.text()
+    assert window.canvas_tool_hint.pos().x() == 8
+    assert window.canvas_tool_hint.pos().y() == 8
+    assert window.canvas_tool_hint.escape_key_label.text() == "Esc"
 
     first_position = window.canvas._layers[images[0].id].mapToScene(QPointF(20.0, 30.0))
     QTest.mouseClick(window.canvas.viewport(), Qt.MouseButton.LeftButton, pos=window.canvas.mapFromScene(first_position))
@@ -652,7 +657,8 @@ def test_continuous_add_mode_creates_sequenced_points_in_clicked_images(tmp_path
     assert [point.display_name for point in window.project.control_points] == ["P1"]
     window.undo_stack.redo()
     assert [point.display_name for point in window.project.control_points] == ["P1", "P1"]
-    window.add_points_action.setChecked(False)
+    QTest.keyClick(window.canvas, Qt.Key.Key_Escape)
+    assert not window.add_points_mode
     assert window.canvas._active_point_id is None
     window.close()
 
@@ -898,6 +904,8 @@ def test_link_points_tool_creates_multiple_cross_image_constraints(tmp_path):
     window.link_points_action.setChecked(True)
     assert not window.add_points_mode
     assert window.link_points_mode
+    assert window.canvas_tool_hint.isVisible()
+    assert "LINK POINTS" in window.canvas_tool_hint.message_label.text()
 
     def click_marker(image_id, point_id):
         marker = window.canvas._point_items[(image_id, point_id)]
@@ -906,6 +914,10 @@ def test_link_points_tool_creates_multiple_cross_image_constraints(tmp_path):
 
     click_marker(first_image.id, points[0].id)
     assert window.pending_constraint_point_id == points[0].id
+    QTest.keyClick(window.canvas, Qt.Key.Key_Escape)
+    assert window.pending_constraint_point_id is None
+    assert window.link_points_mode
+    click_marker(first_image.id, points[0].id)
     click_marker(first_image.id, points[1].id)
     assert not window.project.constraints
     assert window.pending_constraint_point_id == points[0].id

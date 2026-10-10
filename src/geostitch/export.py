@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from json import dumps
 from math import cos, radians, sin
 from pathlib import Path
+from shutil import copy2, copyfileobj
+from tempfile import TemporaryDirectory
 from typing import Callable
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps, TiffImagePlugin
@@ -30,6 +33,46 @@ _TYPE_DOUBLE = 12
 class ExportResult:
     written: list[Path]
     failures: list[str]
+    cancelled: bool = False
+
+
+@dataclass
+class ExportItem:
+    image: ImageRecord
+    target: Path
+    outputs: tuple[Path, ...]
+
+
+def plan_export(project: Project, directory: str | Path, extension: str) -> list[ExportItem]:
+    if extension not in FORMATS.values():
+        raise ValueError(f"Unsupported export format '{extension}'.")
+    destination = Path(directory)
+    crs = CRS.from_user_input(project.crs)
+    used_names: set[str] = set()
+    items = []
+    for image in project.images:
+        if image.world_x is None or image.world_y is None:
+            continue
+        stem = f"{Path(image.name).stem}_georef"
+        candidate, counter = stem, 2
+        while candidate.casefold() in used_names:
+            candidate = f"{stem}-{counter}"
+            counter += 1
+        used_names.add(candidate.casefold())
+        target = destination / f"{candidate}{extension}"
+        outputs = [target]
+        if extension != ".tif":
+            outputs.append(target.with_suffix(_WORLD_FILE_SUFFIX[extension]))
+        if extension != ".tif" or crs.to_epsg() is None:
+            outputs.append(target.with_suffix(".prj"))
+        if image.mask_active:
+            outputs.extend((destination / f"{candidate}_mask.png", destination / f"{candidate}_cutline.geojson"))
+        items.append(ExportItem(image, target, tuple(outputs)))
+    sources = {Path(image.path).resolve() for image in project.images}
+    for item in items:
+        if any(path.resolve() in sources for path in item.outputs):
+            raise ValueError(f"Export would overwrite a source image: {item.target}")
+    return items
 
 
 def image_affine(image: ImageRecord) -> Affine:
@@ -46,58 +89,148 @@ def image_affine(image: ImageRecord) -> Affine:
     )
 
 
+def _publish_exclusive(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError:
+        created = False
+        try:
+            with destination.open("xb") as output:
+                created = True
+                with source.open("rb") as input_file:
+                    copyfileobj(input_file, output)
+        except OSError:
+            if created:
+                destination.unlink(missing_ok=True)
+            raise
+
+
+def _publish_image(staging: Path, destination: Path, overwrite: bool) -> None:
+    files = list(staging.iterdir())
+    originals = {}
+    published = []
+    retained = set()
+    try:
+        if overwrite:
+            for source in files:
+                target = destination / source.name
+                if target.exists():
+                    if not target.is_file():
+                        raise IsADirectoryError(f"Output is not a file: {target}")
+                    backup = destination / f".{target.name}.{staging.name}.backup"
+                    originals[target] = backup
+                    copy2(target, backup)
+        for source in files:
+            target = destination / source.name
+            if overwrite:
+                os.replace(source, target)
+            else:
+                _publish_exclusive(source, target)
+            published.append(target)
+    except OSError as error:
+        recovery_files = []
+        incomplete_files = []
+        for target in reversed(published):
+            try:
+                if target in originals:
+                    os.replace(originals[target], target)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                if target in originals:
+                    retained.add(originals[target])
+                    recovery_files.append(str(originals[target]))
+                else:
+                    incomplete_files.append(str(target))
+        if recovery_files or incomplete_files:
+            details = str(error)
+            if recovery_files:
+                details += f". Previous outputs preserved at: {', '.join(recovery_files)}"
+            if incomplete_files:
+                details += f". Incomplete outputs could not be removed: {', '.join(incomplete_files)}"
+            raise OSError(details) from error
+        raise
+    finally:
+        for backup in originals.values():
+            if backup not in retained:
+                backup.unlink(missing_ok=True)
+
+
 def export_project_images(
     project: Project,
     directory: str | Path,
     extension: str,
     progress: Callable[[int, int, str], None] | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    overwrite: bool = False,
 ) -> ExportResult:
     """Write each georeferenced image to `directory` as `<name>_georef<extension>`."""
-    if extension not in FORMATS.values():
-        raise ValueError(f"Unsupported export format '{extension}'.")
+    items = plan_export(project, directory, extension)
     destination = Path(directory)
     destination.mkdir(parents=True, exist_ok=True)
     crs = CRS.from_user_input(project.crs)
     result = ExportResult(written=[], failures=[])
-    used_names: set[str] = set()
-    exportable = [image for image in project.images if image.world_x is not None and image.world_y is not None]
-    for index, image in enumerate(exportable):
+    for index, item in enumerate(items):
+        if cancelled is not None and cancelled():
+            result.cancelled = True
+            break
+        image, target = item.image, item.target
         if progress is not None:
-            progress(index, len(exportable), image.name)
-        stem = f"{Path(image.name).stem}_georef"
-        candidate, counter = stem, 2
-        while candidate.casefold() in used_names:
-            candidate = f"{stem}-{counter}"
-            counter += 1
-        used_names.add(candidate.casefold())
-        target = destination / f"{candidate}{extension}"
+            progress(index, len(items), image.name)
+        if cancelled is not None and cancelled():
+            result.cancelled = True
+            break
         try:
-            with Image.open(image.path) as source:
-                source.load()
-                pixels = _exportable_image(ImageOps.exif_transpose(source), extension)
-            affine = image_affine(image)
-            sidecar_mask = None
-            if image.mask_active:
-                mask = build_mask(pixels.size, image.mask_polygon, image.mask_mode)
-                pixels, sidecar_mask = _apply_mask(pixels, mask, extension)
-            if extension == ".tif":
-                write_geotiff(target, pixels, affine, crs)
-            else:
-                write_world_file_image(target, pixels, affine, crs)
-            if sidecar_mask is not None:
-                sidecar_mask.save(destination / f"{candidate}_mask.png")
-            if image.mask_active:
-                (destination / f"{candidate}_cutline.geojson").write_text(
-                    _cutline_geojson(image, affine, project.crs),
-                    encoding="utf-8",
-                )
+            conflicts = [path for path in item.outputs if path.exists()]
+            if conflicts and not overwrite:
+                raise FileExistsError(f"Output already exists: {conflicts[0]}")
+            with TemporaryDirectory(prefix=".geostitch-export-", dir=destination) as temporary:
+                staged = Path(temporary) / target.name
+                _export_image(image, staged, extension, crs, project.crs)
+                _publish_image(Path(temporary), destination, overwrite)
         except (OSError, ValueError) as error:
             result.failures.append(f"{image.name}: {error}")
             continue
         result.written.append(target)
     if progress is not None:
-        progress(len(exportable), len(exportable), "")
+        progress(len(result.written) + len(result.failures), len(items), "")
     return result
+
+
+def _export_image(image: ImageRecord, target: Path, extension: str, crs: CRS, crs_name: str) -> None:
+    with Image.open(image.path) as source:
+        oriented = ImageOps.exif_transpose(source)
+        try:
+            pixels = _exportable_image(oriented, extension)
+        finally:
+            oriented.close()
+    mask = None
+    sidecar_mask = None
+    try:
+        affine = image_affine(image)
+        if image.mask_active:
+            mask = build_mask(pixels.size, image.mask_polygon, image.mask_mode)
+            masked, sidecar_mask = _apply_mask(pixels, mask, extension)
+            if masked is not pixels:
+                pixels.close()
+                pixels = masked
+        if extension == ".tif":
+            write_geotiff(target, pixels, affine, crs)
+        else:
+            write_world_file_image(target, pixels, affine, crs)
+        if sidecar_mask is not None:
+            sidecar_mask.save(target.parent / f"{target.stem}_mask.png")
+        if image.mask_active:
+            (target.parent / f"{target.stem}_cutline.geojson").write_text(
+                _cutline_geojson(image, affine, crs_name), encoding="utf-8",
+            )
+    finally:
+        pixels.close()
+        if mask is not None:
+            mask.close()
 
 
 def build_mask(size: tuple[int, int], polygon: list[list[float]], mode: str) -> Image.Image:

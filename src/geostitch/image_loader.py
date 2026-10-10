@@ -34,14 +34,14 @@ class ImageLoader(QObject):
 
     loaded = Signal(object, object, str)
 
-    def __init__(self, decode: Callable[[str], tuple[QImage, str]], parent: QObject | None = None):
+    def __init__(self, decode: Callable[[str], tuple[QImage, str]], parent: QObject | None = None, *, max_threads: int = 2):
         super().__init__(parent)
         self._decode = decode
         self._pending: set[tuple] = set()
         self._signals = _Signals(self)
         self._signals.loaded.connect(self._on_loaded)
         self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(2)
+        self._pool.setMaxThreadCount(max_threads)
 
     def request(self, key: tuple, path: str) -> None:
         if key in self._pending:

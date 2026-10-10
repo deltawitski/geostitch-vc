@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from time import monotonic
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,9 +11,10 @@ from PySide6.QtCore import QSettings, QTimer, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
+import geostitch.app as app_module
 from geostitch.app import MainWindow
 from geostitch.models import Project
-from geostitch.project_io import save_project
+from geostitch.project_io import save_project, save_recovery
 
 
 def test_window_startup_does_not_import_solver_or_export_dependencies(tmp_path):
@@ -102,7 +104,7 @@ def test_background_project_loading_keeps_ui_events_running(tmp_path, monkeypatc
         image.fill(Qt.GlobalColor.white)
         return image, ""
 
-    monkeypatch.setattr(MainWindow, "_read_image_data", staticmethod(decode))
+    monkeypatch.setattr(MainWindow, "_read_preview_data", staticmethod(decode))
     window = MainWindow(QSettings(str(tmp_path / "background.ini"), QSettings.Format.IniFormat))
     heartbeat = []
     try:
@@ -145,3 +147,74 @@ def test_last_project_is_not_opened_before_window_show(tmp_path, monkeypatch):
         assert opened == [True]
     finally:
         window.close()
+
+
+def test_main_opens_explicit_project_instead_of_last_project(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    last_path = tmp_path / "last.gsp"
+    requested_path = tmp_path / "requested project.gsp"
+    save_project(Project(name="Last project"), last_path)
+    save_project(Project(name="Requested project"), requested_path)
+    settings = QSettings(str(tmp_path / "explicit.ini"), QSettings.Format.IniFormat)
+    settings.setValue("last_project", str(last_path))
+    window = MainWindow(settings)
+    monkeypatch.setattr(app_module, "QApplication", lambda arguments: app)
+    monkeypatch.setattr(app_module, "MainWindow", lambda: window)
+    monkeypatch.setattr(app, "arguments", lambda: ["GeoStitch.exe", str(requested_path)])
+
+    def run_events():
+        assert window.isVisible()
+        assert window.project_path is None
+        assert not window._startup_timer.isActive()
+        app.processEvents()
+        assert window.project_path == requested_path
+        assert window.project.name == "Requested project"
+        window._reopen_startup_project()
+        assert window.project_path == requested_path
+        return 0
+
+    monkeypatch.setattr(app, "exec", run_events)
+    try:
+        assert app_module.main() == 0
+    finally:
+        window.close()
+
+
+def test_main_reports_missing_explicit_project_without_opening_last(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    last_path = tmp_path / "last.gsp"
+    missing_path = tmp_path / "missing project.gsp"
+    save_project(Project(name="Last project"), last_path)
+    settings = QSettings(str(tmp_path / "missing.ini"), QSettings.Format.IniFormat)
+    settings.setValue("last_project", str(last_path))
+    window = MainWindow(settings)
+    save_recovery(Project(name="Unrelated recovery"), window._recovery_directory / "unrelated.gsp", None)
+    errors = []
+    monkeypatch.setattr(app_module, "QApplication", lambda arguments: app)
+    monkeypatch.setattr(app_module, "MainWindow", lambda: window)
+    monkeypatch.setattr(app, "arguments", lambda: ["GeoStitch.exe", str(missing_path)])
+    monkeypatch.setattr(window, "_show_error", errors.append)
+
+    def run_events():
+        app.processEvents()
+        assert len(errors) == 1
+        assert "Could not open project" in errors[0]
+        assert window.project_path is None
+        assert not window._startup_timer.isActive()
+        assert not window._startup_pending
+        assert window.project_path is None
+        return 0
+
+    monkeypatch.setattr(app, "exec", run_events)
+    try:
+        assert app_module.main() == 0
+    finally:
+        window.close()
+
+
+def test_installer_association_passes_quoted_project_path():
+    installer_path = Path(__file__).resolve().parents[1] / "packaging" / "installer.iss"
+    installer = installer_path.read_text(encoding="utf-8")
+    assert "ChangesAssociations=yes" in installer
+    assert 'Subkey: "Software\\Classes\\.gsp"; ValueType: string; ValueName: ""; ValueData: "GeoStitch.Project"' in installer
+    assert 'Subkey: "Software\\Classes\\GeoStitch.Project\\shell\\open\\command"; ValueType: string; ValueName: ""; ValueData: """{app}\\GeoStitch.exe"" ""%1"""' in installer

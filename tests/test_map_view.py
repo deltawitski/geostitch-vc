@@ -371,3 +371,33 @@ def test_app_map_dock_updates_when_georeference_result_is_applied(tmp_path):
     assert map_item.mapToScene(QPointF(0.0, 0.0)).y() == pytest.approx(-top_left[1])
     assert window.world_map_dock.windowTitle() == "World Map · EPSG:26910"
     window.close()
+
+
+def test_map_coordinate_pick_has_visible_cancel_control(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(QSettings(str(tmp_path / "map-pick-cancel.ini"), QSettings.Format.IniFormat))
+    point = GroundControlPoint.create("Map point")
+    window.project.add_control_point(point)
+    window._select_point(point.id)
+    window.show()
+    window.world_map_dock.show()
+    app.processEvents()
+    window.pick_gcp_action.setChecked(True)
+
+    assert window.map_tool_hint.isVisible()
+    assert "PICK MAP COORDINATE" in window.map_tool_hint.message_label.text()
+    assert window.map_tool_hint.pos().x() == 8
+    assert window.map_tool_hint.pos().y() == 8
+    window.world_map.setFocus()
+    QTest.keyClick(window.world_map, Qt.Key.Key_Escape)
+    assert not window.pick_gcp_action.isChecked()
+    assert not window.world_map._pick_mode
+    assert not window.map_tool_hint.isVisible()
+
+    window.pick_gcp_action.setChecked(True)
+    window.world_map.coordinate_picked.emit(0.0, 0.0)
+    assert point.geographic_x == pytest.approx(0.0)
+    assert point.geographic_y == pytest.approx(0.0)
+    assert not window.pick_gcp_action.isChecked()
+    assert not window.map_tool_hint.isVisible()
+    window.close()

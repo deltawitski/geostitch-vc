@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import sys
+from collections import OrderedDict
 from contextlib import contextmanager
+from datetime import datetime
 from html import escape
 from math import atan2, ceil, cos, degrees, hypot, isfinite, radians, sin, sqrt
+from os.path import normcase
 from pathlib import Path
+from uuid import uuid4
 from PySide6.QtGui import QActionGroup
 
 from geostitch.adjustment import AlignmentResult, simulate_alignment
@@ -14,8 +18,8 @@ from geostitch.map_view import WorldMapView
 from pyproj import CRS, Transformer
 from shiboken6 import isValid
 
-from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QItemSelectionModel, QRectF, QSettings, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QTransform, QUndoCommand, QUndoStack
+from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QItemSelectionModel, QRect, QRectF, QSettings, QSize, QStandardPaths, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QBrush, QColor, QCursor, QDesktopServices, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QTransform, QUndoCommand, QUndoStack
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -57,12 +61,19 @@ from geostitch.icons import DEFAULT_KIND_COLORS, KIND_COLORS, app_icon, kind_bar
 from geostitch.appearance import AppearanceDialog
 from geostitch.default_layout import DEFAULT_DOCK_STATE, DEFAULT_GEOMETRY
 from geostitch.layers import CONSTRAINT_KIND, IMAGE_KIND, POINT_KIND, VECTOR_KIND, LayerItem, LayerTree
+from geostitch.layer_filter import match_layers
 from geostitch.image_view import ImageViewer
 from geostitch.image_loader import ImageLoader
+from geostitch.image_decode import read_preview, source_size
+from geostitch.image_tiles import TileLoader, visible_tiles
+from geostitch.export_worker import ExportWorker
+from geostitch.image_repair import apply_replacements, missing_images
+from geostitch.link_review import LinkReviewPanel
 from geostitch.masking import masked_pixmap
 from geostitch.models import GroundControlPoint, PointConstraint, Project, SolverSettings, VectorLayer
-from geostitch.project_io import load_project, save_project
+from geostitch.project_io import load_project, load_recovery, save_project, save_recovery
 from geostitch.solver_dialog import SolverSettingsDialog, SolverToolbarControl
+from geostitch.solver_readiness import ReadinessIssue, check_readiness
 from geostitch.status_bar import ScrollingStatusBar
 from geostitch.vector_loader import VectorLoader
 
@@ -173,6 +184,9 @@ class ProjectSnapshotCommand(QUndoCommand):
 
 
 class MainWindow(QMainWindow):
+    RECENT_PROJECT_LIMIT = 10
+    DETAIL_CACHE_BYTES = 256 * 1024 * 1024
+    TILE_CACHE_BYTES = 64 * 1024 * 1024
     IMAGE_EXTENSIONS = {
         f".{bytes(image_format).decode('ascii').lower()}"
         for image_format in QImageReader.supportedImageFormats()
@@ -183,11 +197,16 @@ class MainWindow(QMainWindow):
         "open_project": ("Open project", "Ctrl+O"),
         "save_project": ("Save project", "Ctrl+S"),
         "save_project_as": ("Save project as...", "Ctrl+Shift+S"),
+        "recover_project": ("Recover project...", ""),
+        "open_project_folder": ("Open project folder", ""),
+        "repair_images": ("Repair missing images...", ""),
         "select_all": ("Select all", "Ctrl+A"),
         "deselect_all": ("Deselect all", "Ctrl+D"),
         "import_images": ("Import images", "Ctrl+I"),
         "import_geojson": ("Import GeoJSON layers", ""),
         "export_images": ("Export georeferenced images", "Ctrl+E"),
+        "cancel_export": ("Cancel export", ""),
+        "open_export_folder": ("Open export folder", ""),
         "fit_images": ("Fit current view", "Ctrl+Shift+F"),
         "arrange_images": ("Arrange images", "Ctrl+Shift+A"),
         "simulate_alignment": ("Align", "Ctrl+Shift+M"),
@@ -197,6 +216,7 @@ class MainWindow(QMainWindow):
         "align_georeference": ("Align and georeference", ""),
         "alignment_report": ("Last alignment report...", ""),
         "georeference_report": ("Last georeference report...", ""),
+        "solver_diagnostics": ("Solver diagnostics...", ""),
         "toggle_alignment": ("Toggle aligned / rest layout", "A"),
         "maximize_dock": ("Maximize / restore current panel", "M"),
         "add_points": ("Toggle Add points", "P"),
@@ -221,6 +241,9 @@ class MainWindow(QMainWindow):
             application.setOrganizationName("GeoStitch")
             application.setApplicationName("GeoStitch")
         self._settings = settings or QSettings()
+        if not self._settings.contains("recent_projects"):
+            last_project = str(self._settings.value("last_project", "") or "")
+            self._settings.setValue("recent_projects", [last_project] if last_project else [])
         self._load_appearance()
         self.shortcut_actions: dict[str, QAction] = {}
         self.undo_stack = QUndoStack(self)
@@ -230,16 +253,50 @@ class MainWindow(QMainWindow):
         self._georeference_result: GeoreferenceResult | None = None
         self._georeference_result_tolerance: float | None = None
         self._solver_running = False
+        self._export_running = False
+        self._export_worker: ExportWorker | None = None
+        self._export_dialog: QProgressDialog | None = None
+        self._export_directory: Path | None = None
+        self._last_export_directory: Path | None = None
+        self._export_total = 0
         self._solver_progress_dialog: QProgressDialog | None = None
         self.project = Project()
         self.project_path: Path | None = None
+        recovery_root = (
+            Path(self._settings.fileName()).parent
+            if self._settings.format() == QSettings.Format.IniFormat
+            else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation))
+        )
+        self._recovery_directory = recovery_root / "recovery"
+        self._recovery_path = self._recovery_directory / f"{uuid4().hex}.gsp"
+        self._last_recovery_state: dict | None = None
+        self._saved_project_state = self._project_document_state()
+        self.undo_stack.indexChanged.connect(self._update_title)
         self._image_pixmaps: dict[str, QPixmap] = {}
+        self._image_sizes: dict[str, QSize] = {}
         self._image_load_generation = 0
         self._background_images = False
         self._image_load_errors: dict[str, str] = {}
         self._loading_image_keys: set[tuple] = set()
-        self._image_loader = ImageLoader(self._read_image_data, self)
+        self._image_loader = ImageLoader(self._read_preview_data, self)
         self._image_loader.loaded.connect(self._on_image_loaded)
+        self._detail_pixmaps: dict[str, QPixmap] = {}
+        self._detail_requested_ids: set[str] = set()
+        self._detail_loading_keys: set[tuple] = set()
+        self._detail_failures: dict[str, str] = {}
+        self._detail_loader = ImageLoader(self._read_image_data, self, max_threads=1)
+        self._detail_loader.loaded.connect(self._on_detail_loaded)
+        self._tile_loader = TileLoader(self, pool=self._detail_loader._pool)
+        self._tile_loader.loaded.connect(self._on_tile_loaded)
+        self._tile_pixmaps: OrderedDict[tuple, QPixmap] = OrderedDict()
+        self._tile_requested_keys: set[tuple] = set()
+        self._tile_loading_keys: set[tuple] = set()
+        self._tile_failures: set[tuple] = set()
+        self._tile_view_keys: dict[ImageViewer, list[tuple]] = {}
+        self._tile_budget = 0
+        self._detail_timer = QTimer(self)
+        self._detail_timer.setSingleShot(True)
+        self._detail_timer.timeout.connect(self._refresh_detail_demand)
         self._image_refresh_timer = QTimer(self)
         self._image_refresh_timer.setSingleShot(True)
         self._image_refresh_timer.setInterval(40)
@@ -284,16 +341,24 @@ class MainWindow(QMainWindow):
         self._startup_timer.setSingleShot(True)
         self._startup_timer.setInterval(50)
         self._startup_timer.timeout.connect(self._reopen_startup_project)
+        self._startup_pending = True
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setInterval(60_000)
+        self._recovery_timer.timeout.connect(self._autosave_recovery)
+        self._recovery_timer.start()
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._startup_project and not self._startup_timer.isActive():
+        if self._startup_pending and (self._startup_project or self._recovery_directory.exists()):
+            self._startup_pending = False
             self._startup_timer.start()
 
     def _reopen_startup_project(self) -> None:
         path, self._startup_project = self._startup_project, ""
         if path and Path(path).is_file():
             self._open_project_path(path, quiet=True)
+        else:
+            self._offer_recovery(Path(path) if path else None)
 
     def _build_ui(self) -> None:
         for key, label, callback in (
@@ -301,11 +366,16 @@ class MainWindow(QMainWindow):
             ("open_project", "Open", self.open_project),
             ("save_project", "Save", self.save_current_project),
             ("save_project_as", "Save as", self.save_project_as),
+            ("recover_project", "Recover project...", self.recover_project),
+            ("open_project_folder", "Open project folder", self.open_project_folder),
+            ("repair_images", "Repair missing images...", self.repair_missing_images),
             ("select_all", "Select all", self.select_all),
             ("deselect_all", "Deselect all", self.deselect_all),
             ("import_images", "Import images", self.import_images),
             ("import_geojson", "Import GeoJSON layers", self.import_geojson),
             ("export_images", "Export georeferenced images", self.export_georeferenced_images),
+            ("cancel_export", "Cancel export", self.cancel_export),
+            ("open_export_folder", "Open export folder", self.open_export_folder),
         ):
             self._register_shortcut_action(key, label, callback)
         fit_action = self._register_shortcut_action("fit_images", "Fit current view", self._fit_canvas)
@@ -314,6 +384,7 @@ class MainWindow(QMainWindow):
         self._register_shortcut_action("simulate_alignment", "Align", self.run_alignment)
         self._register_shortcut_action("georeference", "Georeference", self.run_georeference)
         self._register_shortcut_action("align_georeference", "Align and georeference", self.run_combined_solvers)
+        self._register_shortcut_action("solver_diagnostics", "Solver diagnostics...", self.show_solver_diagnostics)
         for stage in ("alignment", "georeference"):
             self._register_shortcut_action(
                 f"{stage}_settings", f"{stage.title()} settings...",
@@ -335,6 +406,12 @@ class MainWindow(QMainWindow):
         self.pick_gcp_action.setCheckable(True)
         self.pick_gcp_action.setToolTip("Click the map to set geographic coordinates on the selected control point")
         self.pick_gcp_action.toggled.connect(self._set_map_pick_mode)
+        self.cancel_active_tool_action = QAction("Cancel active tool", self)
+        self.cancel_active_tool_action.setShortcut(QKeySequence(Qt.Key.Key_Escape))
+        self.cancel_active_tool_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.cancel_active_tool_action.setEnabled(False)
+        self.cancel_active_tool_action.triggered.connect(self._cancel_active_tool)
+        self.addAction(self.cancel_active_tool_action)
         self.toggle_alignment_action = self._register_shortcut_action("toggle_alignment", "Aligned layout", None)
         self.toggle_alignment_action.setCheckable(True)
         self.toggle_alignment_action.setEnabled(False)
@@ -361,11 +438,51 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda _checked=False, method=name: getattr(self.image_list, method)())
             title_row.addWidget(button)
         image_layout.addLayout(title_row)
+        self._layer_filter_expanded: dict[str, bool] | None = None
+        self._layer_image_choices = None
+        self._layer_filter_point_count = 0
+        self._layer_filter_layer_count = 0
+        self.layer_search = QLineEdit()
+        self.layer_search.setPlaceholderText("Search layers, points or labels")
+        self.layer_search.setAccessibleName("Search layers and control points")
+        self.layer_search.setClearButtonEnabled(True)
+        search_row = QHBoxLayout()
+        search_row.addWidget(self.layer_search, 1)
+        self.layer_filter_reset = QToolButton()
+        self.layer_filter_reset.setIcon(make_icon("undo"))
+        self.layer_filter_reset.setToolTip("Clear layer filters")
+        self.layer_filter_reset.setAccessibleName("Clear layer filters")
+        self.layer_filter_reset.setFixedSize(28, 28)
+        search_row.addWidget(self.layer_filter_reset)
+        image_layout.addLayout(search_row)
+        filter_row = QHBoxLayout()
+        self.layer_image_filter = QComboBox()
+        self.layer_image_filter.setAccessibleName("Filter layers by image")
+        self.layer_image_filter.addItem("All images", None)
+        self.layer_point_filter = QComboBox()
+        self.layer_point_filter.setAccessibleName("Filter control point status")
+        for label, value in (("All points", "all"), ("Missing coordinates", "missing_geo"),
+                             ("With coordinates", "with_geo"), ("Unlinked points", "unlinked"),
+                             ("Linked points", "linked")):
+            self.layer_point_filter.addItem(label, value)
+        for combo in (self.layer_image_filter, self.layer_point_filter):
+            combo.setMinimumContentsLength(7)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            filter_row.addWidget(combo, 1)
+        image_layout.addLayout(filter_row)
+        self.layer_filter_summary = QLabel()
+        self.layer_filter_summary.setWordWrap(True)
+        self.layer_filter_summary.setToolTip("Filters affect only the Layers list. Selection is unchanged, including items outside the filter.")
+        image_layout.addWidget(self.layer_filter_summary)
         self.image_list = LayerTree()
         self.image_list.itemSelectionChanged.connect(self._on_image_selected)
         self.image_list.visibility_toggled.connect(self._on_layer_visibility_toggled)
         self.image_list.lock_toggled.connect(self._on_layer_lock_toggled)
         self.image_list.layers_reordered.connect(self._on_layers_reordered)
+        self.layer_search.textChanged.connect(self._apply_layer_filter)
+        self.layer_image_filter.currentIndexChanged.connect(self._apply_layer_filter)
+        self.layer_point_filter.currentIndexChanged.connect(self._apply_layer_filter)
+        self.layer_filter_reset.clicked.connect(self.clear_layer_filters)
         image_layout.addWidget(self.image_list, 1)
         remove_image_action = self._register_shortcut_action("remove_image", "Remove selected image", self.remove_selected_image)
         remove_image_button = QPushButton(remove_image_action.text())
@@ -375,6 +492,7 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.image_dock)
 
         self.canvas = ImageCanvas()
+        self.canvas_tool_hint = self.canvas.active_tool_hint
         self.canvas.image_clicked.connect(self._on_canvas_clicked)
         self.canvas.background_clicked.connect(self._on_canvas_background_clicked)
         self.canvas.point_marker_clicked.connect(self._on_constraint_point_clicked)
@@ -410,6 +528,7 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.image_dock, self.canvas_dock, Qt.Orientation.Horizontal)
 
         self.world_map = WorldMapView()
+        self.map_tool_hint = self.world_map.active_tool_hint
         world_map_panel = QWidget()
         world_map_layout = QVBoxLayout(world_map_panel)
         world_map_layout.setContentsMargins(6, 6, 6, 6)
@@ -430,11 +549,25 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.canvas_dock, self.world_map_dock, Qt.Orientation.Vertical)
 
         self.image_view_dock = self._create_panel_dock("imageViewDock", "Image View", self._build_image_view_panel())
+        self.image_view_dock.visibilityChanged.connect(self._schedule_detail_refresh)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.image_view_dock)
         self.splitDockWidget(self.world_map_dock, self.image_view_dock, Qt.Orientation.Horizontal)
 
         self.details_dock = self._create_panel_dock("detailsDock", "Details", self._build_details_panel())
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.details_dock)
+
+        self.link_review = LinkReviewPanel()
+        self.link_review.link_selected.connect(self._select_constraint)
+        self.link_review.point_observation_interaction_started.connect(self._begin_point_observation_drag)
+        self.link_review.point_observation_changed.connect(self._on_review_point_changed)
+        self.link_review.point_observation_interaction_finished.connect(self._finish_review_point_drag)
+        for view in self.link_review.views:
+            view.resolution_changed.connect(self._schedule_detail_refresh)
+        self.link_review_dock = self._create_panel_dock("linkReviewDock", "Link Review", self.link_review)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.link_review_dock)
+        self.tabifyDockWidget(self.canvas_dock, self.link_review_dock)
+        self.link_review_dock.hide()
+        self.link_review_dock.visibilityChanged.connect(self._on_link_review_visibility)
 
         self._build_menus()
         self._build_toolbar()
@@ -624,15 +757,22 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("File")
-        for key in ("new_project", "open_project", "save_project", "save_project_as"):
+        for key in ("new_project", "open_project", "save_project", "save_project_as", "recover_project"):
             file_menu.addAction(self.shortcut_actions[key])
+        self.recent_projects_menu = file_menu.addMenu("Recent projects")
+        self.recent_projects_menu.setToolTipsVisible(True)
+        self.recent_projects_menu.aboutToShow.connect(self._refresh_recent_projects_menu)
+        self._refresh_recent_projects_menu()
+        file_menu.addAction(self.shortcut_actions["open_project_folder"])
         file_menu.addSeparator()
         file_menu.addAction(self.shortcut_actions["import_images"])
         file_menu.addAction(self.shortcut_actions["import_geojson"])
-        file_menu.addAction(self.shortcut_actions["export_images"])
-        file_menu.addAction(self.shortcut_actions["remove_image"])
+        file_menu.addAction(self.shortcut_actions["repair_images"])
         file_menu.addSeparator()
-        self.file_settings_menu = file_menu.addMenu("Settings")
+        file_menu.addAction(self.shortcut_actions["export_images"])
+        file_menu.addAction(self.shortcut_actions["cancel_export"])
+        file_menu.addAction(self.shortcut_actions["open_export_folder"])
+        file_menu.addSeparator()
         file_menu.addAction(self._register_shortcut_action("quit_app", "Exit", self.close))
 
         edit_menu = self.menuBar().addMenu("Edit")
@@ -652,9 +792,11 @@ class MainWindow(QMainWindow):
 
         image_menu = self.menuBar().addMenu("Image")
         image_menu.addAction(self.shortcut_actions["arrange_images"])
+        image_menu.addAction(self.shortcut_actions["remove_image"])
         image_menu.addSeparator()
         for key in ("simulate_alignment", "georeference", "align_georeference"):
             image_menu.addAction(self.shortcut_actions[key])
+        image_menu.addAction(self.shortcut_actions["solver_diagnostics"])
         image_menu.addSeparator()
         for key in ("alignment_settings", "georeference_settings"):
             image_menu.addAction(self.shortcut_actions[key])
@@ -671,6 +813,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.details_dock.toggleViewAction())
         view_menu.addAction(self.world_map_dock.toggleViewAction())
         view_menu.addAction(self.image_view_dock.toggleViewAction())
+        view_menu.addAction(self.link_review_dock.toggleViewAction())
         view_menu.addSeparator()
         reset_layout_action = QAction("Reset panel layout", self)
         reset_layout_action.triggered.connect(self.reset_panel_layout)
@@ -696,8 +839,6 @@ class MainWindow(QMainWindow):
         settings_menu.addSeparator()
         for key in ("alignment_settings", "georeference_settings"):
             settings_menu.addAction(self.shortcut_actions[key])
-        self.file_settings_menu.addAction(self.shortcut_settings_action)
-        self.file_settings_menu.addAction(self.appearance_action)
 
     TOOLBAR_INFO = {
         "new_project": ("new", "Start an empty project"),
@@ -773,6 +914,8 @@ class MainWindow(QMainWindow):
         return self.shortcut_actions[key].shortcut().toString(QKeySequence.SequenceFormat.NativeText)
 
     def _update_hints(self) -> None:
+        if hasattr(self, "link_review"):
+            self.link_review.setEnabled(not self._solver_running)
         if not hasattr(self, "hint_label") or not hasattr(self, "details_stack"):
             return
         project = self.project
@@ -788,6 +931,9 @@ class MainWindow(QMainWindow):
         linkable = len(project.control_points) > 1
 
         enabled = {
+            "solver_diagnostics": not self._solver_running,
+            "open_project_folder": self.project_path is not None,
+            "repair_images": has_images and not self._solver_running,
             "add_points": has_images or self.add_points_mode,
             "link_points": linkable or self.link_points_mode,
             "simulate_alignment": bool(project.constraints),
@@ -810,7 +956,9 @@ class MainWindow(QMainWindow):
             "remove_image": has_image_selection or has_vector_selection,
             "arrange_images": has_images,
             "fit_images": has_images,
-            "export_images": any(item.world_x is not None and item.world_y is not None for item in project.images),
+            "export_images": not self._export_running and any(item.world_x is not None and item.world_y is not None for item in project.images),
+            "cancel_export": self._export_running,
+            "open_export_folder": self._last_export_directory is not None,
         }
         for key, value in enabled.items():
             if key in (
@@ -858,37 +1006,114 @@ class MainWindow(QMainWindow):
         self._refresh_action_tooltips()
 
     def export_georeferenced_images(self) -> None:
-        from geostitch.export import FORMATS as EXPORT_FORMATS, export_project_images
+        from geostitch.export import FORMATS as EXPORT_FORMATS, plan_export
 
+        if self._export_running:
+            return
         georeferenced = [image for image in self.project.images if image.world_x is not None and image.world_y is not None]
         if not georeferenced:
             self._show_error("No images are georeferenced yet. Run the georeference solver first.")
             return
         labels = list(EXPORT_FORMATS)
-        label, accepted = QInputDialog.getItem(self, "Export georeferenced images", "Format:", labels, 0, False)
+        saved_format = str(self._settings.value("export/format", ""))
+        format_index = labels.index(saved_format) if saved_format in labels else 0
+        label, accepted = QInputDialog.getItem(self, "Export georeferenced images", "Format:", labels, format_index, False)
         if not accepted:
             return
-        directory = QFileDialog.getExistingDirectory(self, "Export to folder", self._last_directory())
+        directory = QFileDialog.getExistingDirectory(
+            self, "Export to folder", str(self._settings.value("export/directory", self._last_directory())),
+        )
         if not directory:
             return
-        self._remember_directory(Path(directory) / "_")
         try:
-            with self._progress("Exporting images…", 0) as update:
-                result = export_project_images(
-                    self.project,
-                    directory,
-                    EXPORT_FORMATS[label],
-                    progress=lambda done, total, name: update(
-                        done, total, f"Exporting {name} ({done + 1} of {total})" if name else None
-                    ),
-                )
+            items = plan_export(self.project, directory, EXPORT_FORMATS[label])
         except (OSError, ValueError) as error:
             self._show_error(f"Export failed: {error}")
             return
-        message = f"Exported {len(result.written)} of {len(georeferenced)} georeferenced images to {directory}."
+        conflicts = [path for item in items for path in item.outputs if path.exists()]
+        overwrite = False
+        if conflicts:
+            box = QMessageBox(QMessageBox.Icon.Warning, "Existing export files",
+                              f"{len(conflicts)} output file(s) already exist. Replace them?", parent=self)
+            box.setDetailedText("\n".join(str(path) for path in conflicts))
+            box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                return
+            overwrite = True
+        self._settings.setValue("export/format", label)
+        self._settings.setValue("export/directory", directory)
+        self._remember_directory(Path(directory) / "_")
+        self._start_export(Path(directory), EXPORT_FORMATS[label], overwrite=overwrite)
+
+    def _start_export(self, directory: Path, extension: str, *, overwrite: bool = False) -> None:
+        if self._export_running:
+            return
+        self._export_total = sum(image.world_x is not None and image.world_y is not None for image in self.project.images)
+        self._export_directory = directory
+        worker = ExportWorker(self)
+        worker.progress.connect(self._on_export_progress)
+        worker.finished.connect(self._on_export_finished)
+        self._export_worker = worker
+        self._export_running = True
+        dialog = QProgressDialog("Exporting images...", "Cancel", 0, self._export_total, self)
+        dialog.setWindowTitle("Export")
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.canceled.connect(self.cancel_export)
+        self._export_dialog = dialog
+        dialog.show()
+        self._update_hints()
+        try:
+            worker.start(self.project, directory, extension, overwrite=overwrite)
+        except (OSError, ValueError, RuntimeError) as error:
+            self._on_export_finished(None, str(error))
+
+    def cancel_export(self) -> None:
+        if self._export_worker is not None and self._export_running:
+            self._export_worker.cancel()
+            self.statusBar().showMessage("Export cancellation requested. The current image will finish first.")
+            if self._export_dialog is not None:
+                self._export_dialog.setLabelText("Cancelling after the current image...")
+
+    def _on_export_progress(self, done: int, total: int, name: str) -> None:
+        if not self._export_running:
+            return
+        text = f"Exporting {name} ({done + 1} of {total})" if name else f"Exported {done} of {total} images"
+        if self._export_dialog is not None:
+            self._export_dialog.setMaximum(total)
+            self._export_dialog.setValue(done)
+            self._export_dialog.setLabelText(text)
+        self.statusBar().showMessage(text)
+
+    def _on_export_finished(self, result, error: str) -> None:
+        directory = self._export_directory
+        self._export_running = False
+        if self._export_dialog is not None:
+            self._export_dialog.canceled.disconnect(self.cancel_export)
+            self._export_dialog.close()
+            self._export_dialog.deleteLater()
+            self._export_dialog = None
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
+        if result is not None and result.written:
+            self._last_export_directory = directory
+        self._update_hints()
+        if error:
+            self._show_error(f"Export failed: {error}")
+            return
+        state = "Export cancelled." if result.cancelled else "Export complete."
+        message = f"{state} Exported {len(result.written)} of {self._export_total} georeferenced images to {directory}."
         self.statusBar().showMessage(message)
         if result.failures:
             QMessageBox.warning(self, "Export", message + "\n\nFailed:\n" + "\n".join(result.failures))
+
+    def open_export_folder(self) -> None:
+        if self._last_export_directory is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._last_export_directory.resolve())))
 
     @contextmanager
     def _progress(self, text: str, maximum: int = 100):
@@ -943,6 +1168,20 @@ class MainWindow(QMainWindow):
         self._settings.sync()
 
     def closeEvent(self, event) -> None:
+        if self._export_running:
+            choice = QMessageBox.question(
+                self, "Export in progress", "Cancel the export? Close the window again after the current image finishes.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if choice == QMessageBox.StandardButton.Yes:
+                self.cancel_export()
+            event.ignore()
+            return
+        if not self._confirm_project_replacement():
+            event.ignore()
+            return
+        self._recovery_timer.stop()
+        self._clear_recovery()
         self._startup_timer.stop()
         self._startup_project = ""
         self._reset_image_loading()
@@ -1036,14 +1275,22 @@ class MainWindow(QMainWindow):
         selected_point_id = self._selected_point_id()
         canvas_state = self.project.canvas_state
         feedback = self._alignment_feedback
+        previous_paths = {image.id: image.path for image in self.project.images}
         self.project = Project.from_dict(snapshot)
         self.project.canvas_state = canvas_state
         self._alignment_feedback = feedback
         valid_image_ids = {image.id for image in self.project.images}
+        changed_paths = {image.id for image in self.project.images if previous_paths.get(image.id) != image.path}
+        if changed_paths:
+            self._reset_image_loading(background=True)
+            for image_id in changed_paths:
+                self._masked_pixmaps.pop(image_id, None)
         self._image_pixmaps = {
             image_id: pixmap for image_id, pixmap in self._image_pixmaps.items()
-            if image_id in valid_image_ids
+            if image_id in valid_image_ids and image_id not in changed_paths
         }
+        self._image_sizes = {image_id: size for image_id, size in self._image_sizes.items()
+                     if image_id in valid_image_ids and image_id not in changed_paths}
         if self.current_image_id not in valid_image_ids:
             self.current_image_id = self.project.images[0].id if self.project.images else None
         self.pending_constraint_point_id = None
@@ -1212,6 +1459,7 @@ class MainWindow(QMainWindow):
             if not image.map_visible:
                 continue
             pixmap, _error = self._display_pixmap_for_image(image)
+            size = self._image_size(image, pixmap)
             corners = None
             if pixmap and not pixmap.isNull() and image.world_x is not None and image.world_y is not None:
                 angle = radians(image.world_rotation)
@@ -1225,13 +1473,14 @@ class MainWindow(QMainWindow):
 
                 corners = [
                     to_mercator.transform(*to_world(0.0, 0.0)),
-                    to_mercator.transform(*to_world(float(pixmap.width()), 0.0)),
-                    to_mercator.transform(*to_world(0.0, float(pixmap.height()))),
+                    to_mercator.transform(*to_world(float(size.width()), 0.0)),
+                    to_mercator.transform(*to_world(0.0, float(size.height()))),
                 ]
             world_images.append({
                 "id": image.id,
                 "pixmap": pixmap,
                 "mercator_corners": corners,
+                "source_size": size,
                 "order": stack_order[image.id],
             })
         self.world_map.set_world_images(world_images, fit=fit)
@@ -1361,6 +1610,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select a control point before picking its coordinate from the map.")
             return
         self.world_map.set_pick_mode(enabled)
+        self._refresh_active_tool_hints()
         if enabled:
             self.statusBar().showMessage("Click the OSM map to assign coordinates to the selected control point.")
         else:
@@ -1390,9 +1640,154 @@ class MainWindow(QMainWindow):
         self._record_project_edit(before, "Set control point map coordinate")
         self._refresh_points(point.id)
         self._refresh_world_map()
+        self.pick_gcp_action.setChecked(False)
         self.statusBar().showMessage(f"Set '{point.name}' to {map_x:.6f}, {map_y:.6f} ({self.project.crs}).")
 
+    def _refresh_active_tool_hints(self) -> None:
+        if self.add_points_mode:
+            self.canvas_tool_hint.set_hint("ADD POINTS  Click an image to place a control point.")
+        elif self.link_points_mode and self.pending_constraint_point_id is not None:
+            self.canvas_tool_hint.set_hint("LINK POINTS  Choose the matching point in another image.")
+        elif self.link_points_mode:
+            self.canvas_tool_hint.set_hint("LINK POINTS  Choose two matching points in different images.")
+        else:
+            self.canvas_tool_hint.set_hint("")
+
+        if self.pick_gcp_action.isChecked():
+            self.map_tool_hint.set_hint("PICK MAP COORDINATE  Click the map to set this point's location.")
+        else:
+            self.map_tool_hint.set_hint("")
+
+        self.cancel_active_tool_action.setEnabled(
+            self.add_points_mode or self.link_points_mode or self.pick_gcp_action.isChecked()
+        )
+
+    def _cancel_canvas_tool(self) -> None:
+        if self.link_points_mode and self.pending_constraint_point_id is not None:
+            self.pending_constraint_point_id = None
+            self.pending_constraint_image_id = None
+            self.canvas.set_constraint_source(None)
+            self.statusBar().showMessage("Canceled the pending link. Link points is still on.")
+            self._refresh_active_tool_hints()
+        elif self.link_points_mode:
+            self.link_points_action.setChecked(False)
+        elif self.add_points_mode:
+            self.add_points_action.setChecked(False)
+
+    def _cancel_map_pick(self) -> None:
+        self.pick_gcp_action.setChecked(False)
+
+    def _cancel_active_tool(self) -> None:
+        focused_widget = QApplication.focusWidget()
+        if (
+            focused_widget is not None
+            and self.image_viewer._drawing
+            and (focused_widget is self.image_viewer or self.image_viewer.isAncestorOf(focused_widget))
+        ):
+            self.image_viewer.cancel_drawing()
+            return
+        if focused_widget is not None and (
+            focused_widget is self.world_map or self.world_map.isAncestorOf(focused_widget)
+        ) and self.pick_gcp_action.isChecked():
+            self._cancel_map_pick()
+        elif focused_widget is not None and (
+            focused_widget is self.canvas or self.canvas.isAncestorOf(focused_widget)
+        ) and (self.add_points_mode or self.link_points_mode):
+            self._cancel_canvas_tool()
+        elif self.pick_gcp_action.isChecked():
+            self._cancel_map_pick()
+        else:
+            self._cancel_canvas_tool()
+
+    def _refresh_layer_image_choices(self) -> None:
+        choices = tuple((image.id, image.name, image.path) for image in self.project.images)
+        if choices == self._layer_image_choices:
+            return
+        self._layer_image_choices = choices
+        combo = self.layer_image_filter
+        selected = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All images", None)
+        for image_id, name, path in choices:
+            combo.addItem(name, image_id)
+            combo.setItemData(combo.count() - 1, path, Qt.ItemDataRole.ToolTipRole)
+        combo.setCurrentIndex(max(0, combo.findData(selected)))
+        combo.blockSignals(False)
+
+    def clear_layer_filters(self) -> None:
+        for widget in (self.layer_search, self.layer_image_filter, self.layer_point_filter):
+            widget.blockSignals(True)
+        self.layer_search.clear()
+        self.layer_image_filter.setCurrentIndex(0)
+        self.layer_point_filter.setCurrentIndex(0)
+        for widget in (self.layer_search, self.layer_image_filter, self.layer_point_filter):
+            widget.blockSignals(False)
+        self._apply_layer_filter()
+
+    def _apply_layer_filter(self, *_args) -> None:
+        tree = self.image_list
+        query = self.layer_search.text()
+        status = self.layer_point_filter.currentData()
+        image_id = self.layer_image_filter.currentData()
+        active = bool(query.strip() or status != "all" or image_id is not None)
+        rows = [tree.topLevelItem(row) for row in range(tree.topLevelItemCount())]
+        if active and self._layer_filter_expanded is None:
+            self._layer_filter_expanded = {
+                item.item_id: item.isExpanded() for top in rows
+                for item in (top, *(top.child(index) for index in range(top.childCount())))
+            }
+        matches = match_layers(self.project, query, status, image_id)
+        blocked = tree.blockSignals(True)
+        try:
+            for top in rows:
+                top.setHidden(top.item_id not in (matches.vector_ids if top.kind == VECTOR_KIND else matches.image_ids))
+                for point_index in range(top.childCount()):
+                    point = top.child(point_index)
+                    point.setHidden(point.item_id not in matches.point_ids)
+                    for link_index in range(point.childCount()):
+                        link = point.child(link_index)
+                        link.setHidden((link.item_id, point.item_id) not in matches.link_rows)
+                    if active and query.strip() and not point.isHidden() and point.childCount():
+                        point.setExpanded(True)
+                if active and not top.isHidden() and top.childCount():
+                    top.setExpanded(True)
+            if not active and self._layer_filter_expanded is not None:
+                for top in rows:
+                    for item in (top, *(top.child(index) for index in range(top.childCount()))):
+                        item.setExpanded(self._layer_filter_expanded.get(item.item_id, item.isExpanded()))
+                self._layer_filter_expanded = None
+            tree.set_filter_active(active)
+            self.layer_filter_reset.setEnabled(active)
+        finally:
+            tree.blockSignals(blocked)
+        self._layer_filter_point_count = len(matches.point_ids)
+        self._layer_filter_layer_count = len(matches.image_ids) + len(matches.vector_ids)
+        self._update_layer_filter_summary()
+
+    def _update_layer_filter_summary(self) -> None:
+        if not hasattr(self, "layer_filter_summary"):
+            return
+        hidden_selected = set()
+        shown_selected = set()
+        for item in self.image_list.selected_rows():
+            identity = (item.kind, item.item_id)
+            ancestor = item
+            while ancestor is not None:
+                if ancestor.isHidden():
+                    hidden_selected.add(identity)
+                    break
+                ancestor = ancestor.parent()
+            else:
+                shown_selected.add(identity)
+        outside = len(hidden_selected - shown_selected)
+        text = f"{self._layer_filter_layer_count} layers | {self._layer_filter_point_count} of {len(self.project.control_points)} points"
+        if outside:
+            text += f" | {outside} selected outside filter"
+        self.layer_filter_summary.setText(text)
+
     def _refresh_layers(self, force: bool = False) -> None:
+        self._refresh_layer_image_choices()
         points_by_image: dict[str, list[GroundControlPoint]] = {}
         constraints_by_point: dict[str, list[PointConstraint]] = {}
         points_by_id = {point.id: point for point in self.project.control_points}
@@ -1413,7 +1808,8 @@ class MainWindow(QMainWindow):
             (
                 layer.id, layer.name, layer.visible, getattr(layer, "map_visible", None),
                 getattr(layer, "rest_locked", None),
-                                [(p.id, p.name, p.short_name, p.label, p.visible, p.map_visible, [observation.locked for observation in p.observations],
+                                                                [(p.id, p.name, p.short_name, p.label, p.visible, p.map_visible,
+                                                                    p.geographic_x is not None, p.geographic_y is not None, [observation.locked for observation in p.observations],
                                     [(link.id, link.name, link.first_point_id, link.second_point_id, link.kind)
                                      for link in constraints_by_point.get(p.id, [])])
                  for p in points_by_image.get(layer.id, [])],
@@ -1422,6 +1818,7 @@ class MainWindow(QMainWindow):
         ]
         if not force and signature == self._layers_signature:
             self._refresh_layer_errors()
+            self._apply_layer_filter()
             return
         self._layers_signature = signature
         tree = self.image_list
@@ -1492,6 +1889,7 @@ class MainWindow(QMainWindow):
         tree.blockSignals(False)
         self._sync_tree_points()
         self._refresh_layer_errors()
+        self._apply_layer_filter()
 
     def _refresh_layer_errors(self, current: bool | None = None) -> None:
         if not hasattr(self, "image_list"):
@@ -1529,6 +1927,15 @@ class MainWindow(QMainWindow):
         feedback = self._alignment_feedback
         current = feedback is not None and feedback.is_current(self.project)
         self._refresh_layer_errors(current)
+        if hasattr(self, "link_review_dock") and self.link_review_dock.isVisible():
+            self.link_review.setEnabled(not self._solver_running)
+            self.link_review.set_project(
+                self.project, feedback.result.constraint_residuals if feedback else {}, current,
+                self._detail_pixmap_for_image,
+                self._image_size,
+            )
+            self.link_review.select_link(self.selected_constraint_id)
+            self._schedule_detail_refresh()
         if not hasattr(self, "alignment_errors_button"):
             return
         matching_layout = feedback is not None and feedback.matches_layout(self.project, current)
@@ -1576,6 +1983,7 @@ class MainWindow(QMainWindow):
                         top.setExpanded(True)
                         child.setExpanded(True)
         tree.blockSignals(False)
+        self._update_layer_filter_summary()
 
     @staticmethod
     def _style_layer_lock(item: LayerItem, locked: bool, target: str) -> None:
@@ -1974,6 +2382,7 @@ class MainWindow(QMainWindow):
                 "visible": image.visible,
                 "rest_locked": image.rest_locked,
                 "pixmap": pixmap,
+                "source_size": self._image_size(image, pixmap),
                 "position_x": pose_x,
                 "position_y": pose_y,
                 "rotation": pose_rotation,
@@ -1996,6 +2405,13 @@ class MainWindow(QMainWindow):
             remaining = len(load_errors) - 3
             suffix = f"; and {remaining} more" if remaining > 0 else ""
             self.statusBar().showMessage(f"Could not display image(s): {shown_errors}{suffix}")
+
+    @staticmethod
+    def _read_preview_data(path: str | Path) -> tuple[QImage, str]:
+        return read_preview(path)
+
+    def _image_size(self, image, pixmap: QPixmap | None = None) -> QSize:
+        return self._image_sizes.get(image.id, pixmap.size() if pixmap is not None else QSize())
 
     @staticmethod
     def _read_image_pixmap(path: str | Path) -> tuple[QPixmap, str]:
@@ -2046,12 +2462,29 @@ class MainWindow(QMainWindow):
             self._loading_image_keys.add(key)
             self._image_loader.request(key, image.path)
             return QPixmap(), ""
-        pixmap, error = self._read_image_pixmap(image.path)
-        if not pixmap.isNull():
+        decoded, error = self._read_preview_data(image.path)
+        pixmap = QPixmap.fromImage(decoded)
+        if not decoded.isNull():
+            self._image_sizes[image.id] = source_size(decoded)
             self._image_pixmaps[image.id] = pixmap
         return pixmap, error
 
     def _reset_image_loading(self, background: bool = False) -> None:
+        self._tile_loader.clear_queued()
+        self._tile_pixmaps.clear()
+        self._tile_requested_keys.clear()
+        self._tile_loading_keys.clear()
+        self._tile_failures.clear()
+        self._tile_view_keys.clear()
+        if hasattr(self, "image_viewer"):
+            for view in (self.image_viewer, *self.link_review.views):
+                view.set_detail_tiles({})
+        self._detail_loader.clear_queued()
+        self._detail_pixmaps.clear()
+        self._detail_requested_ids.clear()
+        self._detail_loading_keys.clear()
+        self._detail_failures.clear()
+        self._detail_timer.stop()
         self._image_load_generation += 1
         self._image_loader.clear_queued()
         self._loading_image_keys.clear()
@@ -2070,9 +2503,184 @@ class MainWindow(QMainWindow):
         if image.isNull():
             self._image_load_errors[image_id] = error or "Could not decode image"
         else:
+            self._image_sizes[image_id] = source_size(image)
             self._image_pixmaps[image_id] = QPixmap.fromImage(image)
         if not self._image_refresh_timer.isActive():
             self._image_refresh_timer.start()
+
+    def _detail_pixmap_for_image(self, image) -> tuple[QPixmap, str]:
+        cached = self._detail_pixmaps.get(image.id)
+        return (cached, "") if cached is not None else self._pixmap_for_image(image)
+
+    def _schedule_detail_refresh(self, *_args) -> None:
+        if not self._detail_timer.isActive():
+            self._detail_timer.start(40)
+
+    def _refresh_detail_demand(self) -> None:
+        views = [self.image_viewer, *self.link_review.views]
+        wanted = []
+        allocated = 0
+        for view in views:
+            image_id = view._image_key
+            if not view.isVisible() or image_id is None or image_id in wanted:
+                continue
+            preview = self._image_pixmaps.get(image_id)
+            size = self._image_sizes.get(image_id)
+            if preview is None or preview.isNull() or size is None or preview.size() == size:
+                continue
+            density = max(size.width() / preview.width(), size.height() / preview.height())
+            density *= view.transform().m11() * view.viewport().devicePixelRatioF()
+            if density <= 1:
+                continue
+            cost = size.width() * size.height() * 4
+            if allocated + cost > self.DETAIL_CACHE_BYTES:
+                continue
+            wanted.append(image_id)
+            allocated += cost
+        desired = set(wanted)
+        detail_changed = desired != self._detail_requested_ids
+        if detail_changed:
+            self._detail_loader.clear_queued()
+            self._tile_loader.clear_queued()
+            self._detail_loading_keys.clear()
+            self._tile_loading_keys.clear()
+            self._detail_requested_ids = desired
+        removed = set(self._detail_pixmaps) - desired
+        for image_id in removed:
+            self._detail_pixmaps.pop(image_id, None)
+        for image_id in wanted:
+            if image_id in self._detail_pixmaps or image_id in self._detail_failures:
+                continue
+            image = next((image for image in self.project.images if image.id == image_id), None)
+            if image is None:
+                continue
+            key = (self._image_load_generation, image.id, image.path)
+            if key not in self._detail_loading_keys:
+                self._detail_loading_keys.add(key)
+                self._detail_loader.request(key, image.path)
+        if removed:
+            self._refresh_image_view()
+            self._refresh_alignment_feedback()
+        self._refresh_tile_demand(views, min(self.TILE_CACHE_BYTES, max(0, self.DETAIL_CACHE_BYTES - allocated)), detail_changed)
+
+    def _tile_key(self, image, region: QRect) -> tuple:
+        return (self._image_load_generation, image.id, image.path,
+                region.x(), region.y(), region.width(), region.height())
+
+    def _refresh_tile_demand(self, views: list[ImageViewer], budget: int, detail_changed: bool) -> None:
+        self._tile_budget = budget
+        candidates = {}
+        image_ids = set()
+        for view in views:
+            image_id = view._image_key
+            if not view.isVisible() or image_id is None or image_id in self._detail_requested_ids:
+                continue
+            preview = self._image_pixmaps.get(image_id)
+            size = self._image_sizes.get(image_id)
+            image = next((image for image in self.project.images if image.id == image_id), None)
+            if preview is None or preview.isNull() or size is None or image is None or preview.size() == size:
+                continue
+            density = max(size.width() / preview.width(), size.height() / preview.height())
+            if density * view.transform().m11() * view.viewport().devicePixelRatioF() <= 1:
+                continue
+            bounds = view.mapToScene(view.viewport().rect()).boundingRect()
+            regions = visible_tiles(size, bounds)
+            candidates[view] = [self._tile_key(image, region) for region in regions]
+            image_ids.add(image_id)
+        ordered = []
+        seen = set()
+        maximum = max((len(keys) for keys in candidates.values()), default=0)
+        for index in range(maximum):
+            for keys in candidates.values():
+                if index < len(keys) and keys[index] not in seen:
+                    seen.add(keys[index])
+                    ordered.append(keys[index])
+        selected = []
+        allocated = 0
+        for key in ordered:
+            cost = key[5] * key[6] * 4
+            if allocated + cost <= budget:
+                selected.append(key)
+                allocated += cost
+        desired = set(selected)
+        self._tile_view_keys = {view: [key for key in keys if key in desired] for view, keys in candidates.items()}
+        if desired != self._tile_requested_keys:
+            if not detail_changed:
+                self._tile_loader.clear_queued()
+                self._detail_loader.clear_queued()
+                self._tile_loading_keys.clear()
+                self._detail_loading_keys.clear()
+            self._tile_requested_keys = desired
+        self._trim_tile_cache(image_ids)
+        for key in selected:
+            if key in self._tile_pixmaps:
+                self._tile_pixmaps.move_to_end(key)
+                continue
+            if key not in self._tile_loading_keys and key not in self._tile_failures:
+                self._tile_loading_keys.add(key)
+                self._tile_loader.request(key, key[2], QRect(*key[3:]))
+        for image_id in self._detail_requested_ids:
+            if image_id in self._detail_pixmaps or image_id in self._detail_failures:
+                continue
+            image = next((image for image in self.project.images if image.id == image_id), None)
+            if image is None:
+                continue
+            key = (self._image_load_generation, image.id, image.path)
+            if key not in self._detail_loading_keys:
+                self._detail_loading_keys.add(key)
+                self._detail_loader.request(key, image.path)
+        self._apply_visible_tiles()
+
+    def _trim_tile_cache(self, image_ids: set[str] | None = None) -> None:
+        if image_ids is not None:
+            for key in list(self._tile_pixmaps):
+                if key[1] not in image_ids:
+                    self._tile_pixmaps.pop(key)
+        total = sum(pixmap.width() * pixmap.height() * 4 for pixmap in self._tile_pixmaps.values())
+        for key in list(self._tile_pixmaps):
+            if total <= self._tile_budget:
+                break
+            if key not in self._tile_requested_keys:
+                pixmap = self._tile_pixmaps.pop(key)
+                total -= pixmap.width() * pixmap.height() * 4
+
+    def _apply_visible_tiles(self) -> None:
+        for view in (self.image_viewer, *self.link_review.views):
+            keys = self._tile_view_keys.get(view, [])
+            tiles = {key[3:]: self._tile_pixmaps[key] for key in keys
+                     if key[1] == view._image_key and key in self._tile_pixmaps and view.isVisible()}
+            view.set_detail_tiles(tiles)
+
+    def _on_tile_loaded(self, key: tuple, image: QImage, error: str) -> None:
+        self._tile_loading_keys.discard(key)
+        if key not in self._tile_requested_keys or key[0] != self._image_load_generation:
+            return
+        record = next((image for image in self.project.images if image.id == key[1] and image.path == key[2]), None)
+        if record is None:
+            return
+        if image.isNull() or image.size() != QSize(key[5], key[6]) or source_size(image) != self._image_sizes.get(key[1]):
+            self._tile_failures.add(key)
+            return
+        self._tile_pixmaps[key] = QPixmap.fromImage(image)
+        self._tile_pixmaps.move_to_end(key)
+        self._trim_tile_cache()
+        self._apply_visible_tiles()
+
+    def _on_detail_loaded(self, key: tuple, image: QImage, error: str) -> None:
+        generation, image_id, path = key
+        self._detail_loading_keys.discard(key)
+        record = next((item for item in self.project.images if item.id == image_id and item.path == path), None)
+        if generation != self._image_load_generation or image_id not in self._detail_requested_ids or record is None:
+            return
+        if image.isNull():
+            self._detail_failures[image_id] = error or "Could not decode full-resolution image"
+            return
+        if image.size() != self._image_sizes.get(image_id):
+            self._detail_failures[image_id] = "Source dimensions changed; reload the image before reviewing it"
+            return
+        self._detail_pixmaps[image_id] = QPixmap.fromImage(image)
+        self._refresh_image_view()
+        self._refresh_alignment_feedback()
 
     def _refresh_loaded_images(self) -> None:
         self._refresh_canvas()
@@ -2158,6 +2766,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(6, 6, 6, 6)
         self.image_viewer = ImageViewer()
+        self.image_viewer.resolution_changed.connect(self._schedule_detail_refresh)
         self.mask_draw_button = self.image_viewer.draw_polygon_button
         self.mask_draw_button.toggled.connect(self._on_mask_draw_toggled)
         self.mask_clear_button = self.image_viewer.clear_polygon_button
@@ -2197,7 +2806,7 @@ class MainWindow(QMainWindow):
         cached = self._masked_pixmaps.get(image.id)
         if cached is not None and cached[0] == key and cached[1] is pixmap:
             return cached[2], error
-        masked = masked_pixmap(pixmap, image.mask_polygon, image.mask_mode)
+        masked = masked_pixmap(pixmap, image.mask_polygon, image.mask_mode, self._image_size(image, pixmap))
         self._masked_pixmaps[image.id] = (key, pixmap, masked)
         return masked, error
 
@@ -2219,7 +2828,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "image_viewer"):
             return
         image = self._current_image_record()
-        pixmap = self._pixmap_for_image(image)[0] if image is not None else None
+        pixmap = self._detail_pixmap_for_image(image)[0] if image is not None else None
         points = []
         if image is not None:
             for point in self.project.control_points:
@@ -2237,6 +2846,7 @@ class MainWindow(QMainWindow):
             {point.id for point in self.project.control_points
              if image is not None and (observation := point.observation_for(image.id)) is not None
              and observation.locked},
+            source_size=self._image_size(image, pixmap) if image is not None else None,
         )
         has_image = image is not None and pixmap is not None and not pixmap.isNull()
         widgets = (self.mask_mode_button, self.mask_enable_button, self.mask_clear_button, self.mask_draw_button)
@@ -2256,6 +2866,7 @@ class MainWindow(QMainWindow):
         self.mask_enable_button.setEnabled(has_image and len(image.mask_polygon) >= 3)
         self.mask_clear_button.setEnabled(has_image and bool(image.mask_polygon))
         self.image_view_dock.setWindowTitle(f"Image View · {image.name}" if image is not None else "Image View")
+        self._schedule_detail_refresh()
 
     def _refresh_mask_displays(self) -> None:
         self._refresh_canvas()
@@ -2387,7 +2998,8 @@ class MainWindow(QMainWindow):
 
     def _image_info_text(self, image) -> str:
         pixmap = self._image_pixmaps.get(image.id)
-        size = f"{pixmap.width()} x {pixmap.height()} px" if pixmap is not None and not pixmap.isNull() else "unknown size"
+        dimensions = self._image_size(image, pixmap)
+        size = f"{dimensions.width()} x {dimensions.height()} px" if dimensions.isValid() else "unknown size"
         pose_x, pose_y, pose_rotation, pose_scale = self._canvas_pose(image)
         lines = [
             image.path,
@@ -2573,6 +3185,27 @@ class MainWindow(QMainWindow):
     def _begin_point_observation_drag(self, _image_id: str, _point_id: str) -> None:
         self._begin_project_edit("Move control point")
 
+    def _on_link_review_visibility(self, visible: bool) -> None:
+        if visible and hasattr(self, "hint_label"):
+            self._refresh_alignment_feedback()
+        elif not visible:
+            for view in self.link_review.views:
+                view._finish_point_drag()
+            self.link_review.clear_images()
+        self._schedule_detail_refresh()
+
+    def _on_review_point_changed(self, image_id: str, point_id: str, x: float, y: float) -> None:
+        if self._solver_running or not isfinite(x) or not isfinite(y):
+            return
+        self._on_point_observation_changed(image_id, point_id, x, y)
+
+    def _finish_review_point_drag(self, _image_id: str, _point_id: str) -> None:
+        self._finish_project_edit()
+        self.link_review._displayed = None
+        self._refresh_canvas()
+        self._refresh_details()
+        self._refresh_map_points()
+
     def _on_point_observation_changed(self, image_id: str, point_id: str, x: float, y: float) -> None:
         point = self.project.point_by_id(point_id)
         observation = point.observation_for(image_id) if point else None
@@ -2611,6 +3244,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_active_point(None)
             self.instruction_label.setText("Use Add points to click control points onto images, then Link points to join matches.")
             self.statusBar().showMessage("Add points is off. Drag images to move them.")
+        self._refresh_active_tool_hints()
 
     def _set_link_points_mode(self, enabled: bool) -> None:
         if enabled and not any(point.observations for point in self.project.control_points):
@@ -2636,6 +3270,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_active_point("__continuous_add__" if self.add_points_mode else None)
             self.instruction_label.setText("Use Add points to click control points onto images, then Link points to join matches.")
             self.statusBar().showMessage("Link points is off.")
+        self._refresh_active_tool_hints()
 
     def _on_constraint_point_clicked(self, image_id: str, point_id: str) -> None:
         point = self.project.point_by_id(point_id)
@@ -2649,6 +3284,7 @@ class MainWindow(QMainWindow):
             self.canvas.set_constraint_source(point_id)
             image = next(item for item in self.project.images if item.id == image_id)
             self.statusBar().showMessage(f"First point: {point.name} in {image.name}. Click a point in another image.")
+            self._refresh_active_tool_hints()
             return
         if image_id == self.pending_constraint_image_id:
             self.statusBar().showMessage("Choose the matching point in a different image.")
@@ -2666,6 +3302,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_constraint_source(None)
         self._refresh_constraints()
         self._select_constraint(constraint.id)
+        self._refresh_active_tool_hints()
         self.statusBar().showMessage(f"Linked points. Choose the next first point to continue.")
 
     def _on_constraint_point_missed(self) -> None:
@@ -2958,7 +3595,8 @@ class MainWindow(QMainWindow):
             pixmap, _error = self._pixmap_for_image(image)
             if pixmap.isNull():
                 continue
-            bounds = QTransform().rotate(image.rotation).mapRect(QRectF(0, 0, pixmap.width(), pixmap.height()))
+            size = self._image_size(image, pixmap)
+            bounds = QTransform().rotate(image.rotation).mapRect(QRectF(0, 0, size.width(), size.height()))
             layout.append((image, bounds, bounds.width() * image.scale, bounds.height() * image.scale))
         if not layout:
             return
@@ -3015,12 +3653,14 @@ class MainWindow(QMainWindow):
             resolved_path = str(Path(path).expanduser().resolve())
             if resolved_path in known_image_paths:
                 continue
-            pixmap, error = self._read_image_pixmap(path)
+            decoded, error = self._read_preview_data(path)
+            pixmap = QPixmap.fromImage(decoded)
             if pixmap.isNull():
                 failures.append(f"{Path(path).name}: {error}")
                 continue
             image = self.project.add_image(path)
             self._image_pixmaps[image.id] = pixmap
+            self._image_sizes[image.id] = source_size(decoded)
             added_image_ids.add(image.id)
             known_image_paths.add(resolved_path)
         if not added_image_ids:
@@ -3144,6 +3784,7 @@ class MainWindow(QMainWindow):
         self.project.images = [item for item in self.project.images if item.id not in image_ids]
         for image_id in image_ids:
             self._image_pixmaps.pop(image_id, None)
+            self._image_sizes.pop(image_id, None)
         removed_point_ids = {point.id for point in self.project.control_points if point.image_id in image_ids}
         self.project.control_points = [
             point for point in self.project.control_points if point.id not in removed_point_ids
@@ -3175,6 +3816,8 @@ class MainWindow(QMainWindow):
         self._refresh_points()
 
     def new_project(self) -> None:
+        if not self._confirm_project_replacement():
+            return
         self._startup_project = ""
         self._startup_timer.stop()
         self._reset_image_loading()
@@ -3184,10 +3827,12 @@ class MainWindow(QMainWindow):
         self._georeference_result = None
         self._georeference_result_tolerance = None
         self._image_pixmaps.clear()
+        self._image_sizes.clear()
         self.project_path = None
         self.current_image_id = None
         self.selected_point_id = None
         self.selected_constraint_id = None
+        self._mark_project_saved()
         self._refresh_all()
         self.statusBar().showMessage("New project created.")
 
@@ -3199,9 +3844,54 @@ class MainWindow(QMainWindow):
         self._settings.setValue("last_directory", str(directory))
         self._settings.sync()
 
+    def repair_missing_images(self) -> None:
+        from geostitch.repair_dialog import ImageRepairDialog
+
+        if self._solver_running:
+            return
+        images = missing_images(self.project.images)
+        if not images:
+            self.statusBar().showMessage("All image files are available.")
+            return
+        dialog = ImageRepairDialog(images, self._last_directory(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._repair_image_paths(dialog.replacements())
+
+    def _repair_image_paths(self, replacements: dict[str, Path]) -> bool:
+        if self._solver_running or not replacements:
+            return False
+        before = self.project.to_dict()
+        try:
+            from PIL import Image
+
+            for path in replacements.values():
+                reader = QImageReader(str(path))
+                if not reader.canRead():
+                    with Image.open(path) as source:
+                        if source.width <= 0 or source.height <= 0:
+                            raise ValueError(f"Replacement image has invalid dimensions: {path}")
+            changed = apply_replacements(self.project.images, replacements)
+        except (OSError, ValueError) as error:
+            self._show_error(f"Could not repair image paths: {error}")
+            return False
+        if not changed:
+            return False
+        self._reset_image_loading(background=True)
+        for image_id in changed:
+            self._image_pixmaps.pop(image_id, None)
+            self._image_sizes.pop(image_id, None)
+            self._masked_pixmaps.pop(image_id, None)
+        self._record_project_edit(before, "Repair missing image paths")
+        self._refresh_all()
+        self._remember_directory(next(iter(replacements.values())))
+        remaining = len(missing_images(self.project.images))
+        self.statusBar().showMessage(f"Repaired {len(changed)} image path(s). {remaining} missing image(s) remain.")
+        return True
+
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open project", self._last_directory(), "GeoStitch project (*.gsp);;JSON files (*.json)"
+            self, "Open project", self._last_directory(),
+            "GeoStitch project (*.gsp);;Project backup (*.gsp.bak);;JSON files (*.json);;All files (*)"
         )
         if not path:
             return
@@ -3215,9 +3905,86 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError, TypeError) as error:
             if not quiet:
                 self._show_error(f"Could not open project: {error}")
+            self._offer_recovery(Path(path), ignore_source_age=True)
             return
-        self._remember_directory(path)
-        self._settings.setValue("last_project", str(Path(path).resolve()))
+        if not self._confirm_project_replacement():
+            return
+        self._replace_project(project, Path(path))
+        self._offer_recovery(Path(path))
+
+    def _recent_project_paths(self) -> list[Path]:
+        self._settings.sync()
+        saved = self._settings.value("recent_projects", [])
+        if isinstance(saved, str):
+            saved = [saved]
+        if not isinstance(saved, (list, tuple)):
+            return []
+        paths = []
+        seen = set()
+        for value in saved:
+            if not isinstance(value, str) or not value.strip() or "\x00" in value:
+                continue
+            try:
+                path = Path(value).expanduser().resolve()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            identity = normcase(str(path))
+            if identity not in seen:
+                seen.add(identity)
+                paths.append(path)
+            if len(paths) == self.RECENT_PROJECT_LIMIT:
+                break
+        return paths
+
+    def _remember_recent_project(self, path: Path) -> None:
+        path = path.expanduser().resolve()
+        identity = normcase(str(path))
+        paths = [path, *(entry for entry in self._recent_project_paths() if normcase(str(entry)) != identity)]
+        self._settings.setValue("recent_projects", [str(entry) for entry in paths[:self.RECENT_PROJECT_LIMIT]])
+        self._settings.sync()
+        self._refresh_recent_projects_menu()
+
+    def _refresh_recent_projects_menu(self) -> None:
+        menu = self.recent_projects_menu
+        menu.clear()
+        paths = self._recent_project_paths()
+        if not paths:
+            action = menu.addAction("No recent projects")
+            action.setEnabled(False)
+            return
+        for index, path in enumerate(paths, 1):
+            missing = " [Missing]" if not path.is_file() else ""
+            label = f"{index}. {path.name} ({path.parent}){missing}".replace("&", "&&")
+            action = menu.addAction(label)
+            action.setData(str(path))
+            action.setToolTip(str(path))
+            action.setStatusTip(str(path))
+            action.triggered.connect(lambda _checked=False, selected=str(path): self._open_project_path(selected))
+        menu.addSeparator()
+        menu.addAction("Clear recent projects", self.clear_recent_projects)
+
+    def clear_recent_projects(self) -> None:
+        self._settings.setValue("recent_projects", [])
+        self._settings.sync()
+        self._refresh_recent_projects_menu()
+
+    def open_project_folder(self) -> None:
+        if self.project_path is None:
+            return
+        directory = self.project_path.resolve().parent
+        if not directory.is_dir():
+            self._show_error(f"Project folder is no longer available: {directory}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory))):
+            self._show_error(f"Could not open project folder: {directory}")
+
+    def _replace_project(self, project: Project, path: Path | None) -> None:
+        self._startup_project = ""
+        self._startup_timer.stop()
+        self._startup_pending = False
+        if path is not None:
+            self._remember_directory(path)
+            self._settings.setValue("last_project", str(path.resolve()))
         self.undo_stack.clear()
         self._reset_image_loading(background=True)
         self.project = project
@@ -3225,14 +3992,18 @@ class MainWindow(QMainWindow):
         self._georeference_result_tolerance = None
         self._image_pixmaps.clear()
         self._masked_pixmaps.clear()
-        self.project_path = Path(path)
+        self._image_sizes.clear()
+        self.project_path = path
         self.current_image_id = project.images[0].id if project.images else None
         self.selected_point_id = None
         self.selected_constraint_id = None
+        self._mark_project_saved()
         self._refresh_all()
         self._clear_image_selection()
         self._refresh_points()
         self._restore_views()
+        if path is not None and path.is_file():
+            self._remember_recent_project(path)
         if self._loading_image_keys:
             self.statusBar().showMessage(f"Opened {path}. Loading {len(self._loading_image_keys)} image(s)...")
         else:
@@ -3247,26 +4018,32 @@ class MainWindow(QMainWindow):
     def save_project_as(self) -> None:
         self.save_current_project(save_as=True)
 
-    def save_current_project(self, _checked: bool = False, save_as: bool = False) -> None:
+    def save_current_project(self, _checked: bool = False, save_as: bool = False) -> bool:
+        destination = self.project_path
         if self.project_path is None or save_as:
             start = str(self.project_path) if self.project_path else self._last_directory()
             path, _ = QFileDialog.getSaveFileName(self, "Save project", start, "GeoStitch project (*.gsp)")
             if not path:
-                return
-            self._remember_directory(path)
-            self.project_path = Path(path)
-            if self.project_path.suffix.lower() != ".gsp":
-                self.project_path = self.project_path.with_suffix(".gsp")
+                return False
+            destination = Path(path)
+            if destination.suffix.lower() != ".gsp":
+                destination = destination.with_suffix(".gsp")
         try:
             self._update_crs()
             self.project.views = {"canvas": self.canvas.view_state(), "map": self.world_map.view_state()}
-            save_project(self.project, self.project_path)
-        except OSError as error:
+            save_project(self.project, destination)
+        except (OSError, ValueError, TypeError) as error:
             self._show_error(f"Could not save project: {error}")
-            return
+            return False
+        self.project_path = destination
+        self._remember_directory(destination)
+        self._mark_project_saved()
         self.statusBar().showMessage(f"Saved {self.project_path}")
         self._settings.setValue("last_project", str(self.project_path.resolve()))
+        self._remember_recent_project(self.project_path)
         self._update_title()
+        self._update_hints()
+        return True
 
     def _panel_under_focus_or_cursor(self):
         """The dock under the cursor, else the focused or last active one (menu use leaves the cursor outside any panel)."""
@@ -3282,7 +4059,8 @@ class MainWindow(QMainWindow):
             self._last_active_dock = dock
 
     def _all_docks(self) -> tuple[QDockWidget, ...]:
-        return (self.image_dock, self.canvas_dock, self.details_dock, self.world_map_dock, self.image_view_dock)
+        return (self.image_dock, self.canvas_dock, self.details_dock, self.world_map_dock,
+            self.image_view_dock, self.link_review_dock)
 
     def _dock_containing(self, widget) -> QDockWidget | None:
         for dock in self._all_docks():
@@ -3325,6 +4103,9 @@ class MainWindow(QMainWindow):
 
     def _fit_canvas(self) -> None:
         panel = self._panel_under_focus_or_cursor()
+        if panel is self.link_review_dock:
+            self.link_review.center_endpoints()
+            return
         if panel is self.image_view_dock:
             self.image_viewer.fit_image()
             return
@@ -3393,6 +4174,35 @@ class MainWindow(QMainWindow):
     def run_alignment(self) -> bool:
         return self._run_solver_pipeline(("alignment",))
 
+    def _solver_readiness(self, stages: tuple[str, ...] = ("alignment", "georeference")) -> list[ReadinessIssue]:
+        sizes = {image_id: (size.width(), size.height()) for image_id, size in self._image_sizes.items()}
+        return check_readiness(self.project, stages, sizes)
+
+    def show_solver_diagnostics(self) -> None:
+        from geostitch.readiness_dialog import ReadinessDialog
+
+        if self._solver_running:
+            return
+        dialog = ReadinessDialog(self.project, self._solver_readiness(), self)
+        dialog.affected_selected.connect(self._select_readiness_items)
+        dialog.exec()
+
+    def _select_readiness_items(self, issue: ReadinessIssue) -> None:
+        if self.add_points_mode:
+            self.add_points_action.setChecked(False)
+        if self.link_points_mode:
+            self.link_points_action.setChecked(False)
+        point_keys = [(point.image_id, point.id) for point in self.project.control_points if point.id in issue.point_ids]
+        self._on_canvas_area_selected(list(issue.image_ids), point_keys, [
+            index for index, constraint in enumerate(self.project.constraints) if constraint.id in issue.constraint_ids
+        ], False)
+        self.canvas.fit_items(set(issue.image_ids), set(issue.point_ids), {
+            index for index, constraint in enumerate(self.project.constraints) if constraint.id in issue.constraint_ids
+        })
+        self.canvas_dock.show()
+        self.canvas_dock.raise_()
+        self.statusBar().showMessage(issue.recommendation)
+
     def run_georeference(self) -> bool:
         return self._run_solver_pipeline(("georeference",))
 
@@ -3452,6 +4262,16 @@ class MainWindow(QMainWindow):
         self._solver_running = True
         self._update_hints()
         try:
+            readiness = self._solver_readiness(stages)
+            errors = [issue for issue in readiness if issue.severity == "Error" and not (
+                len(stages) > 1 and issue.stage == "georeference" and issue.code == "invalid_frame"
+            )]
+            if errors:
+                findings = "\n\n".join(f"{issue.stage.title()}: {issue.message}\n{issue.recommendation}" for issue in errors)
+                self._show_error(f"Cannot run solver:\n\n{findings}\n\nImage > Solver diagnostics can select affected items.")
+                return False
+            warnings = sum(issue.severity == "Warning" for issue in readiness)
+            warning_summary = f" | {warnings} readiness warning(s); see Image > Solver diagnostics" if warnings else ""
             candidate = Project.from_dict(self.project.to_dict())
             settings = {
                 "alignment": candidate.alignment_settings,
@@ -3459,6 +4279,18 @@ class MainWindow(QMainWindow):
             }
             results: dict[str, AlignmentResult | GeoreferenceResult] = {}
             for stage in stages:
+                if stage == "georeference" and "alignment" in results:
+                    geographic_readiness = check_readiness(candidate, ("georeference",), {
+                        image_id: (size.width(), size.height()) for image_id, size in self._image_sizes.items()
+                    })
+                    errors = [issue for issue in geographic_readiness if issue.severity == "Error"]
+                    if errors:
+                        findings = "\n\n".join(f"{issue.message}\n{issue.recommendation}" for issue in errors)
+                        self._show_error(f"Cannot georeference aligned candidate:\n\n{findings}")
+                        return False
+                    readiness = [issue for issue in readiness if issue.stage != "georeference"] + geographic_readiness
+                    warnings = sum(issue.severity == "Warning" for issue in readiness)
+                    warning_summary = f" | {warnings} readiness warning(s); see Image > Solver diagnostics" if warnings else ""
                 config = settings[stage]
                 result = self._compute_solver_result(stage, candidate, config)
                 results[stage] = result
@@ -3474,7 +4306,7 @@ class MainWindow(QMainWindow):
                         self._apply_solver_results(results, settings)
                     elif decision == "settings":
                         QTimer.singleShot(0, lambda chosen=stage: self.open_solver_settings(chosen))
-                    self.statusBar().showMessage(self._solver_summary(stage, result, "Target not reached"))
+                    self.statusBar().showMessage(self._solver_summary(stage, result, "Target not reached") + warning_summary)
                     return decision == "apply" and len(stages) == 1
                 if isinstance(result, AlignmentResult):
                     for image in candidate.images:
@@ -3484,12 +4316,12 @@ class MainWindow(QMainWindow):
             if not all(settings[stage].auto_apply for stage in stages):
                 self.statusBar().showMessage(" | ".join(
                     self._solver_summary(stage, results[stage], "Preview ready") for stage in stages
-                ))
+                ) + warning_summary)
                 return False
             self._apply_solver_results(results, settings)
             self.statusBar().showMessage(" | ".join(
                 self._solver_summary(stage, results[stage], "Applied") for stage in stages
-            ))
+            ) + warning_summary)
             return True
         except SolverCancelled:
             self.statusBar().showMessage("Solver cancelled. Existing transforms were retained.")
@@ -3624,9 +4456,139 @@ class MainWindow(QMainWindow):
         self._refresh_world_map(fit=True)
         self._update_hints()
 
+    def _project_document_state(self) -> dict:
+        state = self.project.to_dict()
+        state.pop("views", None)
+        state.pop("canvas_state", None)
+        return state
+
+    def _is_project_modified(self) -> bool:
+        return self._project_document_state() != self._saved_project_state
+
+    def _mark_project_saved(self) -> None:
+        self._saved_project_state = self._project_document_state()
+        self._clear_recovery()
+        self.undo_stack.setClean()
+        self._update_title()
+
+    def _clear_recovery(self) -> None:
+        try:
+            self._recovery_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._last_recovery_state = None
+
+    def _autosave_recovery(self) -> None:
+        if self._solver_running or self._edit_depth:
+            return
+        state = self._project_document_state()
+        if state == self._saved_project_state:
+            self._clear_recovery()
+            return
+        if state == self._last_recovery_state:
+            return
+        snapshot = Project.from_dict(self.project.to_dict())
+        snapshot.views = {"canvas": self.canvas.view_state(), "map": self.world_map.view_state()}
+        try:
+            save_recovery(snapshot, self._recovery_path, self.project_path)
+        except (OSError, ValueError, TypeError) as error:
+            self.statusBar().showMessage(f"Could not save recovery copy: {error}")
+            return
+        self._last_recovery_state = state
+        self._update_title()
+
+    def _recovery_candidates(self) -> list[tuple[Path, Project, Path | None]]:
+        candidates = []
+        for path in self._recovery_directory.glob("*.gsp"):
+            if path == self._recovery_path:
+                continue
+            try:
+                project, source = load_recovery(path)
+                candidates.append((path, project, source))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        return sorted(candidates, key=lambda entry: entry[0].stat().st_mtime, reverse=True)
+
+    def _offer_recovery(self, source_path: Path | None, *, ignore_source_age: bool = False) -> None:
+        if self._is_project_modified():
+            return
+        source_path = source_path.resolve() if source_path is not None else None
+        for path, project, source in self._recovery_candidates():
+            if source != source_path:
+                continue
+            if not ignore_source_age and source_path is not None and source_path.exists() and path.stat().st_mtime <= source_path.stat().st_mtime:
+                continue
+            choice = QMessageBox.question(
+                self, "Recover project", f"A recovery copy of {project.name} is available. Restore it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if choice == QMessageBox.StandardButton.Yes:
+                self._restore_recovery(path)
+            return
+
+    def recover_project(self) -> None:
+        candidates = self._recovery_candidates()
+        if not candidates:
+            self.statusBar().showMessage("No recovery copies are available.")
+            return
+        labels = [
+            f"{project.name} - {source or 'Unsaved project'} - {datetime.fromtimestamp(path.stat().st_mtime):%Y-%m-%d %H:%M:%S}"
+            for path, project, source in candidates
+        ]
+        label, accepted = QInputDialog.getItem(self, "Recover project", "Recovery copy:", labels, 0, False)
+        if accepted:
+            self._restore_recovery(candidates[labels.index(label)][0])
+
+    def _restore_recovery(self, path: Path) -> None:
+        try:
+            project, source = load_recovery(path)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            self._show_error(f"Could not restore recovery copy: {error}")
+            return
+        try:
+            saved = load_project(source) if source is not None else None
+        except (OSError, ValueError, KeyError, TypeError):
+            saved = None
+        if not self._confirm_project_replacement():
+            return
+        self._replace_project(project, source)
+        baseline = saved.to_dict() if saved is not None else {}
+        baseline.pop("views", None)
+        baseline.pop("canvas_state", None)
+        self._saved_project_state = baseline
+        self._update_title()
+        self._autosave_recovery()
+        if self._recovery_path.is_file():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.statusBar().showMessage("Recovery copy restored. Save the project to keep these changes.")
+
+    def _confirm_project_replacement(self) -> bool:
+        if self._solver_running:
+            self.statusBar().showMessage("Wait for the solver to finish or cancel it before closing the project.")
+            return False
+        if not self._is_project_modified():
+            return True
+        name = self.project_path.name if self.project_path else self.project.name
+        choice = QMessageBox.question(
+            self, "Unsaved changes", f"Save changes to {name}?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice == QMessageBox.StandardButton.Save:
+            return self.save_current_project()
+        if choice == QMessageBox.StandardButton.Discard:
+            self._clear_recovery()
+            return True
+        return False
+
     def _update_title(self) -> None:
         name = self.project_path.name if self.project_path else self.project.name
-        self.setWindowTitle(f"GeoStitch | {name}")
+        suffix = " *" if self._is_project_modified() else ""
+        self.setWindowTitle(f"GeoStitch | {name}{suffix}")
 
     def _show_error(self, message: str) -> None:
         QMessageBox.warning(self, "GeoStitch", message)
@@ -3644,6 +4606,12 @@ def main() -> int:
     # Qt's default 256 MB cap rejects large survey images before the Pillow fallback is tried.
     QImageReader.setAllocationLimit(2048)
     window = MainWindow()
+    arguments = app.arguments()
+    if len(arguments) > 1:
+        project_path = arguments[1]
+        window._startup_project = ""
+        window._startup_pending = False
+        QTimer.singleShot(0, lambda: window._open_project_path(project_path))
     window.show()
     return app.exec()
 

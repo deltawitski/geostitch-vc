@@ -21,6 +21,45 @@ def test_project_file_round_trip(tmp_path):
     assert restored.to_dict() == project.to_dict()
 
 
+def test_save_preserves_previous_project_as_backup(tmp_path):
+    path = tmp_path / "survey.gsp"
+    save_project(Project(name="Original"), path)
+    assert not path.with_suffix(".gsp.bak").exists()
+    save_project(Project(name="Updated"), path)
+    assert load_project(path).name == "Updated"
+    assert load_project(path.with_suffix(".gsp.bak")).name == "Original"
+    save_project(Project(name="Latest"), path)
+    assert load_project(path.with_suffix(".gsp.bak")).name == "Updated"
+
+
+def test_failed_atomic_replace_preserves_original_and_cleans_temporary_files(tmp_path, monkeypatch):
+    import geostitch.project_io as project_io
+
+    path = tmp_path / "survey.gsp"
+    save_project(Project(name="Original"), path)
+    replace = project_io.os.replace
+
+    def fail_project_replace(source, destination):
+        if destination == path:
+            raise OSError("Simulated replacement failure")
+        replace(source, destination)
+
+    monkeypatch.setattr(project_io.os, "replace", fail_project_replace)
+    with pytest.raises(OSError, match="replacement failure"):
+        save_project(Project(name="Updated"), path)
+    assert load_project(path).name == "Original"
+    assert load_project(path.with_suffix(".gsp.bak")).name == "Original"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_recovery_save_can_skip_previous_version_backup(tmp_path):
+    path = tmp_path / "recovery.gsp"
+    save_project(Project(name="First"), path, backup=False)
+    save_project(Project(name="Second"), path, backup=False)
+    assert load_project(path).name == "Second"
+    assert not path.with_suffix(".gsp.bak").exists()
+
+
 def test_project_round_trips_view_state(tmp_path):
     from geostitch.project_io import load_project, save_project
     from geostitch.models import Project
