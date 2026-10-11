@@ -69,6 +69,7 @@ from geostitch.layers import CONSTRAINT_KIND, IMAGE_KIND, POINT_KIND, VECTOR_KIN
 from geostitch.layer_filter import match_layers
 from geostitch.image_view import ImageViewer
 from geostitch.image_loader import ImageLoader
+from geostitch.image_import_worker import ImageImportWorker
 from geostitch.image_decode import read_preview, source_size
 from geostitch.image_tiles import TileLoader, visible_tiles
 from geostitch.export_worker import ExportWorker
@@ -264,6 +265,11 @@ class MainWindow(QMainWindow):
         self._solver_running = False
         self._export_running = False
         self._export_worker: ExportWorker | None = None
+        self._image_import_running = False
+        self._image_import_worker = ImageImportWorker(self)
+        self._image_import_worker.progress.connect(self._on_image_import_progress)
+        self._image_import_worker.finished.connect(self._on_image_import_finished)
+        self._queued_file_imports: list[tuple[str, list[str]]] = []
         self._export_dialog: QProgressDialog | None = None
         self._export_directory: Path | None = None
         self._last_export_directory: Path | None = None
@@ -319,6 +325,9 @@ class MainWindow(QMainWindow):
         self._vector_progress: dict[tuple, tuple[int, int]] = {}
         self._vector_failed: set[tuple] = set()
         self._vector_progress_visible = False
+        self._geojson_import_pending_keys: set[tuple] = set()
+        self._geojson_import_count = 0
+        self._geojson_import_failures: list[str] = []
         self._fit_vector_ids: set[str] = set()
         self._vector_loader = VectorLoader(self)
         self._vector_loader.progress.connect(self._on_vector_progress)
@@ -1570,21 +1579,47 @@ class MainWindow(QMainWindow):
         if key in self._vector_progress:
             self._vector_progress[key] = (done, max(1, total))
             self._update_vector_progress()
+            if key in self._geojson_import_pending_keys:
+                self.statusBar().showMessage(f"Loading {Path(key[0]).name} ({done} of {total})")
 
     def _on_vector_loaded(self, key: tuple, prepared) -> None:
         self._vector_progress.pop(key, None)
+        self._geojson_import_pending_keys.discard(key)
         self._vector_cache[key] = prepared
         self._refresh_world_vectors()
         for layer in self.project.vector_layers:
             if self._vector_key(layer) == key and layer.id in self._fit_vector_ids:
                 self._fit_vector_ids.discard(layer.id)
                 self.world_map.fit_world()
+        self._finish_geojson_import_status()
+        self._start_next_file_import()
 
     def _on_vector_failed(self, key: tuple, message: str) -> None:
         self._vector_progress.pop(key, None)
+        was_imported = key in self._geojson_import_pending_keys
+        self._geojson_import_pending_keys.discard(key)
         self._vector_failed.add(key)
         self._update_vector_progress()
-        self.statusBar().showMessage(f"Could not load '{Path(key[0]).name}' for the world map: {message}")
+        failure = f"{Path(key[0]).name}: {message}"
+        if was_imported:
+            self._geojson_import_failures.append(failure)
+            self._finish_geojson_import_status()
+        else:
+            self.statusBar().showMessage(f"Could not load '{Path(key[0]).name}' for the world map: {message}")
+            self._finish_geojson_import_status()
+        self._start_next_file_import()
+
+    def _finish_geojson_import_status(self) -> None:
+        if self._geojson_import_pending_keys or self._vector_progress or not self._geojson_import_count:
+            return
+        message = f"Imported {self._geojson_import_count} GeoJSON layer(s) to the world map."
+        if self._geojson_import_failures:
+            message += " Could not load: " + "; ".join(self._geojson_import_failures[:3])
+            if len(self._geojson_import_failures) > 3:
+                message += f"; and {len(self._geojson_import_failures) - 3} more"
+        self.statusBar().showMessage(message)
+        self._geojson_import_count = 0
+        self._geojson_import_failures.clear()
 
     def _image_world_point(self, image, pixel_x: float, pixel_y: float) -> tuple[float, float]:
         mapping = image.world_mapping
@@ -3817,15 +3852,60 @@ class MainWindow(QMainWindow):
         self._import_image_paths(paths)
 
     def _import_image_paths(self, paths: list[str]) -> None:
-        before = self._begin_project_edit("Import images")
-        added_image_ids = set()
+        if self._image_import_running or self._vector_progress:
+            self._queue_file_import("images", paths)
+            return
         known_image_paths = {image.path for image in self.project.images}
-        failures = []
+        pending_paths = []
         for path in paths:
             resolved_path = str(Path(path).expanduser().resolve())
             if resolved_path in known_image_paths:
                 continue
-            decoded, error = self._read_preview_data(path)
+            known_image_paths.add(resolved_path)
+            pending_paths.append(path)
+        if not pending_paths:
+            self.statusBar().showMessage("No new images to import.")
+            return
+        self._image_import_running = True
+        bar = self.statusBar()
+        bar.showMessage(f"Importing {len(pending_paths)} image(s)...")
+        bar.begin_progress(len(pending_paths))
+        try:
+            self._image_import_worker.start(pending_paths, self._read_preview_data)
+        except (RuntimeError, ValueError) as error:
+            self._image_import_running = False
+            bar.end_progress()
+            bar.showMessage(f"Could not start image import: {error}")
+            self._start_next_file_import()
+
+    def _queue_file_import(self, kind: str, paths: list[str]) -> None:
+        if self._queued_file_imports and self._queued_file_imports[-1][0] == kind:
+            self._queued_file_imports[-1][1].extend(paths)
+        else:
+            self._queued_file_imports.append((kind, list(paths)))
+
+    def _start_next_file_import(self) -> None:
+        if self._image_import_running or self._vector_progress or not self._queued_file_imports:
+            return
+        kind, paths = self._queued_file_imports.pop(0)
+        if kind == "images":
+            self._import_image_paths(paths)
+        else:
+            self._import_geojson_paths(paths)
+
+    def _on_image_import_progress(self, done: int, total: int, name: str) -> None:
+        if not self._image_import_running:
+            return
+        self.statusBar().set_progress(done)
+        self.statusBar().showMessage(f"Importing {name} ({done} of {total})")
+
+    def _on_image_import_finished(self, results: list[tuple[str, QImage, str]]) -> None:
+        self._image_import_running = False
+        self.statusBar().end_progress()
+        self._begin_project_edit("Import images")
+        added_image_ids = set()
+        failures = []
+        for path, decoded, error in results:
             pixmap = QPixmap.fromImage(decoded)
             if pixmap.isNull():
                 failures.append(f"{Path(path).name}: {error}")
@@ -3834,11 +3914,11 @@ class MainWindow(QMainWindow):
             self._image_pixmaps[image.id] = pixmap
             self._image_sizes[image.id] = source_size(decoded)
             added_image_ids.add(image.id)
-            known_image_paths.add(resolved_path)
         if not added_image_ids:
             message = "No images imported. " + "; ".join(failures[:3]) if failures else "No new images to import."
             self.statusBar().showMessage(message)
             self._finish_project_edit()
+            self._start_next_file_import()
             return
         self._refresh_images()
         self.arrange_images()
@@ -3849,6 +3929,7 @@ class MainWindow(QMainWindow):
                 message += f"; and {len(failures) - 3} more"
         self.statusBar().showMessage(message)
         self._finish_project_edit()
+        self._start_next_file_import()
 
     GEOJSON_EXTENSIONS = {".geojson", ".json"}
 
@@ -3873,8 +3954,12 @@ class MainWindow(QMainWindow):
             self._import_geojson_paths(vectors)
 
     def _import_geojson_paths(self, paths: list[str]) -> None:
+        if self._image_import_running or self._vector_progress:
+            self._queue_file_import("geojson", paths)
+            return
         before = self._begin_project_edit("Import GeoJSON layers")
         added = 0
+        added_layers = []
         failures = []
         for path in paths:
             if not Path(path).is_file():
@@ -3883,18 +3968,31 @@ class MainWindow(QMainWindow):
             layer = VectorLayer.from_path(path)
             self.project.vector_layers.append(layer)
             self._fit_vector_ids.add(layer.id)
+            added_layers.append(layer)
             added += 1
         if not added:
             self.statusBar().showMessage("No GeoJSON imported. " + "; ".join(failures[:3]))
             self._finish_project_edit()
+            self._start_next_file_import()
             return
         self._refresh_layers(force=True)
         self._refresh_world_map(fit=True)
         message = f"Imported {added} GeoJSON layer(s) to the world map."
         if failures:
             message += " Skipped: " + "; ".join(failures[:3])
-        self.statusBar().showMessage(message)
+        pending_keys = {
+            self._vector_key(layer) for layer in added_layers
+            if self._vector_key(layer) in self._vector_progress
+        }
+        if pending_keys:
+            self._geojson_import_pending_keys.update(pending_keys)
+            self._geojson_import_count += added
+            self._geojson_import_failures.extend(failures)
+            self.statusBar().showMessage("Loading GeoJSON layers for the world map...")
+        else:
+            self.statusBar().showMessage(message)
         self._finish_project_edit()
+        self._start_next_file_import()
 
     @classmethod
     def _local_file_paths(cls, mime_data) -> list[str]:
@@ -5123,6 +5221,9 @@ class MainWindow(QMainWindow):
     def _confirm_project_replacement(self) -> bool:
         if self._solver_running:
             self.statusBar().showMessage("Wait for the solver to finish or cancel it before closing the project.")
+            return False
+        if self._image_import_running:
+            self.statusBar().showMessage("Wait for image import to finish before closing or replacing the project.")
             return False
         if not self._is_project_modified():
             return True

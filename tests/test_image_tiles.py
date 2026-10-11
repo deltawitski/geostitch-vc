@@ -106,7 +106,7 @@ def test_transparent_native_tile_does_not_double_blend_preview():
         view.close()
 
 
-def test_real_oversized_image_loads_visible_tiles_on_worker(tmp_path, monkeypatch):
+def test_real_oversized_image_loads_visible_tiles_on_worker(tmp_path, monkeypatch, wait_for_image_import):
     from geostitch.app import MainWindow
     import geostitch.image_tiles as tiles_module
 
@@ -126,6 +126,7 @@ def test_real_oversized_image_loads_visible_tiles_on_worker(tmp_path, monkeypatc
     window.DETAIL_CACHE_BYTES = 2 * 512 * 512 * 4
     try:
         window._import_image_paths([str(path)])
+        wait_for_image_import(window)
         image = window.project.images[0]
         window._on_canvas_image_selected(image.id)
         window._mark_project_saved()

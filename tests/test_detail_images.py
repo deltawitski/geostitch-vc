@@ -151,7 +151,7 @@ def test_detail_decode_failure_does_not_remove_usable_preview(window):
     assert len(requests) == before
 
 
-def test_real_native_decoder_upgrades_visible_view_without_project_edits(tmp_path, monkeypatch):
+def test_real_native_decoder_upgrades_visible_view_without_project_edits(tmp_path, monkeypatch, wait_for_image_import):
     from PIL import Image
 
     app = QApplication.instance() or QApplication([])
@@ -169,6 +169,7 @@ def test_real_native_decoder_upgrades_visible_view_without_project_edits(tmp_pat
     window = MainWindow(QSettings(str(tmp_path / "real.ini"), QSettings.Format.IniFormat))
     try:
         window._import_image_paths([str(path)])
+        wait_for_image_import(window)
         image = window.project.images[0]
         assert window._image_pixmaps[image.id].width() == 2048
         window._on_canvas_image_selected(image.id)

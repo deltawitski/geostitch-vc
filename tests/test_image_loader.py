@@ -51,3 +51,44 @@ def test_image_loader_reports_decode_errors():
     wait_for_results(app, results)
     assert results[0][1].isNull()
     assert results[0][2] == "missing image"
+
+
+def test_main_window_image_import_runs_in_background_with_status_progress(tmp_path, monkeypatch):
+    from PySide6.QtCore import QSettings
+    from geostitch.app import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(QSettings(str(tmp_path / "import.ini"), QSettings.Format.IniFormat))
+    ui_thread = threading.get_ident()
+    started, release = threading.Event(), threading.Event()
+    decode_threads = []
+
+    def decode(_path):
+        decode_threads.append(threading.get_ident())
+        started.set()
+        if not release.wait(3):
+            raise OSError("Test decoder timed out")
+        return QImage(20, 10, QImage.Format.Format_RGB32), ""
+
+    monkeypatch.setattr(window, "_read_preview_data", decode)
+    window.show()
+    try:
+        window._import_image_paths([str(tmp_path / "image.png")])
+        assert started.wait(2)
+        assert window._image_import_running
+        assert window.statusBar().progress_bar.isVisible()
+        assert not window.project.images
+        assert decode_threads[0] != ui_thread
+
+        release.set()
+        deadline = monotonic() + 3
+        while window._image_import_running and monotonic() < deadline:
+            app.processEvents()
+        assert not window._image_import_running
+        assert len(window.project.images) == 1
+        assert window.statusBar().progress_bar.value() == 1
+        assert not window.statusBar().progress_bar.isVisible()
+        assert "Imported 1 image" in window.statusBar().currentMessage()
+    finally:
+        release.set()
+        window.close()

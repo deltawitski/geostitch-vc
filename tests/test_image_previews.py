@@ -154,7 +154,7 @@ def test_preview_arrangement_and_world_footprints_use_original_size(tmp_path):
         window.close()
 
 
-def test_preview_import_does_not_reduce_export_resolution(tmp_path, monkeypatch):
+def test_preview_import_does_not_reduce_export_resolution(tmp_path, monkeypatch, wait_for_image_import):
     from PIL import Image
     from geostitch.app import MainWindow
     from geostitch.image_decode import read_preview
@@ -167,6 +167,7 @@ def test_preview_import_does_not_reduce_export_resolution(tmp_path, monkeypatch)
     monkeypatch.setattr(window, "_read_preview_data", lambda path: read_preview(path, 128))
     try:
         window._import_image_paths([str(path)])
+        wait_for_image_import(window)
         image = window.project.images[0]
         assert window._image_pixmaps[image.id].width() <= 128
         assert window._image_sizes[image.id] == QSize(1200, 800)

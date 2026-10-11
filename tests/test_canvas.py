@@ -935,7 +935,7 @@ def test_link_points_tool_creates_multiple_cross_image_constraints(tmp_path):
     window.close()
 
 
-def test_dropping_multiple_images_imports_them_into_near_square_grid(tmp_path):
+def test_dropping_multiple_images_imports_them_into_near_square_grid(tmp_path, wait_for_image_import):
     app = QApplication.instance() or QApplication([])
     paths = []
     for index in range(5):
@@ -994,6 +994,7 @@ def test_dropping_multiple_images_imports_them_into_near_square_grid(tmp_path):
     window.dropEvent(window_drop)
 
     assert window_drop.isAccepted()
+    wait_for_image_import(window)
     assert len(window.project.images) == 5
     positions = [(round(image.position_x), round(image.position_y)) for image in window.project.images]
     assert len({x for x, _y in positions}) == 3
@@ -1006,7 +1007,7 @@ def test_dropping_multiple_images_imports_them_into_near_square_grid(tmp_path):
     window.close()
 
 
-def test_import_supports_qt_reader_formats_omitted_from_old_filter(tmp_path):
+def test_import_supports_qt_reader_formats_omitted_from_old_filter(tmp_path, wait_for_image_import):
     app = QApplication.instance() or QApplication([])
     svg_path = tmp_path / "diagram.svg"
     svg_path.write_text(
@@ -1021,6 +1022,7 @@ def test_import_supports_qt_reader_formats_omitted_from_old_filter(tmp_path):
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
 
     window._import_image_paths([str(svg_path), str(mislabeled_path)])
+    wait_for_image_import(window)
 
     assert len(window.project.images) == 2
     sizes = {window.canvas._layers[image.id].pixmap().width() for image in window.project.images}
@@ -1028,13 +1030,14 @@ def test_import_supports_qt_reader_formats_omitted_from_old_filter(tmp_path):
     window.close()
 
 
-def test_unreadable_supported_extension_is_skipped_with_error_status(tmp_path):
+def test_unreadable_supported_extension_is_skipped_with_error_status(tmp_path, wait_for_image_import):
     app = QApplication.instance() or QApplication([])
     invalid_path = tmp_path / "broken.png"
     invalid_path.write_bytes(b"not actually a png")
     window = MainWindow(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
 
     window._import_image_paths([str(invalid_path)])
+    wait_for_image_import(window)
 
     assert not window.project.images
     assert "broken.png" in window.statusBar().currentMessage()

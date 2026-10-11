@@ -1,6 +1,22 @@
 import pytest
 
 
+@pytest.fixture
+def wait_for_image_import():
+    from time import monotonic
+
+    from PySide6.QtWidgets import QApplication
+
+    def wait(window):
+        app = QApplication.instance()
+        deadline = monotonic() + 5
+        while window._image_import_running and monotonic() < deadline:
+            app.processEvents()
+        assert not window._image_import_running
+
+    return wait
+
+
 @pytest.fixture(autouse=True)
 def discard_unsaved_projects_during_test_cleanup(monkeypatch, request):
     from geostitch.app import MainWindow
