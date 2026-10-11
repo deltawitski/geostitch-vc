@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PIL import Image
 from PySide6.QtCore import QSettings, QTimer
-from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QInputDialog, QMessageBox
 
 from geostitch.app import MainWindow
 
@@ -126,6 +126,7 @@ def test_existing_output_requires_confirmation(window, tmp_path, monkeypatch, re
     started = []
     prompts = []
     monkeypatch.setattr(QInputDialog, "getItem", lambda *args: ("PNG + world file (.png/.pgw)", True))
+    monkeypatch.setattr("geostitch.export_grid_dialog.ExportGridDialog.exec", lambda self: QDialog.DialogCode.Accepted)
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args: str(directory))
 
     def confirm(box):
@@ -140,6 +141,7 @@ def test_existing_output_requires_confirmation(window, tmp_path, monkeypatch, re
     assert bool(started) is replace
     if replace:
         assert started[0][1]["overwrite"]
+        assert started[0][1]["grid_options"]["output_crs"].to_epsg() == 3857
     assert existing.read_text() == "Existing metadata"
 
 

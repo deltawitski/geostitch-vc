@@ -12,12 +12,13 @@ class _ExportSignals(QObject):
 
 
 class _ExportJob(QRunnable):
-    def __init__(self, project: Project, directory: Path, extension: str, overwrite: bool):
+    def __init__(self, project: Project, directory: Path, extension: str, overwrite: bool, grid_options: dict):
         super().__init__()
         self.project = project
         self.directory = directory
         self.extension = extension
         self.overwrite = overwrite
+        self.grid_options = dict(grid_options)
         self.cancelled = Event()
         self.signals = _ExportSignals()
 
@@ -27,7 +28,7 @@ class _ExportJob(QRunnable):
 
             result = export_project_images(
                 self.project, self.directory, self.extension, self.signals.progress.emit,
-                cancelled=self.cancelled.is_set, overwrite=self.overwrite,
+                cancelled=self.cancelled.is_set, overwrite=self.overwrite, **self.grid_options,
             )
             error = ""
         except Exception as exception:
@@ -46,11 +47,14 @@ class ExportWorker(QObject):
         super().__init__(parent)
         self._job: _ExportJob | None = None
 
-    def start(self, project: Project, directory: Path, extension: str, *, overwrite: bool = False) -> None:
+    def start(
+        self, project: Project, directory: Path, extension: str, *, overwrite: bool = False,
+        grid_options: dict | None = None,
+    ) -> None:
         if self._job is not None:
             raise RuntimeError("An export is already running.")
         snapshot = Project.from_dict(project.to_dict())
-        self._job = _ExportJob(snapshot, directory, extension, overwrite)
+        self._job = _ExportJob(snapshot, directory, extension, overwrite, grid_options or {})
         self._job.signals.progress.connect(self._progress)
         self._job.signals.finished.connect(self._finished)
         QThreadPool.globalInstance().start(self._job)

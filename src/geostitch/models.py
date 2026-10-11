@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from math import isfinite
+from math import atan2, degrees, hypot, isfinite, isclose
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from geostitch.transforms import MatrixTransform, similarity_mapping
+from geostitch.mapping import ImageMapping
+from geostitch.warp import WarpTransform
 
 if TYPE_CHECKING:
     from geostitch.alignment_feedback import AlignmentFeedback
@@ -36,14 +39,263 @@ class ImageRecord:
     visible: bool = True
     map_visible: bool = True
     rest_locked: bool = False
+    source_dimensions: tuple[int, int] | None = None
+    rest_intrinsic: MatrixTransform | None = None
+    aligned_intrinsic: MatrixTransform | None = None
+    aligned_warp: WarpTransform | None = None
+    native_world_mapping: ImageMapping | None = None
+
+    def __post_init__(self) -> None:
+        if self.source_dimensions is not None:
+            if not isinstance(self.source_dimensions, (list, tuple)) or len(self.source_dimensions) != 2 or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in self.source_dimensions
+            ):
+                raise ValueError("Image source dimensions must be two positive integers.")
+            self.source_dimensions = tuple(self.source_dimensions)
+        for name, matrix in (("rest", self.rest_intrinsic), ("aligned", self.aligned_intrinsic)):
+            if matrix is not None:
+                self._validate_layout_mapping(matrix)
+                if (self.position_x if name == "rest" else self.aligned_x) is None:
+                    raise ValueError("An intrinsic layout mapping requires an available outer pose.")
+        if self.aligned_warp is not None:
+            if not isinstance(self.aligned_warp, WarpTransform) or self.source_dimensions is None:
+                raise ValueError("An aligned TPS mapping requires a validated warp and known source dimensions.")
+            if self.aligned_intrinsic is not None or self.aligned_x is None:
+                raise ValueError("An aligned TPS mapping cannot also use an intrinsic matrix mapping.")
+            if not all(self.aligned_warp.supports((
+                (0.0, 0.0), (float(self.source_dimensions[0]), 0.0),
+                (float(self.source_dimensions[0]), float(self.source_dimensions[1])),
+                (0.0, float(self.source_dimensions[1])),
+            ))):
+                raise ValueError("Aligned TPS support must cover the complete source image domain.")
+        if self.native_world_mapping is not None:
+            self._validate_native_world_mapping(self.native_world_mapping)
+
+    def _validate_layout_mapping(self, mapping: MatrixTransform) -> None:
+        if not isinstance(mapping, MatrixTransform):
+            raise ValueError("Layout mappings require validated matrix transforms.")
+        if not mapping.is_affine and self.source_dimensions is None:
+            raise ValueError("Projective image mappings require known source dimensions.")
+        if self.source_dimensions is not None:
+            mapping.domain_bounds(*self.source_dimensions)
+
+    def _validate_native_world_mapping(self, record: ImageMapping) -> None:
+        if not isinstance(record, ImageMapping) or record.target_frame != "native_crs":
+            raise ValueError("A native world mapping must target its declared CRS.")
+        if self.source_dimensions is not None and record.source_size not in (None, self.source_dimensions):
+            raise ValueError("Native world mapping dimensions disagree with the image.")
+
+    def ensure_native_world_mapping(self, crs: str) -> None:
+        mapping = self.world_mapping
+        if mapping is None:
+            self.native_world_mapping = None
+        elif self.native_world_mapping is None:
+            self.native_world_mapping = ImageMapping(mapping, "native_crs", crs)
+
+    def set_layout_mapping(self, mapping: MatrixTransform | WarpTransform, *, aligned: bool = False) -> None:
+        if isinstance(mapping, WarpTransform):
+            if not aligned or self.source_dimensions is None:
+                raise ValueError("TPS mappings are supported only for aligned layouts with known source dimensions.")
+            base = mapping.base_mapping
+            if base.model == "similarity":
+                pose = base.to_similarity()
+            else:
+                origin_x, origin_y = base.map_point(0.0, 0.0)
+                a, _b, d, _e = base.jacobian(0.0, 0.0)
+                pose = (origin_x, origin_y, degrees(atan2(d, a)), hypot(a, d))
+            self.aligned_x, self.aligned_y, self.aligned_rotation, self.aligned_scale = pose
+            self.aligned_intrinsic = None
+            self.aligned_warp = mapping
+            return
+        self._validate_layout_mapping(mapping)
+        if mapping.model == "similarity":
+            pose = mapping.to_similarity()
+            intrinsic = None
+        else:
+            origin_x, origin_y = mapping.map_point(0, 0)
+            pose = (origin_x, origin_y, 0.0, 1.0)
+            intrinsic = similarity_mapping((-origin_x, -origin_y, 0, 1)).compose(mapping)
+        if aligned:
+            self.aligned_x, self.aligned_y, self.aligned_rotation, self.aligned_scale = pose
+            self.aligned_intrinsic = intrinsic
+            self.aligned_warp = None
+        else:
+            self.position_x, self.position_y, self.rotation, self.scale = pose
+            self.rest_intrinsic = intrinsic
 
     @property
     def has_alignment(self) -> bool:
         return self.aligned_x is not None
 
     @property
+    def rest_mapping(self) -> MatrixTransform | None:
+        if self.position_x is None:
+            return None
+        pose = similarity_mapping((self.position_x, self.position_y, self.rotation, self.scale))
+        return pose.compose(self.rest_intrinsic) if self.rest_intrinsic is not None else pose
+
+    @property
+    def aligned_mapping(self) -> MatrixTransform | WarpTransform | None:
+        if self.aligned_x is None:
+            return None
+        if self.aligned_warp is not None:
+            return self.aligned_warp
+        pose = similarity_mapping((self.aligned_x, self.aligned_y, self.aligned_rotation, self.aligned_scale))
+        return pose.compose(self.aligned_intrinsic) if self.aligned_intrinsic is not None else pose
+
+    @property
+    def world_mapping(self) -> MatrixTransform | None:
+        if self.world_x is None or self.world_y is None:
+            return None
+        return similarity_mapping((self.world_x, self.world_y, self.world_rotation, self.world_scale), True)
+
+    @property
     def mask_active(self) -> bool:
         return self.mask_enabled and len(self.mask_polygon) >= 3
+
+    def to_dict(self, crs: str) -> dict[str, Any]:
+        values = vars(self).copy()
+        values.pop("rest_intrinsic")
+        values.pop("aligned_intrinsic")
+        values.pop("aligned_warp")
+        native_world_mapping = values.pop("native_world_mapping")
+        if native_world_mapping is None and self.world_mapping is not None:
+            native_world_mapping = ImageMapping(self.world_mapping, "native_crs", crs)
+        values["native_world_mapping"] = native_world_mapping.to_dict() if native_world_mapping is not None else None
+        mappings = {}
+        for name, fields, matrix in (
+            ("rest", ("position_x", "position_y", "rotation", "scale"), self.rest_mapping),
+            ("aligned", ("aligned_x", "aligned_y", "aligned_rotation", "aligned_scale"), self.aligned_mapping),
+            ("world", ("world_x", "world_y", "world_rotation", "world_scale"), self.world_mapping),
+        ):
+            pose = [values.pop(field) for field in fields]
+            record = ImageMapping(
+                matrix, "native_crs" if name == "world" else "layout", crs if name == "world" else None,
+                source_size=self.source_dimensions,
+            ) if matrix is not None else None
+            intrinsic = self.rest_intrinsic if name == "rest" else self.aligned_intrinsic if name == "aligned" else None
+            intrinsic_record = ImageMapping(intrinsic, "layout", source_size=self.source_dimensions) if intrinsic is not None else None
+            mappings[name] = {"pose": pose, "transform": record.to_dict() if record is not None else None,
+                              "intrinsic": intrinsic_record.to_dict() if intrinsic_record is not None else None}
+        values["mappings"] = mappings
+        return json.loads(json.dumps(values))
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any], crs: str, *, mapping_format: bool = False,
+        allow_layout_matrices: bool = False, allow_native_world_mapping: bool = False,
+        allow_layout_warps: bool = False,
+    ) -> ImageRecord:
+        if not isinstance(data, dict):
+            raise ValueError("Saved image data must be an object.")
+        if not mapping_format:
+            values = dict(data)
+            if "mappings" in values:
+                return cls.from_dict(
+                    values, crs, mapping_format=True, allow_layout_matrices=allow_layout_matrices,
+                    allow_native_world_mapping=allow_native_world_mapping, allow_layout_warps=allow_layout_warps,
+                )
+            if "native_world_mapping" in values:
+                raise ValueError("Native world mappings are not enabled for this project version.")
+            image = cls(**values)
+            image.ensure_native_world_mapping(crs)
+            return image
+        values = dict(data)
+        mappings = values.pop("mappings", None)
+        saved_native_world_mapping = values.pop("native_world_mapping", None)
+        if allow_native_world_mapping != ("native_world_mapping" in data):
+            raise ValueError("Native world mapping availability does not match the project version.")
+        if not isinstance(mappings, dict) or set(mappings) != {"rest", "aligned", "world"}:
+            raise ValueError("Saved images require rest, aligned, and world mapping states.")
+        if "rest_intrinsic" in values or "aligned_intrinsic" in values:
+            raise ValueError("Intrinsic mappings must be stored inside their layout records.")
+        for name, fields in (
+            ("rest", ("position_x", "position_y", "rotation", "scale")),
+            ("aligned", ("aligned_x", "aligned_y", "aligned_rotation", "aligned_scale")),
+            ("world", ("world_x", "world_y", "world_rotation", "world_scale")),
+        ):
+            if any(field in values for field in fields):
+                raise ValueError("An image cannot contain conflicting legacy and matrix transform fields.")
+            slot = mappings[name]
+            if not isinstance(slot, dict):
+                raise ValueError("Invalid saved image mapping state.")
+            pose = slot.get("pose")
+            if not isinstance(pose, list) or len(pose) != 4:
+                raise ValueError("A compatibility pose requires four parameters.")
+            for index, value in enumerate(pose):
+                if value is None and (index == 0 or name == "world" and index == 1):
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
+                    raise ValueError("Saved image pose parameters must be finite numbers.")
+            if pose[3] <= 0:
+                raise ValueError("Saved image scale must be positive.")
+            available = pose[0] is not None and (name != "world" or pose[1] is not None)
+            saved_transform = slot.get("transform")
+            saved_intrinsic = slot.get("intrinsic")
+            if (saved_transform is not None) != available:
+                raise ValueError("Image pose availability does not match its mapping.")
+            if saved_intrinsic is not None and (not allow_layout_matrices or name == "world" or not available):
+                raise ValueError("General image mappings are not enabled for this frame or project version.")
+            if saved_transform is not None:
+                record = ImageMapping.from_dict(saved_transform)
+                expected_frame = "native_crs" if name == "world" else "layout"
+                if record.target_frame != expected_frame or name == "world" and record.native_crs != crs:
+                    raise ValueError("Image mapping frame or native CRS does not match the project.")
+                source_dimensions = values.get("source_dimensions")
+                if source_dimensions is not None:
+                    if not isinstance(source_dimensions, (list, tuple)) or record.source_size != tuple(source_dimensions):
+                        raise ValueError("Image and mapping source dimensions disagree.")
+                elif record.source_size is not None:
+                    raise ValueError("A mapping cannot introduce source dimensions absent from its image.")
+                if isinstance(record.mapping, WarpTransform):
+                    if name != "aligned" or not allow_layout_warps or saved_intrinsic is not None:
+                        raise ValueError("Aligned TPS mappings are not enabled for this project version or frame.")
+                    base = record.mapping.base_mapping
+                    if base.model == "similarity":
+                        expected_pose = base.to_similarity()
+                    else:
+                        origin_x, origin_y = base.map_point(0.0, 0.0)
+                        a, _b, d, _e = base.jacobian(0.0, 0.0)
+                        expected_pose = (origin_x, origin_y, degrees(atan2(d, a)), hypot(a, d))
+                    if any(not isclose(actual, wanted, rel_tol=1e-13, abs_tol=1e-12)
+                           for actual, wanted in zip(pose, expected_pose)):
+                        raise ValueError("Aligned TPS base mapping and compatibility pose disagree.")
+                    values["aligned_warp"] = record.mapping
+                    expected = None
+                else:
+                    expected = similarity_mapping(tuple(pose), name == "world")
+                if saved_intrinsic is not None:
+                    intrinsic_record = ImageMapping.from_dict(saved_intrinsic)
+                    if intrinsic_record.target_frame != "layout" or intrinsic_record.source_size != record.source_size:
+                        raise ValueError("Intrinsic mapping frame or source dimensions disagree.")
+                    if not isinstance(intrinsic_record.mapping, MatrixTransform):
+                        raise ValueError("Intrinsic layout records must be matrix mappings.")
+                    if not intrinsic_record.mapping.is_affine and intrinsic_record.source_size is None:
+                        raise ValueError("Projective image mappings require known source dimensions.")
+                    if expected is None:
+                        raise ValueError("Aligned TPS mappings cannot also use an intrinsic mapping.")
+                    expected = expected.compose(intrinsic_record.mapping)
+                    values[f"{name}_intrinsic"] = intrinsic_record.mapping
+                elif isinstance(record.mapping, MatrixTransform) and record.mapping.model != "similarity":
+                    raise ValueError("General image mappings require an intrinsic layout record.")
+                if expected is not None and (
+                    not isinstance(record.mapping, MatrixTransform)
+                    or any(not isclose(actual, wanted, rel_tol=1e-13, abs_tol=1e-12)
+                           for actual, wanted in zip(record.mapping.coefficients, expected.coefficients))
+                ):
+                    raise ValueError("Image matrix and compatibility pose disagree.")
+            values.update(zip(fields, pose))
+        image = cls(**values)
+        if allow_native_world_mapping:
+            record = ImageMapping.from_dict(saved_native_world_mapping) if saved_native_world_mapping is not None else None
+            if (image.world_mapping is None) != (record is None):
+                raise ValueError("Native world mapping availability does not match its compatibility pose.")
+            if record is not None:
+                image._validate_native_world_mapping(record)
+            image.native_world_mapping = record
+        else:
+            image.ensure_native_world_mapping(crs)
+        return image
 
     @classmethod
     def from_path(cls, path: str | Path) -> ImageRecord:
@@ -85,6 +337,43 @@ class GroundControlPoint:
     visible: bool = True
     map_visible: bool = True
     short_name: str | None = None
+    geographic_native_x: float | None = None
+    geographic_native_y: float | None = None
+    geographic_native_crs: str | None = None
+    geographic_checkpoint: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.geographic_checkpoint, bool):
+            raise ValueError("Geographic checkpoint status must be true or false.")
+        native = (self.geographic_native_x, self.geographic_native_y, self.geographic_native_crs)
+        if any(value is not None for value in native):
+            if not all(value is not None for value in native):
+                raise ValueError("Native geographic coordinates require X, Y, and CRS together.")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in native[:2]) or not all(isfinite(value) for value in native[:2]) or not isinstance(self.geographic_native_crs, str) or not self.geographic_native_crs.strip():
+                raise ValueError("Native geographic coordinates must be finite and use a valid CRS definition.")
+
+    def set_geographic_coordinates(self, x: float | None, y: float | None, crs: str) -> None:
+        if (x is None) != (y is None):
+            raise ValueError("Enter both geographic coordinates, or leave both empty.")
+        if x is None:
+            self.geographic_x = self.geographic_y = None
+            self.geographic_native_x = self.geographic_native_y = None
+            self.geographic_native_crs = None
+            return
+        if not isfinite(x) or not isfinite(y):
+            raise ValueError("Geographic coordinates must be finite.")
+        if not isinstance(crs, str) or not crs.strip():
+            raise ValueError("A project CRS is required for geographic coordinates.")
+        self.geographic_x, self.geographic_y = float(x), float(y)
+        self.geographic_native_x, self.geographic_native_y = float(x), float(y)
+        self.geographic_native_crs = crs
+
+    def ensure_native_geographic_coordinates(self, crs: str) -> None:
+        if self.geographic_x is None or self.geographic_y is None:
+            self.geographic_native_x = self.geographic_native_y = None
+            self.geographic_native_crs = None
+        elif self.geographic_native_crs is None:
+            self.set_geographic_coordinates(self.geographic_x, self.geographic_y, crs)
 
     @property
     def display_name(self) -> str:
@@ -152,6 +441,18 @@ class SolverSettings:
     xtol: float = 1e-10
     gtol: float = 1e-10
     parameter_scaling: str = "unit"
+    affine_min_stretch: float = 0.05
+    affine_max_stretch: float = 20.0
+    affine_max_condition: float = 100.0
+    affine_allow_reflection: bool = False
+    projective_min_stretch: float = 0.05
+    projective_max_stretch: float = 20.0
+    projective_max_condition: float = 100.0
+    projective_horizon_margin: float = 0.02
+    projective_allow_reflection: bool = False
+    warp_smoothing: float = 0.1
+    warp_min_relative_area: float = 0.05
+    warp_max_relative_stretch: float = 20.0
 
     def __post_init__(self) -> None:
         if not isfinite(self.tolerance) or self.tolerance <= 0:
@@ -161,7 +462,7 @@ class SolverSettings:
         if not isinstance(self.auto_apply, bool):
             raise ValueError("Automatic application must be true or false.")
         for value, choices, label in (
-            (self.transform_model, ("translation", "rigid", "similarity"), "Transform model"),
+            (self.transform_model, ("translation", "rigid", "similarity", "affine", "projective", "tps"), "Transform model"),
             (self.optimizer_method, ("trf", "dogbox"), "Optimizer method"),
             (self.loss, ("linear", "soft_l1", "huber", "cauchy"), "Robust loss"),
             (self.parameter_scaling, ("unit", "jacobian"), "Parameter scaling"),
@@ -176,6 +477,38 @@ class SolverSettings:
                 raise ValueError(f"{label} must be finite and greater than zero.")
         if min(self.ftol, self.xtol, self.gtol) < 1e-14:
             raise ValueError("Convergence thresholds must be at least 1e-14.")
+        for value, label in (
+            (self.affine_min_stretch, "Minimum affine stretch"),
+            (self.affine_max_stretch, "Maximum affine stretch"),
+            (self.affine_max_condition, "Maximum affine condition"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be finite and greater than zero.")
+        if self.affine_max_condition < 1 or self.affine_min_stretch >= self.affine_max_stretch:
+            raise ValueError("Affine limits require min stretch < max stretch and condition >= 1.")
+        if not isinstance(self.affine_allow_reflection, bool):
+            raise ValueError("Affine reflection policy must be true or false.")
+        for value, label in (
+            (self.projective_min_stretch, "Minimum projective stretch"),
+            (self.projective_max_stretch, "Maximum projective stretch"),
+            (self.projective_max_condition, "Maximum projective condition"),
+            (self.projective_horizon_margin, "Projective horizon margin"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"{label} must be finite and greater than zero.")
+        if self.projective_max_condition < 1 or self.projective_min_stretch >= self.projective_max_stretch or self.projective_horizon_margin >= 1:
+            raise ValueError("Projective limits require min stretch < max stretch, condition >= 1, and horizon margin < 1.")
+        if not isinstance(self.projective_allow_reflection, bool):
+            raise ValueError("Projective reflection policy must be true or false.")
+        if isinstance(self.warp_smoothing, bool) or not isinstance(self.warp_smoothing, (int, float)) or not isfinite(self.warp_smoothing) or self.warp_smoothing < 0:
+            raise ValueError("TPS smoothing must be finite and non-negative.")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
+            for value in (self.warp_min_relative_area, self.warp_max_relative_stretch)
+        ) or self.warp_min_relative_area >= 1:
+            raise ValueError("TPS validity limits require relative area in (0, 1) and positive maximum stretch.")
+        if self.transform_model == "tps" and self.loss != "linear":
+            raise ValueError("TPS fitting currently requires least-squares residual loss.")
         for value in (self.scale_min, self.scale_max):
             if value is not None and (
                 isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0
@@ -259,7 +592,19 @@ class Project:
     def add_control_point(self, point: GroundControlPoint) -> None:
         if any(item.name.casefold() == point.name.casefold() for item in self.control_points):
             raise ValueError(f"A control point named '{point.name}' already exists.")
+        point.ensure_native_geographic_coordinates(self.crs)
         self.control_points.append(point)
+
+    def set_point_geographic_coordinates(
+        self, point: GroundControlPoint, x: float | None, y: float | None,
+    ) -> None:
+        if point not in self.control_points:
+            raise ValueError("Control point does not belong to this project.")
+        point.set_geographic_coordinates(x, y, self.crs)
+
+    def ensure_native_geographic_coordinates(self) -> None:
+        for point in self.control_points:
+            point.ensure_native_geographic_coordinates(self.crs)
 
     def add_constraint(self, constraint: PointConstraint) -> None:
         point_ids = {point.id for point in self.control_points}
@@ -288,10 +633,10 @@ class Project:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 17,
+            "version": 27,
             "name": self.name,
             "crs": self.crs,
-            "images": [json.loads(json.dumps(vars(image))) for image in self.images],
+            "images": [image.to_dict(self.crs) for image in self.images],
             "control_points": [
                 {
                     "id": point.id,
@@ -302,6 +647,10 @@ class Project:
                     "map_visible": point.map_visible,
                     "geographic_x": point.geographic_x,
                     "geographic_y": point.geographic_y,
+                    "geographic_native_x": (point.geographic_native_x if point.geographic_native_x is not None else point.geographic_x) if point.geographic_x is not None and point.geographic_y is not None else None,
+                    "geographic_native_y": (point.geographic_native_y if point.geographic_native_y is not None else point.geographic_y) if point.geographic_x is not None and point.geographic_y is not None else None,
+                    "geographic_native_crs": (point.geographic_native_crs or self.crs) if point.geographic_x is not None and point.geographic_y is not None else None,
+                    "geographic_checkpoint": point.geographic_checkpoint,
                     "observations": [vars(observation).copy() for observation in point.observations],
                 }
                 for point in self.control_points
@@ -321,10 +670,14 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Project:
-        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+        if data.get("version") not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27):
             raise ValueError("This project uses an unsupported file version.")
         project = cls(name=data.get("name", "Untitled project"), crs=data.get("crs", "EPSG:4326"))
-        project.images = [ImageRecord(**image) for image in data.get("images", [])]
+        project.images = [ImageRecord.from_dict(
+            image, project.crs, mapping_format=data["version"] >= 18,
+            allow_layout_matrices=data["version"] >= 19, allow_native_world_mapping=data["version"] >= 23,
+            allow_layout_warps=data["version"] >= 27,
+        ) for image in data.get("images", [])]
         project.vector_layers = [
             VectorLayer(id=layer["id"], path=layer["path"], name=layer["name"], visible=bool(layer.get("visible", True)))
             for layer in data.get("vector_layers", [])
@@ -355,6 +708,16 @@ class Project:
                 map_visible=bool(point.get("map_visible", True)),
                 geographic_x=point.get("geographic_x"),
                 geographic_y=point.get("geographic_y"),
+                geographic_native_x=(
+                    point.get("geographic_native_x") if data["version"] >= 21 else point.get("geographic_x")
+                ) if point.get("geographic_x") is not None and point.get("geographic_y") is not None else None,
+                geographic_native_y=(
+                    point.get("geographic_native_y") if data["version"] >= 21 else point.get("geographic_y")
+                ) if point.get("geographic_x") is not None and point.get("geographic_y") is not None else None,
+                geographic_native_crs=(
+                    point.get("geographic_native_crs") if data["version"] >= 21 else project.crs
+                ) if point.get("geographic_x") is not None and point.get("geographic_y") is not None else None,
+                geographic_checkpoint=point.get("geographic_checkpoint", False) if data["version"] >= 26 else False,
                 observations=[Observation(**observation) for observation in point.get("observations", [])],
             )
             for point in data.get("control_points", [])
@@ -369,6 +732,14 @@ class Project:
         for constraint_data in data.get("constraints", []):
             project.add_constraint(PointConstraint(**constraint_data))
         project._split_shared_points()
+        members = {image.id: image for image in project.images}
+        for point in project.control_points:
+            for observation in point.observations:
+                image = members[observation.image_id]
+                for name in ("rest", "aligned"):
+                    if getattr(image, f"{name}_intrinsic") is not None:
+                        mapping = getattr(image, f"{name}_mapping")
+                        mapping.map_point(observation.x, observation.y)
         return project
 
     def _split_shared_points(self) -> None:
@@ -390,6 +761,10 @@ class Project:
                     label=point.label,
                     geographic_x=point.geographic_x,
                     geographic_y=point.geographic_y,
+                    geographic_native_x=point.geographic_native_x,
+                    geographic_native_y=point.geographic_native_y,
+                    geographic_native_crs=point.geographic_native_crs,
+                    geographic_checkpoint=point.geographic_checkpoint,
                     observations=[observation],
                 ))
             point.observations = point.observations[:1]

@@ -87,7 +87,7 @@ def test_project_round_trips_examined_alignment_feedback(tmp_path, outdated):
     saved_feedback = restored.alignment_feedback
 
     assert isinstance(saved_feedback, AlignmentFeedback)
-    assert restored.to_dict()["version"] == 17
+    assert restored.to_dict()["version"] == 27
     assert restored.to_dict() == project.to_dict()
     assert saved_feedback.result == result
     assert saved_feedback.tolerance == 0.25
@@ -96,7 +96,7 @@ def test_project_round_trips_examined_alignment_feedback(tmp_path, outdated):
     assert saved_feedback.is_current(restored) is not outdated
 
 
-@pytest.mark.parametrize("version", range(1, 18))
+@pytest.mark.parametrize("version", range(1, 27))
 def test_older_projects_without_alignment_feedback_still_load(version):
     data = Project().to_dict()
     data["version"] = version
@@ -115,6 +115,6 @@ def test_project_rejects_malformed_alignment_feedback(feedback):
 
 def test_project_rejects_unsupported_version():
     data = Project().to_dict()
-    data["version"] = 18
+    data["version"] = 28
     with pytest.raises(ValueError):
         Project.from_dict(data)

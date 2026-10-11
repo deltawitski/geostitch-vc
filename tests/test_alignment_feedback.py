@@ -72,7 +72,7 @@ def test_feedback_detects_link_deletion_and_has_fixed_tolerance_colors():
 
 
 @pytest.mark.parametrize("field, value", [
-    ("version", 3),
+    ("version", 6),
     ("tolerance", float("nan")),
     ("constraint_residuals", {"link": -1}),
     ("input_signature", [[], []]),
@@ -89,11 +89,11 @@ def test_feedback_rejects_invalid_saved_metadata(field, value):
         AlignmentFeedback.from_dict(data)
 
 
-def test_feedback_version_two_saves_only_original_inputs_and_result():
+def test_feedback_version_five_saves_only_original_inputs_and_result():
     project, images, points, links, result = make_feedback_project()
     feedback = AlignmentFeedback.capture(project, result, 0.5)
     data = feedback.to_dict()
-    assert data["version"] == 2
+    assert data["version"] == 5
     assert set(data) == {"version", "result", "tolerance", "input_signature"}
     assert AlignmentFeedback.from_dict(data) == feedback
 

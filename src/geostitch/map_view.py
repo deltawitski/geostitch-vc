@@ -31,6 +31,7 @@ class WorldMapView(QGraphicsView):
     MAX_VIEW_ZOOM = 22
     TILE_SIZE = 256
     coordinate_picked = Signal(float, float)
+    image_mapping_warning = Signal(object)
     MAX_VERTICES_PER_REDRAW = 400_000
     TILE_FADE_MS = 220
     ZOOM_ANIMATION_MS = 160
@@ -72,6 +73,8 @@ class WorldMapView(QGraphicsView):
         self._fade_timer.timeout.connect(self._step_fades)
         self._pending_tiles: set[tuple[int, int, int]] = set()
         self._image_items: dict[str, QGraphicsPixmapItem] = {}
+        self._wrapped_image_items: list[QGraphicsPixmapItem] = []
+        self._image_mesh_warnings: frozenset[str] = frozenset()
         self._images: list[dict] = []
         self._vectors: list[dict] = []
         self._vector_items: list[tuple] = []
@@ -112,7 +115,8 @@ class WorldMapView(QGraphicsView):
         self._attribution.adjustSize()
         self._attribution.raise_()
         self.setMouseTracking(True)
-        self._scene.setSceneRect(-self.WORLD_ORIGIN, -self.WORLD_ORIGIN, self.WORLD_ORIGIN * 2, self.WORLD_ORIGIN * 2)
+        self._scene.setSceneRect(-3 * self.WORLD_ORIGIN, -self.WORLD_ORIGIN,
+                     6 * self.WORLD_ORIGIN, self.WORLD_ORIGIN * 2)
         self.fit_world()
         self._position_attribution()
 
@@ -124,6 +128,9 @@ class WorldMapView(QGraphicsView):
         for point in points:
             if point["locked"]:
                 marker = QGraphicsRectItem(-6, -6, 12, 12)
+            elif point.get("checkpoint", False):
+                marker = QGraphicsRectItem(-5, -5, 10, 10)
+                marker.setRotation(45)
             else:
                 marker = QGraphicsEllipseItem(-7, -7, 14, 14)
             marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
@@ -134,7 +141,9 @@ class WorldMapView(QGraphicsView):
             color = QColor(KIND_COLORS["point"])
             marker.setBrush(QBrush(color if point["georeferenced"] else color.lighter(140)))
             marker.setZValue(8500)
-            kind = "georeferenced" if point["georeferenced"] else "placed by image transform"
+            kind = "independent checkpoint" if point.get("checkpoint", False) else (
+                "georeferenced" if point["georeferenced"] else "placed by image transform"
+            )
             marker.setToolTip(f"{point['name']} \u00b7 {kind} \u00b7 {'locked' if point['locked'] else 'unlocked'}")
             self._scene.addItem(marker)
             self._point_overlay_items.append(marker)
@@ -170,6 +179,16 @@ class WorldMapView(QGraphicsView):
         self._refresh_image_items()
         if fit:
             self.fit_world()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        warnings = frozenset(
+            image_id for image_id, item in self._image_items.items()
+            if getattr(item, "_mesh_capped", False) or getattr(item, "_domain_clipped", False)
+        )
+        if warnings != self._image_mesh_warnings:
+            self._image_mesh_warnings = warnings
+            self.image_mapping_warning.emit(warnings)
 
     def set_world_vectors(self, vectors: list[dict]) -> None:
         """Show vector layers (dicts with `id`, `data` PreparedVectors, optional `order` shared with image order)."""
@@ -317,7 +336,8 @@ class WorldMapView(QGraphicsView):
         self._stop_zoom()
         world = QRectF(-self.WORLD_ORIGIN, -self.WORLD_ORIGIN, self.WORLD_ORIGIN * 2, self.WORLD_ORIGIN * 2)
         bounds = self._world_image_bounds()
-        bounds = world if bounds is None else bounds.intersected(world)
+        has_wrapped_image = any(getattr(item, "crosses_antimeridian", False) for item in self._image_items.values())
+        bounds = world if bounds is None else bounds if has_wrapped_image else bounds.intersected(world)
         if bounds.isEmpty():
             bounds = world
         margin_x = max(bounds.width() * 0.05, 1.0)
@@ -329,7 +349,10 @@ class WorldMapView(QGraphicsView):
         self._position_attribution()
 
     def fit_items(self, image_ids: set[str], point_ids: set[str], vector_ids: set[str]) -> None:
-        rects = [item.sceneBoundingRect() for image_id, item in self._image_items.items() if image_id in image_ids]
+        rects = [
+            getattr(item, "fit_scene_bounds", item.sceneBoundingRect())
+            for image_id, item in self._image_items.items() if image_id in image_ids
+        ]
         for vector in self._vectors:
             extent = vector["data"].bounds
             if vector["id"] in vector_ids and extent is not None:
@@ -368,7 +391,7 @@ class WorldMapView(QGraphicsView):
         self._stop_zoom()
         minimum, maximum = self._scale_limits()
         scale = min(maximum, max(minimum, scale))
-        center_x = min(self.WORLD_ORIGIN, max(-self.WORLD_ORIGIN, center_x))
+        center_x = min(3 * self.WORLD_ORIGIN, max(-3 * self.WORLD_ORIGIN, center_x))
         center_y = min(self.WORLD_ORIGIN, max(-self.WORLD_ORIGIN, center_y))
         self.setTransform(QTransform.fromScale(scale, scale))
         self.centerOn(center_x, center_y)
@@ -380,7 +403,7 @@ class WorldMapView(QGraphicsView):
     def _world_image_bounds(self) -> QRectF | None:
         bounds = None
         for item in self._image_items.values():
-            item_bounds = item.sceneBoundingRect()
+            item_bounds = getattr(item, "fit_scene_bounds", item.sceneBoundingRect())
             bounds = item_bounds if bounds is None else bounds.united(item_bounds)
         for vector in self._vectors:
             extent = vector["data"].bounds
@@ -391,12 +414,35 @@ class WorldMapView(QGraphicsView):
 
     def _refresh_image_items(self) -> None:
         from geostitch.image_item import SourceImageItem
+        from geostitch.warped_map_item import WarpedMapImageItem
 
-        for item in self._image_items.values():
+        for item in (*self._image_items.values(), *self._wrapped_image_items):
             self._scene.removeItem(item)
         self._image_items.clear()
+        self._wrapped_image_items.clear()
         for index, image in enumerate(self._images):
             pixmap: QPixmap = image["pixmap"]
+            mapping = image.get("mapping_chain")
+            if mapping is not None:
+                try:
+                    item = WarpedMapImageItem(pixmap, mapping, image.get("source_size"))
+                except (ValueError, OverflowError):
+                    continue
+                item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+                item.setZValue(100 + image.get("order", index))
+                self._scene.addItem(item)
+                self._image_items[image["id"]] = item
+                if item.crosses_antimeridian:
+                    circumference = 2 * self.WORLD_ORIGIN
+                    for offset in (-circumference, circumference):
+                        wrapped = WarpedMapImageItem(
+                            pixmap, mapping, image.get("source_size"), world_offset=offset,
+                        )
+                        wrapped.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+                        wrapped.setZValue(100 + image.get("order", index))
+                        self._scene.addItem(wrapped)
+                        self._wrapped_image_items.append(wrapped)
+                continue
             corners = image.get("mercator_corners")
             if not corners or len(corners) != 3:
                 continue
@@ -446,6 +492,7 @@ class WorldMapView(QGraphicsView):
         self._schedule_vector_update()
         if self.viewport().width() <= 0 or self.viewport().height() <= 0:
             return
+        self._clamp_view_center_x()
         self._zoom = self._zoom_for_scale(self.transform().m11())
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         tile_count = 1 << self._zoom
@@ -454,13 +501,15 @@ class WorldMapView(QGraphicsView):
         max_x = min(tile_count - 1, int(floor((visible.right() + self.WORLD_ORIGIN) / tile_span)))
         min_y = max(0, int(floor((visible.top() + self.WORLD_ORIGIN) / tile_span)))
         max_y = min(tile_count - 1, int(floor((visible.bottom() + self.WORLD_ORIGIN) / tile_span)))
-        needed = {
-            (self._zoom, x, y)
-            for x in range(min_x, max_x + 1)
-            for y in range(min_y, max_y + 1)
-        }
+        needed = set()
+        if min_x <= max_x and min_y <= max_y:
+            needed = {
+                (self._zoom, x, y)
+                for x in range(min_x, max_x + 1)
+                for y in range(min_y, max_y + 1)
+            }
         for key in list(self._tile_items):
-            if key not in needed and key[0] == self._zoom:
+            if key[1] < 0 or key[1] >= tile_count or key not in needed and key[0] == self._zoom:
                 self._remove_tile(key)
         self._needed_tiles = needed
         self._restack_tiles()
@@ -469,17 +518,34 @@ class WorldMapView(QGraphicsView):
             if (zoom, x, y) in self._tile_items or (zoom, x, y) in self._pending_tiles:
                 continue
             key = (zoom, x, y)
-            if key in self._tile_cache:
-                self._tile_cache.move_to_end(key)
-                self._show_tile(key, self._tile_cache[key], fade=False)
+            cache_key = key
+            if cache_key in self._tile_cache:
+                self._tile_cache.move_to_end(cache_key)
+                self._show_tile(key, self._tile_cache[cache_key], fade=False)
                 continue
             url = QUrl(f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png")
             request = QNetworkRequest(url)
             request.setRawHeader(b"User-Agent", b"GeoStitchControl/0.1 (desktop map view)")
             reply = self._manager.get(request)
             reply.setProperty("tileKey", (zoom, x, y))
+            reply.setProperty("cacheKey", cache_key)
             self._pending_tiles.add((zoom, x, y))
         self._prune_stale_tiles()
+
+    def _clamp_view_center_x(self) -> None:
+        scale = max(self.transform().m11(), 1e-15)
+        half_view = self.viewport().width() / (2.0 * scale)
+        if half_view >= self.WORLD_ORIGIN:
+            bounded_center = 0.0
+        else:
+            center = self.mapToScene(self.viewport().rect().center()).x()
+            bounded_center = min(
+                self.WORLD_ORIGIN - half_view,
+                max(-self.WORLD_ORIGIN + half_view, center),
+            )
+        current_center = self.mapToScene(self.viewport().rect().center()).x()
+        if abs(bounded_center - current_center) > 1e-7:
+            self.centerOn(bounded_center, self.mapToScene(self.viewport().rect().center()).y())
 
     def _on_tile_loaded(self, reply) -> None:
         key_value = reply.property("tileKey")
@@ -492,8 +558,12 @@ class WorldMapView(QGraphicsView):
         if reply.error() == reply.NetworkError.NoError:
             pixmap = QPixmap()
             if pixmap.loadFromData(bytes(data)):
-                self._tile_cache[key] = pixmap
-                self._tile_cache.move_to_end(key)
+                cache_key_value = reply.property("cacheKey")
+                cache_key = tuple(cache_key_value) if cache_key_value is not None else (
+                    key[0], key[1] % (1 << key[0]), key[2],
+                )
+                self._tile_cache[cache_key] = pixmap
+                self._tile_cache.move_to_end(cache_key)
                 while len(self._tile_cache) > self.MAX_CACHED_TILES:
                     self._tile_cache.popitem(last=False)
                 if not self._closed and key[0] == self._zoom and (not self._needed_tiles or key in self._needed_tiles):

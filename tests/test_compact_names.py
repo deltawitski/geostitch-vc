@@ -63,6 +63,8 @@ def test_legacy_links_and_split_points_receive_saved_link_numbers():
     data = project.to_dict()
     data["version"] = 15
     data.pop("next_link_number")
+    for image in data["images"]:
+        image.pop("native_world_mapping")
     data["control_points"][0].pop("short_name")
     restored = Project.from_dict(data)
     assert restored.control_points[0].name == "Existing custom name"

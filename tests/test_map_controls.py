@@ -1,6 +1,6 @@
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QToolButton
+from PySide6.QtWidgets import QApplication, QGraphicsRectItem, QToolButton
 
 from geostitch.app import MainWindow
 from geostitch.models import GroundControlPoint
@@ -76,5 +76,29 @@ def test_map_points_overlay_stays_top_right_during_navigation_and_resize(tmp_pat
         assert view.viewport().rect().contains(button.geometry())
         assert hint.pos().x() == 8
         assert hint.pos().y() == 8
+    finally:
+        window.close()
+
+
+def test_geographic_checkpoint_has_a_distinct_world_map_marker(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(QSettings(str(tmp_path / "checkpoint-map.ini"), QSettings.Format.IniFormat))
+    image = window.project.add_image("checkpoint.png")
+    point = GroundControlPoint.create("Independent check")
+    point.set_observation(image.id, 20, 30)
+    point.set_geographic_coordinates(10.0, 45.0, window.project.crs)
+    point.geographic_checkpoint = True
+    window.project.add_control_point(point)
+    window._refresh_all()
+    window.map_points_button.setChecked(True)
+    try:
+        marker = next(
+            item for item in window.world_map._point_overlay_items
+            if item.data(0) == point.id
+        )
+        assert isinstance(marker, QGraphicsRectItem)
+        assert marker.rotation() == 45
+        assert "independent checkpoint" in marker.toolTip()
+        assert "[checkpoint]" in window._point_text(point)
     finally:
         window.close()

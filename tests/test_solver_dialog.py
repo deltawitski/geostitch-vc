@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMessageB
 
 from geostitch.app import MainWindow
 from geostitch.alignment_feedback import AlignmentFeedback
+from geostitch.georeference import GeoreferenceResult, build_local_metric_frame
 from geostitch.icons import make_icon
 from geostitch.models import GroundControlPoint, PointConstraint, SolverSettings
 from geostitch.solver_dialog import SolverSettingsDialog, SolverToolbarControl
@@ -41,6 +42,69 @@ def test_settings_dialog_apply_run_and_cancel():
         assert values[-1] == SolverSettings(1, 1000, True)
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize("model", ["affine", "projective"])
+def test_geographic_matrix_settings_label_local_metric_units(model):
+    app = QApplication.instance() or QApplication([])
+    dialog = SolverSettingsDialog(
+        "georeference", SolverSettings(transform_model=model), project_crs="EPSG:4326",
+    )
+    try:
+        assert dialog.tolerance_spin.suffix() == " local metres"
+        assert dialog.loss_scale_spin.suffix() == " local metres"
+        dialog.model_combo.setCurrentIndex(dialog.model_combo.findData("similarity"))
+        assert dialog.tolerance_spin.suffix() == " degrees"
+        dialog.model_combo.setCurrentIndex(dialog.model_combo.findData(model))
+        assert dialog.tolerance_spin.suffix() == " local metres"
+    finally:
+        dialog.close()
+
+
+def test_tps_alignment_and_georeferencing_expose_regularization_controls():
+    app = QApplication.instance() or QApplication([])
+    alignment = SolverSettingsDialog("alignment", SolverSettings())
+    georeference = SolverSettingsDialog(
+        "georeference", SolverSettings(transform_model="tps"), project_crs="EPSG:4326",
+    )
+    try:
+        assert alignment.advanced_group.text() == "Advanced settings"
+        assert not alignment.advanced_group.isChecked()
+        assert alignment.advanced_controls.isHidden()
+        assert alignment.layout().indexOf(alignment.advanced_group) < alignment.layout().indexOf(alignment.advanced_controls)
+        alignment.model_combo.setCurrentIndex(alignment.model_combo.findData("affine"))
+        assert "shear" in alignment.model_help.text()
+        assert alignment.model_combo.toolTip() == alignment.model_help.text()
+        assert alignment.tolerance_spin.toolTip()
+        alignment.show()
+        app.processEvents()
+        collapsed_height = alignment.height()
+        alignment.advanced_group.click()
+        app.processEvents()
+        assert not alignment.advanced_controls.isHidden()
+        expanded_height = alignment.height()
+        assert expanded_height > collapsed_height
+        alignment.advanced_group.click()
+        app.processEvents()
+        assert alignment.advanced_controls.isHidden()
+        assert alignment.height() < expanded_height
+
+        georeference.advanced_group.setChecked(True)
+        assert alignment.model_combo.findData("tps") >= 0
+        assert georeference.model_combo.currentData() == "tps"
+        assert georeference.tolerance_spin.suffix() == " local metres"
+        assert "geographic CRS" in georeference.model_help.text()
+        assert georeference.warp_smoothing_spin.isEnabled()
+        assert georeference.warp_min_relative_area_spin.isEnabled()
+        assert georeference.warp_max_relative_stretch_spin.isEnabled()
+        assert georeference.warp_smoothing_spin.toolTip()
+        assert not georeference.loss_combo.isEnabled()
+        georeference.warp_smoothing_spin.setValue(0.25)
+        assert georeference.apply_settings()
+        assert georeference.warp_smoothing_spin.value() == 0.25
+    finally:
+        alignment.close()
+        georeference.close()
 
 
 def test_solver_toolbar_group_and_one_click_action(solver_window, monkeypatch):
@@ -116,6 +180,41 @@ def test_last_reports_are_on_demand_and_read_only(solver_window, monkeypatch, st
     assert ("scene units" if stage == "alignment" else "CRS units") in reports[0][1]
 
 
+def test_geographic_georeference_report_discloses_local_metric_frame(solver_window, monkeypatch):
+    app, window, images, alignment, world, errors = solver_window
+    frame, _transformer = build_local_metric_frame(
+        "EPSG:4326", [(179.999, 60.0), (-179.999, 60.01), (179.998, 60.02)],
+    )
+    frame = replace(
+        frame, maximum_domain_radius_m=150_000,
+        sampled_domain_distance_distortion=0.002, domain_sample_count=25,
+    )
+    result = GeoreferenceResult(
+        {}, {}, 1, True, "EPSG:4326", metric_frames={images[0].id: frame},
+    )
+    window._georeference_result = result
+    window._georeference_result_tolerance = 0.5
+    reports = []
+
+    def inspect(dialog):
+        reports.append(dialog.findChild(QPlainTextEdit).toPlainText())
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", inspect)
+    window.show_solver_report("georeference")
+
+    assert len(reports) == 1
+    text = reports[0]
+    assert "metres in local metric frame" in text
+    assert "Local metric frames by connected group" in text
+    assert "centered at" in text and "maximum control radius" in text
+    assert "sampled pairwise distance distortion" in text
+    assert "Mapped image-domain samples: 25" in text
+    assert "maximum domain radius 150.00 km" in text
+    assert "Warning: local-frame extent or sampled distortion is high" in text
+    assert "CRS operation" in text and "Reported operation accuracy" in text
+
+
 @pytest.mark.parametrize("stage", ["alignment", "georeference"])
 @pytest.mark.parametrize("status, expected", [
     (0, "Increase Maximum iterations"),
@@ -169,8 +268,10 @@ def test_reports_distinguish_stop_reason_from_target_and_recommend_changes(
 
 
 @pytest.mark.parametrize("stage", ["alignment", "georeference"])
-@pytest.mark.parametrize("status", [0, 1])
-def test_target_miss_review_shows_stop_reason_and_guidance(solver_window, monkeypatch, stage, status):
+@pytest.mark.parametrize("status, expected", [(0, "raise Maximum solver steps"), (1, "fit stopped improving")])
+def test_target_miss_review_shows_plain_guidance_and_hides_technical_details(
+    solver_window, monkeypatch, stage, status, expected,
+):
     app, window, images, alignment, world, errors = solver_window
     result = replace(
         alignment if stage == "alignment" else world,
@@ -178,8 +279,10 @@ def test_target_miss_review_shows_stop_reason_and_guidance(solver_window, monkey
     )
     messages = []
     details = []
+    headings = []
 
     def inspect(box):
+        headings.append((box.windowTitle(), box.text()))
         messages.append(box.informativeText())
         details.append(box.detailedText())
         return 0
@@ -187,11 +290,56 @@ def test_target_miss_review_shows_stop_reason_and_guidance(solver_window, monkey
     monkeypatch.setattr(QMessageBox, "exec", inspect)
     assert window._review_solver_result(stage, result) == "discard"
     assert len(messages) == 1
+    assert headings[0][0] != headings[0][1]
+    assert "target not reached" not in headings[0][0].lower()
+    assert "target was not reached" not in headings[0][1].lower()
     assert "Optimizer message: Captured reason" in details[0]
     assert "Optimizer message:" not in messages[0]
     assert "Convergence thresholds:" not in messages[0]
+    assert expected in messages[0]
+    assert "Largest point mismatch" in messages[0]
+    assert messages[0].count("Next step:") == 1
     assert len(messages[0]) < 800
-    assert ("Increase Maximum iterations" if status == 0 else "More iterations alone are unlikely to help") in messages[0]
+
+
+def test_runtime_solver_failure_shows_action_before_technical_error(solver_window, monkeypatch):
+    app, window, images, alignment, world, errors = solver_window
+    dialogs = []
+
+    def inspect(box):
+        dialogs.append((box.text(), box.informativeText(), box.detailedText()))
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "exec", inspect)
+    window._show_solver_failure(
+        "alignment",
+        ValueError("Projective homography has rank deficient non-collinear control matrix."),
+    )
+
+    assert len(dialogs) == 1
+    title, guidance, details = dialogs[0]
+    assert "independent positions" in title
+    assert "Add more matching points spread across the images" in guidance
+    assert "rank deficient" not in title.lower() + guidance.lower()
+    assert "rank deficient" in details
+
+
+def test_dismissing_target_miss_does_not_repeat_popup_summary(solver_window, monkeypatch):
+    app, window, images, alignment, world, errors = solver_window
+    result = replace(
+        alignment, converged=False, optimizer_status=1,
+        settings=SolverSettings(transform_model="similarity", tolerance=0.25),
+    )
+    monkeypatch.setattr(window, "_solver_readiness", lambda stages: [])
+    monkeypatch.setattr(window, "_compute_solver_result", lambda *args, **kwargs: result)
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: 0)
+
+    assert not window._run_solver_pipeline(("alignment",))
+
+    message = window.statusBar().currentMessage()
+    assert message == "Fit not applied. Existing transforms were kept unchanged."
+    assert "target not reached" not in message.lower()
+    assert "Maximum error" not in message
 
 
 def test_target_reached_report_does_not_suggest_solver_changes(solver_window):
@@ -284,6 +432,63 @@ def test_dialog_rejects_invalid_scale_bounds_without_running(monkeypatch):
         dialog.close()
 
 
+def test_affine_controls_are_visible_only_for_affine_alignment(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    settings = SolverSettings(transform_model="similarity", affine_allow_reflection=False)
+    alignment = SolverSettingsDialog("alignment", settings)
+    georeference = SolverSettingsDialog("georeference", settings)
+    try:
+        alignment.advanced_group.setChecked(True)
+        georeference.advanced_group.setChecked(True)
+        assert not alignment.affine_min_stretch_spin.isEnabled()
+        index = alignment.model_combo.findData("affine")
+        alignment.model_combo.setCurrentIndex(index)
+        assert alignment.affine_min_stretch_spin.isEnabled()
+        assert alignment.affine_max_stretch_spin.isEnabled()
+        assert alignment.affine_max_condition_spin.isEnabled()
+        assert alignment.affine_allow_reflection_checkbox.isEnabled()
+        alignment.affine_min_stretch_spin.setValue(0.1)
+        alignment.affine_max_stretch_spin.setValue(10)
+        alignment.affine_max_condition_spin.setValue(50)
+        alignment.affine_allow_reflection_checkbox.setChecked(True)
+        applied = []
+        alignment.settings_applied.connect(applied.append)
+        assert alignment.apply_settings()
+        assert applied[-1].transform_model == "affine"
+        assert applied[-1].affine_min_stretch == pytest.approx(0.1)
+        assert applied[-1].affine_max_stretch == pytest.approx(10)
+        assert applied[-1].affine_max_condition == pytest.approx(50)
+        assert applied[-1].affine_allow_reflection
+        geo_index = georeference.model_combo.findData("affine")
+        assert georeference.model_combo.model().item(geo_index).isEnabled()
+        georeference.model_combo.setCurrentIndex(geo_index)
+        assert georeference.affine_min_stretch_spin.isEnabled()
+        projective_index = alignment.model_combo.findData("projective")
+        alignment.model_combo.setCurrentIndex(projective_index)
+        assert alignment.projective_min_stretch_spin.isEnabled()
+        assert alignment.projective_horizon_margin_spin.isEnabled()
+        assert not alignment.affine_min_stretch_spin.isEnabled()
+        alignment.projective_min_stretch_spin.setValue(0.1)
+        alignment.projective_max_stretch_spin.setValue(8)
+        alignment.projective_max_condition_spin.setValue(40)
+        alignment.projective_horizon_margin_spin.setValue(0.05)
+        alignment.projective_allow_reflection_checkbox.setChecked(True)
+        assert alignment.apply_settings()
+        assert applied[-1].transform_model == "projective"
+        assert applied[-1].projective_min_stretch == pytest.approx(0.1)
+        assert applied[-1].projective_max_stretch == pytest.approx(8)
+        assert applied[-1].projective_max_condition == pytest.approx(40)
+        assert applied[-1].projective_horizon_margin == pytest.approx(0.05)
+        assert applied[-1].projective_allow_reflection
+        geo_projective_index = georeference.model_combo.findData("projective")
+        assert georeference.model_combo.model().item(geo_projective_index).isEnabled()
+        georeference.model_combo.setCurrentIndex(geo_projective_index)
+        assert georeference.projective_horizon_margin_spin.isEnabled()
+    finally:
+        alignment.close()
+        georeference.close()
+
+
 def test_report_shows_run_settings_not_current_settings(solver_window):
     app, window, images, alignment, world, errors = solver_window
     settings = SolverSettings(transform_model="translation", optimizer_method="dogbox", loss="huber", loss_scale=3)
@@ -294,6 +499,22 @@ def test_report_shows_run_settings_not_current_settings(solver_window):
     assert "Fixed parameters: rotation and scale" in text
     assert "accuracy target still use raw distances" in text
     assert "Switch to rigid" in "\n".join(window._solver_review_lines("alignment", result))
+
+
+def test_projective_report_shows_domain_limits_instead_of_fixed_parameters(solver_window):
+    app, window, images, alignment, world, errors = solver_window
+    settings = SolverSettings(
+        transform_model="projective", projective_min_stretch=0.1, projective_max_stretch=8,
+        projective_max_condition=40, projective_horizon_margin=0.05, projective_allow_reflection=True,
+    )
+
+    text = "\n".join(window._solver_termination_lines("alignment", replace(alignment, settings=settings)))
+
+    assert "Projective stretches: 0.1 to 8" in text
+    assert "maximum condition: 40" in text
+    assert "horizon margin: 0.05" in text
+    assert "reflections allowed" in text
+    assert "Fixed parameters" not in text
 
 
 def test_saved_solver_settings_are_restored_on_reopen(solver_window, tmp_path):

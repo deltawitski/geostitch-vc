@@ -101,3 +101,15 @@ def test_optimizer_receives_advanced_controls(stage, solve, monkeypatch):
         "method": "dogbox", "loss": "huber", "f_scale": 3, "ftol": 1e-8, "xtol": 1e-7, "gtol": 1e-6,
         "x_scale": "jac", "max_nfev": 222,
     }
+
+
+@pytest.mark.parametrize("stage, solve", [("alignment", simulate_alignment), ("georeference", simulate_georeference)])
+def test_real_solver_result_retains_known_source_dimensions(stage, solve):
+    project, moving = fitting_project(stage, (10, 20, 0, 1))
+    moving.source_dimensions = (3000, 2000)
+    result = solve(project)
+    assert result.converged
+    assert result.source_dimensions[moving.id] == (3000, 2000)
+    assert result.mapping_records[moving.id].source_size == (3000, 2000)
+    moving.source_dimensions = (2000, 3000)
+    assert result.mapping_records[moving.id].source_size == (3000, 2000)

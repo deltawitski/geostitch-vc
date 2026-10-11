@@ -13,7 +13,10 @@ from PySide6.QtGui import QActionGroup
 
 from geostitch.adjustment import AlignmentResult, simulate_alignment
 from geostitch.alignment_feedback import AlignmentFeedback
-from geostitch.georeference import GeoreferenceResult, simulate_georeference
+from geostitch.georeference import (
+    GeoreferenceResult, georeference_distance_unit, rebase_georeference_settings,
+    simulate_georeference,
+)
 from geostitch.map_view import WorldMapView
 from pyproj import CRS, Transformer
 from shiboken6 import isValid
@@ -60,6 +63,8 @@ from geostitch.canvas import ImageCanvas
 from geostitch.icons import DEFAULT_KIND_COLORS, KIND_COLORS, app_icon, kind_bar_html, kind_icon, make_icon, set_icon_colors, set_symbol_colors
 from geostitch.appearance import AppearanceDialog
 from geostitch.default_layout import DEFAULT_DOCK_STATE, DEFAULT_GEOMETRY
+from geostitch.crs_catalog import compatible_crs_options
+from geostitch.searchable_crs_combo import SearchableCRSComboBox
 from geostitch.layers import CONSTRAINT_KIND, IMAGE_KIND, POINT_KIND, VECTOR_KIND, LayerItem, LayerTree
 from geostitch.layer_filter import match_layers
 from geostitch.image_view import ImageViewer
@@ -71,11 +76,15 @@ from geostitch.image_repair import apply_replacements, missing_images
 from geostitch.link_review import LinkReviewPanel
 from geostitch.masking import masked_pixmap
 from geostitch.models import GroundControlPoint, PointConstraint, Project, SolverSettings, VectorLayer
+from geostitch.mapping import CRSMapping, ImageMapping, MappingChain
 from geostitch.project_io import load_project, load_recovery, save_project, save_recovery
 from geostitch.solver_dialog import SolverSettingsDialog, SolverToolbarControl
 from geostitch.solver_readiness import ReadinessIssue, check_readiness
+from geostitch.solver_messages import readiness_copy, solver_failure_copy
 from geostitch.status_bar import ScrollingStatusBar
 from geostitch.vector_loader import VectorLoader
+from geostitch.transforms import MatrixTransform
+from geostitch.warp import WarpTransform
 
 
 class SolverCancelled(Exception):
@@ -260,6 +269,8 @@ class MainWindow(QMainWindow):
         self._last_export_directory: Path | None = None
         self._export_total = 0
         self._solver_progress_dialog: QProgressDialog | None = None
+        self._solver_progress_cancel_button: QToolButton | None = None
+        self._solver_cancel_requested = False
         self.project = Project()
         self.project_path: Path | None = None
         recovery_root = (
@@ -511,6 +522,7 @@ class MainWindow(QMainWindow):
         self.canvas.constraint_toggled.connect(self._on_canvas_constraint_toggled)
         self.canvas.point_marker_toggled.connect(self._on_canvas_point_toggled)
         self.canvas.transform_changed.connect(self._on_image_transform_changed)
+        self.canvas.mapping_changed.connect(self._on_image_mapping_changed)
         self.canvas.transform_interaction_started.connect(lambda _image_id: self._begin_project_edit("Transform image"))
         self.canvas.transform_interaction_finished.connect(lambda _image_id: self._finish_project_edit())
         canvas_panel = QWidget()
@@ -535,15 +547,17 @@ class MainWindow(QMainWindow):
         self.map_points_button = self.world_map.points_toggle_button
         self.map_points_button.toggled.connect(lambda _checked: self._refresh_map_points())
         self.world_map.set_dark_mode(self._dark_map)
-        self.map_crs_combo = QComboBox()
-        self.map_crs_combo.setEditable(True)
-        self.map_crs_combo.setToolTip("Project coordinate system")
-        self.map_crs_combo.addItems(["EPSG:4326", "EPSG:3857", "EPSG:32610", "EPSG:32611", "EPSG:26910", "EPSG:26911", "EPSG:2229"])
-        self.map_crs_combo.setCurrentText(self.project.crs)
+        self.map_crs_combo = SearchableCRSComboBox()
+        self.map_crs_combo.setToolTip("Search EPSG codes or names, or type another coordinate system.")
+        for identifier, name in compatible_crs_options():
+            self.map_crs_combo.addItem(f"{identifier}  ·  {name}", identifier)
+        self.map_crs_combo.lineEdit().setToolTip(self.map_crs_combo.toolTip())
+        self.map_crs_combo.set_compact_text(self.project.crs)
         self.map_crs_combo.activated.connect(self._on_map_crs_chosen)
         self.map_crs_combo.lineEdit().editingFinished.connect(self._on_map_crs_chosen)
         world_map_layout.addWidget(self.world_map, 1)
         self.world_map.coordinate_picked.connect(self._on_world_coordinate_picked)
+        self.world_map.image_mapping_warning.connect(self._on_map_mapping_warning)
         self.world_map_dock = self._create_panel_dock("worldMapDock", "World Map", world_map_panel)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.world_map_dock)
         self.splitDockWidget(self.canvas_dock, self.world_map_dock, Qt.Orientation.Vertical)
@@ -697,6 +711,10 @@ class MainWindow(QMainWindow):
         self.geo_x_edit.setPlaceholderText("Optional")
         self.geo_y_edit = QLineEdit()
         self.geo_y_edit.setPlaceholderText("Optional")
+        self.geographic_checkpoint_checkbox = QCheckBox("Use as independent geographic checkpoint")
+        self.geographic_checkpoint_checkbox.setToolTip(
+            "Exclude this point from georeferencing fit controls and report its independent mapping error."
+        )
         self.pixel_x_edit = QLineEdit()
         self.pixel_x_edit.setPlaceholderText("Point is not placed in an image")
         self.pixel_y_edit = QLineEdit()
@@ -708,6 +726,7 @@ class MainWindow(QMainWindow):
         form.addRow("Label", self.label_edit)
         form.addRow("Map X / longitude", self.geo_x_edit)
         form.addRow("Map Y / latitude", self.geo_y_edit)
+        form.addRow("", self.geographic_checkpoint_checkbox)
         form.addRow("Pixel X", self.pixel_x_edit)
         form.addRow("Pixel Y", self.pixel_y_edit)
         form.addRow("", self.lock_observation_checkbox)
@@ -1013,6 +1032,7 @@ class MainWindow(QMainWindow):
 
     def export_georeferenced_images(self) -> None:
         from geostitch.export import FORMATS as EXPORT_FORMATS, plan_export
+        from geostitch.export_grid_dialog import ExportGridDialog
 
         if self._export_running:
             return
@@ -1026,13 +1046,21 @@ class MainWindow(QMainWindow):
         label, accepted = QInputDialog.getItem(self, "Export georeferenced images", "Format:", labels, format_index, False)
         if not accepted:
             return
+        grid_dialog = ExportGridDialog(self.project.crs, self)
+        if grid_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            grid_options = grid_dialog.options()
+        except ValueError as error:
+            self._show_error(f"Invalid output grid: {error}")
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "Export to folder", str(self._settings.value("export/directory", self._last_directory())),
         )
         if not directory:
             return
         try:
-            items = plan_export(self.project, directory, EXPORT_FORMATS[label])
+            items = plan_export(self.project, directory, EXPORT_FORMATS[label], **grid_options)
         except (OSError, ValueError) as error:
             self._show_error(f"Export failed: {error}")
             return
@@ -1050,9 +1078,12 @@ class MainWindow(QMainWindow):
         self._settings.setValue("export/format", label)
         self._settings.setValue("export/directory", directory)
         self._remember_directory(Path(directory) / "_")
-        self._start_export(Path(directory), EXPORT_FORMATS[label], overwrite=overwrite)
+        self._start_export(Path(directory), EXPORT_FORMATS[label], overwrite=overwrite, grid_options=grid_options)
 
-    def _start_export(self, directory: Path, extension: str, *, overwrite: bool = False) -> None:
+    def _start_export(
+        self, directory: Path, extension: str, *, overwrite: bool = False,
+        grid_options: dict | None = None,
+    ) -> None:
         if self._export_running:
             return
         self._export_total = sum(image.world_x is not None and image.world_y is not None for image in self.project.images)
@@ -1073,7 +1104,7 @@ class MainWindow(QMainWindow):
         dialog.show()
         self._update_hints()
         try:
-            worker.start(self.project, directory, extension, overwrite=overwrite)
+            worker.start(self.project, directory, extension, overwrite=overwrite, grid_options=grid_options)
         except (OSError, ValueError, RuntimeError) as error:
             self._on_export_finished(None, str(error))
 
@@ -1282,7 +1313,11 @@ class MainWindow(QMainWindow):
         canvas_state = self.project.canvas_state
         feedback = self._alignment_feedback
         previous_paths = {image.id: image.path for image in self.project.images}
+        previous_dimensions = {image.id: image.source_dimensions for image in self.project.images}
         self.project = Project.from_dict(snapshot)
+        for image in self.project.images:
+            if image.source_dimensions is None and previous_paths.get(image.id) == image.path:
+                image.source_dimensions = previous_dimensions.get(image.id)
         self.project.canvas_state = canvas_state
         self._alignment_feedback = feedback
         valid_image_ids = {image.id for image in self.project.images}
@@ -1441,11 +1476,6 @@ class MainWindow(QMainWindow):
             return
         world_images = []
         try:
-            to_mercator = Transformer.from_crs(
-                CRS.from_user_input(self.project.crs),
-                CRS.from_epsg(3857),
-                always_xy=True,
-            )
             to_geographic = Transformer.from_crs(
                 CRS.from_user_input(self.project.crs),
                 CRS.from_epsg(4326),
@@ -1466,26 +1496,23 @@ class MainWindow(QMainWindow):
                 continue
             pixmap, _error = self._display_pixmap_for_image(image)
             size = self._image_size(image, pixmap)
-            corners = None
-            if pixmap and not pixmap.isNull() and image.world_x is not None and image.world_y is not None:
-                angle = radians(image.world_rotation)
-
-                def to_world(pixel_x: float, pixel_y: float) -> tuple[float, float]:
-                    pixel_y = -pixel_y  # image Y points down, world Y points north
-                    return (
-                        image.world_x + image.world_scale * (cos(angle) * pixel_x - sin(angle) * pixel_y),
-                        image.world_y + image.world_scale * (sin(angle) * pixel_x + cos(angle) * pixel_y),
-                    )
-
-                corners = [
-                    to_mercator.transform(*to_world(0.0, 0.0)),
-                    to_mercator.transform(*to_world(float(size.width()), 0.0)),
-                    to_mercator.transform(*to_world(0.0, float(size.height()))),
-                ]
+            mapping_chain = None
+            if pixmap and not pixmap.isNull() and image.world_mapping is not None:
+                native_mapping = image.native_world_mapping
+                native_crs = native_mapping.native_crs if native_mapping is not None else self.project.crs
+                image_mapping_chain = (
+                    native_mapping.mapping_chain if native_mapping is not None
+                    else MappingChain((image.world_mapping,))
+                )
+                mapping_chain = MappingChain((
+                    *image_mapping_chain.steps,
+                    CRSMapping(native_crs, "EPSG:3857"),
+                ))
             world_images.append({
                 "id": image.id,
                 "pixmap": pixmap,
-                "mercator_corners": corners,
+                "mercator_corners": None,
+                "mapping_chain": mapping_chain,
                 "source_size": size,
                 "order": stack_order[image.id],
             })
@@ -1560,12 +1587,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Could not load '{Path(key[0]).name}' for the world map: {message}")
 
     def _image_world_point(self, image, pixel_x: float, pixel_y: float) -> tuple[float, float]:
-        angle = radians(image.world_rotation)
-        pixel_y = -pixel_y
-        return (
-            image.world_x + image.world_scale * (cos(angle) * pixel_x - sin(angle) * pixel_y),
-            image.world_y + image.world_scale * (sin(angle) * pixel_x + cos(angle) * pixel_y),
-        )
+        mapping = image.world_mapping
+        if mapping is None:
+            raise ValueError("The image does not have a geographic mapping.")
+        return mapping.map_point(pixel_x, pixel_y)
+
+    def _image_map_point(self, image, pixel_x: float, pixel_y: float) -> tuple[float, float]:
+        native = image.native_world_mapping
+        if native is not None:
+            chain = MappingChain((
+                *native.mapping_chain.steps,
+                CRSMapping(native.native_crs, "EPSG:3857"),
+            ))
+            return chain.map_point(pixel_x, pixel_y)
+        world = self._image_world_point(image, pixel_x, pixel_y)
+        return CRSMapping(self.project.crs, "EPSG:3857").map_point(*world)
 
     def _refresh_map_points(self) -> None:
         if not hasattr(self, "world_map") or not hasattr(self, "map_points_button"):
@@ -1590,13 +1626,12 @@ class MainWindow(QMainWindow):
                 continue
             georeferenced = point.geographic_x is not None and point.geographic_y is not None
             if georeferenced:
-                world = (point.geographic_x, point.geographic_y)
+                x, y = to_mercator.transform(point.geographic_x, point.geographic_y)
             else:
                 image = images.get(observation.image_id) if observation is not None else None
                 if image is None or image.world_x is None or image.world_y is None:
                     continue
-                world = self._image_world_point(image, observation.x, observation.y)
-            x, y = to_mercator.transform(*world)
+                x, y = self._image_map_point(image, observation.x, observation.y)
             if not (isfinite(x) and isfinite(y)):
                 continue
             overlay.append({
@@ -1605,6 +1640,7 @@ class MainWindow(QMainWindow):
                 "y": y,
                 "name": point.name,
                 "georeferenced": georeferenced,
+                "checkpoint": point.geographic_checkpoint,
                 "locked": bool(observation and observation.locked),
                 "selected": point.id == selected_id,
             })
@@ -1639,8 +1675,7 @@ class MainWindow(QMainWindow):
             self._show_error(f"Could not convert picked map location to {self.project.crs}: {error}")
             return
         before = self.project.to_dict()
-        point.geographic_x = map_x
-        point.geographic_y = map_y
+        self.project.set_point_geographic_coordinates(point, map_x, map_y)
         self.geo_x_edit.setText(f"{map_x:.8f}")
         self.geo_y_edit.setText(f"{map_y:.8f}")
         self._record_project_edit(before, "Set control point map coordinate")
@@ -2026,6 +2061,17 @@ class MainWindow(QMainWindow):
         self._refresh_canvas()
         self._refresh_details()
 
+    def _on_map_mapping_warning(self, image_ids: frozenset[str]) -> None:
+        if not image_ids:
+            return
+        names = {image.id: image.name for image in self.project.images}
+        listed = ", ".join(names.get(image_id, image_id) for image_id in sorted(image_ids)[:3])
+        remaining = len(image_ids) - min(len(image_ids), 3)
+        suffix = f" and {remaining} more" if remaining else ""
+        self.statusBar().showMessage(
+            f"Map reprojection clipped invalid/out-of-world areas or reached its subdivision limit for {listed}{suffix}; footprint may be incomplete or less accurate. Check the project CRS and image extent."
+        )
+
     def _on_layer_visibility_toggled(self, item: LayerItem, column: int) -> None:
         if item.kind == CONSTRAINT_KIND:
             return
@@ -2330,12 +2376,23 @@ class MainWindow(QMainWindow):
         if self._aligned_view_active():
             return
         image = next((item for item in self.project.images if item.id == image_id), None)
-        if image is None or image.rest_locked:
+        if image is None or image.rest_locked or image.rest_intrinsic is not None:
             return
         image.position_x = x
         image.position_y = y
         image.rotation = rotation
         image.scale = scale
+        if self._details_image() is image:
+            self.image_info_label.setText(self._image_info_text(image))
+        self._refresh_alignment_feedback()
+
+    def _on_image_mapping_changed(self, image_id: str, mapping: MatrixTransform) -> None:
+        if self._aligned_view_active():
+            return
+        image = next((item for item in self.project.images if item.id == image_id), None)
+        if image is None or image.rest_locked or mapping.model == "similarity" and image.rest_intrinsic is None:
+            return
+        image.set_layout_mapping(mapping)
         if self._details_image() is image:
             self.image_info_label.setText(self._image_info_text(image))
         self._refresh_alignment_feedback()
@@ -2383,6 +2440,9 @@ class MainWindow(QMainWindow):
                 if observation:
                     points.append((point.id, observation.x, observation.y, observation.locked, point.visible and image.visible))
             pose_x, pose_y, pose_rotation, pose_scale = self._canvas_pose(image)
+            aligned = self._aligned_view_active() and image.has_alignment
+            intrinsic = image.aligned_intrinsic if aligned else image.rest_intrinsic
+            layout_mapping = image.aligned_mapping if aligned else image.rest_mapping
             layers.append({
                 "id": image.id,
                 "visible": image.visible,
@@ -2393,6 +2453,7 @@ class MainWindow(QMainWindow):
                 "position_y": pose_y,
                 "rotation": pose_rotation,
                 "scale": pose_scale,
+                "mapping": layout_mapping if intrinsic is not None or isinstance(layout_mapping, WarpTransform) else None,
                 "points": points,
             })
         constraints = [(item.first_point_id, item.second_point_id) for item in self.project.constraints]
@@ -2417,7 +2478,12 @@ class MainWindow(QMainWindow):
         return read_preview(path)
 
     def _image_size(self, image, pixmap: QPixmap | None = None) -> QSize:
-        return self._image_sizes.get(image.id, pixmap.size() if pixmap is not None else QSize())
+        size = self._image_sizes.get(image.id)
+        if size is not None:
+            return size
+        if image.source_dimensions is not None:
+            return QSize(*image.source_dimensions)
+        return pixmap.size() if pixmap is not None else QSize()
 
     @staticmethod
     def _read_image_pixmap(path: str | Path) -> tuple[QPixmap, str]:
@@ -2469,11 +2535,19 @@ class MainWindow(QMainWindow):
             self._image_loader.request(key, image.path)
             return QPixmap(), ""
         decoded, error = self._read_preview_data(image.path)
+        if not decoded.isNull() and not self._source_geometry_matches(image, source_size(decoded)):
+            return QPixmap(), "Source dimensions changed; restore the original image geometry before using this mapped layout."
         pixmap = QPixmap.fromImage(decoded)
         if not decoded.isNull():
             self._image_sizes[image.id] = source_size(decoded)
             self._image_pixmaps[image.id] = pixmap
         return pixmap, error
+
+    @staticmethod
+    def _source_geometry_matches(image, size: QSize) -> bool:
+        if image.rest_intrinsic is None and image.aligned_intrinsic is None:
+            return True
+        return image.source_dimensions is None or image.source_dimensions == (size.width(), size.height())
 
     def _reset_image_loading(self, background: bool = False) -> None:
         self._tile_loader.clear_queued()
@@ -2508,6 +2582,8 @@ class MainWindow(QMainWindow):
             return
         if image.isNull():
             self._image_load_errors[image_id] = error or "Could not decode image"
+        elif not self._source_geometry_matches(record, source_size(image)):
+            self._image_load_errors[image_id] = "Source dimensions changed; restore the original image geometry before using this mapped layout."
         else:
             self._image_sizes[image_id] = source_size(image)
             self._image_pixmaps[image_id] = QPixmap.fromImage(image)
@@ -2933,7 +3009,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _point_text(point: GroundControlPoint) -> str:
-        return f"{point.display_name} · {point.label}" if point.label else point.display_name
+        text = f"{point.display_name} · {point.label}" if point.label else point.display_name
+        return f"{text} [checkpoint]" if point.geographic_checkpoint else text
 
     def _point_context(self, point: GroundControlPoint) -> str:
         image = next((image for image in self.project.images if image.id == point.image_id), None)
@@ -2942,6 +3019,8 @@ class MainWindow(QMainWindow):
             context += f"\nUnique name: {point.name}"
         if point.label:
             context += f"\nLabel: {point.label}"
+        if point.geographic_checkpoint:
+            context += "\nIndependent geographic checkpoint; excluded from georeferencing fit"
         return context
 
     def _point_choice(self, point: GroundControlPoint) -> str:
@@ -3007,10 +3086,13 @@ class MainWindow(QMainWindow):
         dimensions = self._image_size(image, pixmap)
         size = f"{dimensions.width()} x {dimensions.height()} px" if dimensions.isValid() else "unknown size"
         pose_x, pose_y, pose_rotation, pose_scale = self._canvas_pose(image)
+        intrinsic = image.aligned_intrinsic if self._aligned_view_active() and image.has_alignment else image.rest_intrinsic
+        pose_label = f"{intrinsic.model} mapping; outer pose " if intrinsic is not None else ""
         lines = [
             image.path,
             size,
             f"Canvas ({'aligned' if self._aligned_view_active() and image.has_alignment else 'rest'}): "
+            f"{pose_label}"
             f"position ({pose_x or 0.0:.1f}, {pose_y:.1f}), "
             f"rotation {pose_rotation:.2f}°, scale {pose_scale:.4f}",
             f"Rest transform: {'locked' if image.rest_locked else 'unlocked'}",
@@ -3072,6 +3154,13 @@ class MainWindow(QMainWindow):
         self.label_edit.setText(point.label or "")
         self.geo_x_edit.setText("" if point.geographic_x is None else str(point.geographic_x))
         self.geo_y_edit.setText("" if point.geographic_y is None else str(point.geographic_y))
+        self.geographic_checkpoint_checkbox.setChecked(point.geographic_checkpoint)
+        self.geographic_checkpoint_checkbox.setEnabled(
+            bool(point.observations) and (
+                point.geographic_checkpoint
+                or point.geographic_x is not None and point.geographic_y is not None
+            ),
+        )
         observation = point.observations[0] if point.observations else None
         self.pixel_x_edit.setText("" if observation is None else f"{observation.x:g}")
         self.pixel_y_edit.setText("" if observation is None else f"{observation.y:g}")
@@ -3377,14 +3466,18 @@ class MainWindow(QMainWindow):
             self._show_error(str(error))
             return
         before = self.project.to_dict()
-        point.geographic_x = geographic_x
-        point.geographic_y = geographic_y
+        try:
+            self.project.set_point_geographic_coordinates(point, geographic_x, geographic_y)
+        except ValueError as error:
+            self._show_error(str(error))
+            return
         if coordinates_changed:
             point.set_observation(observation.image_id, pixel_x, pixel_y)
         if renamed:
             point.name = name
             point.short_name = None
         point.label = self.label_edit.text().strip() or None
+        point.geographic_checkpoint = self.geographic_checkpoint_checkbox.isChecked()
         self._record_project_edit(before, "Edit control point")
         self._refresh_points(point.id)
 
@@ -3422,14 +3515,23 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Constraint properties updated.")
 
     def _on_map_crs_chosen(self, *_args) -> None:
-        value = self.map_crs_combo.currentText().strip()
+        if not _args and self.map_crs_combo.popup_selection_active:
+            return
+        index = _args[0] if _args and isinstance(_args[0], int) else -1
+        if 0 <= index < self.map_crs_combo.count():
+            value = self.map_crs_combo.itemData(index)
+        else:
+            value = self.map_crs_combo.currentText().strip()
+            match = self.map_crs_combo.findText(value, Qt.MatchFlag.MatchExactly)
+            if match >= 0:
+                value = self.map_crs_combo.itemData(match)
         if value and value != self.project.crs:
             self.crs_edit.setText(value)
             self._update_crs()
+        self._sync_map_crs_combo(self.project.crs)
 
     def _sync_map_crs_combo(self, text: str) -> None:
-        if self.map_crs_combo.currentText() != text:
-            self.map_crs_combo.setCurrentText(text)
+        self.map_crs_combo.set_compact_text(text)
 
     def _update_crs(self) -> None:
         if self._solver_running:
@@ -3449,6 +3551,7 @@ class MainWindow(QMainWindow):
             before = self.project.to_dict()
             previous_report = self._georeference_result
             previous_tolerance = self._georeference_result_tolerance
+            refit_started = False
 
             def restore() -> None:
                 self.project = Project.from_dict(before)
@@ -3459,8 +3562,29 @@ class MainWindow(QMainWindow):
                 self._refresh_all()
 
             try:
+                settings = self.project.georeference_settings
+                rebased_settings = rebase_georeference_settings(settings, self.project.crs, value)
+                if rebased_settings is None:
+                    old_unit = georeference_distance_unit(self.project.crs, settings).label
+                    new_unit = georeference_distance_unit(value, settings).label
+                    answer = QMessageBox.question(
+                        self, "Georeferencing accuracy units will change",
+                        f"Your georeferencing accuracy limit is in {old_unit}, but the new coordinate system uses {new_unit}. "
+                        "There is no exact conversion for this limit. If you continue, the same number will be used "
+                        "in the new units, which may make the fit much looser or stricter. Continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if answer != QMessageBox.StandardButton.Yes:
+                        self.crs_edit.setText(self.project.crs)
+                        self._sync_map_crs_combo(self.project.crs)
+                        return
+                else:
+                    self.project.georeference_settings = rebased_settings
+                self.project.ensure_native_geographic_coordinates()
                 self._reproject_project(transformer)
                 self.project.crs = value
+                refit_started = True
                 self._resolve_world_transforms()
             except SolverCancelled:
                 restore()
@@ -3468,11 +3592,27 @@ class MainWindow(QMainWindow):
                 return
             except (ValueError, RuntimeError, ImportError) as error:
                 restore()
-                self._show_error(f"Cannot switch to coordinate system '{value}': {error}")
+                if refit_started:
+                    self._show_solver_failure(
+                        "georeference", error,
+                        context=f"The project stayed in {before['crs']}; the coordinate system was not changed.",
+                    )
+                else:
+                    box = QMessageBox(
+                        QMessageBox.Icon.Warning, "Could not change coordinate system",
+                        "The project stayed in its current coordinate system.", parent=self,
+                    )
+                    box.setInformativeText(
+                        "Check that the chosen coordinate system is valid and that all saved map locations can be converted."
+                    )
+                    box.setDetailedText(str(error))
+                    box.setStandardButtons(QMessageBox.StandardButton.Ok)
+                    box.exec()
                 return
             self._record_project_edit(before, "Change coordinate system")
             self._refresh_points(self._selected_point().id if self._selected_point() else None)
             self._refresh_world_map(fit=True)
+            self.statusBar().showMessage(f"Project coordinate system changed to {value}.")
 
     def _resolve_world_transforms(self) -> None:
         """Refit image transforms to the reprojected GCPs, since reprojection alone is only a similarity approximation."""
@@ -3490,14 +3630,25 @@ class MainWindow(QMainWindow):
         self._update_hints()
         try:
             config = self.project.georeference_settings
-            result = self._compute_solver_result("georeference", self.project, config)
+            result = self._compute_solver_result(
+                "georeference", self.project, config, show_progress_dialog=False,
+            )
             assert isinstance(result, GeoreferenceResult)
+            mapping_records = result.mapping_records
             self._georeference_result = result
             self._georeference_result_tolerance = config.tolerance
             for image in self.project.images:
                 transform = result.transforms.get(image.id)
                 if transform is not None:
                     image.world_x, image.world_y, image.world_rotation, image.world_scale = transform
+                    if image.native_world_mapping is None:
+                        record = mapping_records.get(image.id)
+                        if record is not None:
+                            image.native_world_mapping = ImageMapping(
+                                record.mapping, record.target_frame, record.native_crs,
+                                record.source_frame, image.source_dimensions or record.source_size,
+                                record.matrix_crs,
+                            )
         finally:
             self._solver_running = False
             self._update_hints()
@@ -3505,11 +3656,19 @@ class MainWindow(QMainWindow):
     def _reproject_project(self, transformer: Transformer) -> None:
         for point in self.project.control_points:
             if point.geographic_x is not None and point.geographic_y is not None:
-                point.geographic_x, point.geographic_y = transformer.transform(point.geographic_x, point.geographic_y)
+                if point.geographic_native_x is None or point.geographic_native_crs is None:
+                    point.ensure_native_geographic_coordinates(self.project.crs)
+                source = CRS.from_user_input(point.geographic_native_crs)
+                target = transformer.target_crs
+                native_to_target = Transformer.from_crs(source, target, always_xy=True)
+                point.geographic_x, point.geographic_y = native_to_target.transform(
+                    point.geographic_native_x, point.geographic_native_y, errcheck=True,
+                )
         reference_length = 100.0
         for image in self.project.images:
             if image.world_x is None or image.world_y is None:
                 continue
+            image.ensure_native_world_mapping(self.project.crs)
             angle = radians(image.world_rotation)
             reach = image.world_scale * reference_length
             new_x, new_y = transformer.transform(image.world_x, image.world_y)
@@ -3602,7 +3761,14 @@ class MainWindow(QMainWindow):
             if pixmap.isNull():
                 continue
             size = self._image_size(image, pixmap)
-            bounds = QTransform().rotate(image.rotation).mapRect(QRectF(0, 0, size.width(), size.height()))
+            if image.rest_intrinsic is not None:
+                mapping = image.rest_mapping
+                minimum_x, minimum_y, maximum_x, maximum_y = mapping.domain_bounds(size.width(), size.height())
+                origin_x, origin_y = mapping.map_point(0, 0)
+                bounds = QRectF((minimum_x - origin_x) / image.scale, (minimum_y - origin_y) / image.scale,
+                                (maximum_x - minimum_x) / image.scale, (maximum_y - minimum_y) / image.scale)
+            else:
+                bounds = QTransform().rotate(image.rotation).mapRect(QRectF(0, 0, size.width(), size.height()))
             layout.append((image, bounds, bounds.width() * image.scale, bounds.height() * image.scale))
         if not layout:
             return
@@ -4037,10 +4203,18 @@ class MainWindow(QMainWindow):
         try:
             self._update_crs()
             self.project.views = {"canvas": self.canvas.view_state(), "map": self.world_map.view_state()}
-            save_project(self.project, destination)
+            candidate = Project.from_dict(self.project.to_dict())
+            for image in candidate.images:
+                size = self._image_sizes.get(image.id)
+                if size is not None and size.isValid():
+                    image.source_dimensions = (size.width(), size.height())
+            save_project(candidate, destination)
         except (OSError, ValueError, TypeError) as error:
             self._show_error(f"Could not save project: {error}")
             return False
+        dimensions = {image.id: image.source_dimensions for image in candidate.images}
+        for image in self.project.images:
+            image.source_dimensions = dimensions[image.id]
         self.project_path = destination
         self._remember_directory(destination)
         self._mark_project_saved()
@@ -4146,36 +4320,67 @@ class MainWindow(QMainWindow):
         self.canvas.fit_images(selected_image_ids or None)
 
     @contextmanager
-    def _solver_progress(self, stage: str):
+    def _solver_progress(self, stage: str, *, show_dialog: bool = True):
         title = "Aligning images" if stage == "alignment" else "Georeferencing images"
-        dialog = QProgressDialog(title, "Cancel", 0, 100, self)
-        dialog.setWindowTitle(title)
-        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-        dialog.setMinimumDuration(0)
-        dialog.setAutoClose(False)
-        dialog.setAutoReset(False)
+        dialog = QProgressDialog(title, "Cancel", 0, 100, self) if show_dialog else None
+        cancel_button = None
+        if dialog is not None:
+            dialog.setWindowTitle(title)
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+        else:
+            self._solver_cancel_requested = False
+            cancel_button = QToolButton(self.statusBar())
+            cancel_button.setText("Cancel")
+            cancel_button.setToolTip("Cancel the CRS-triggered georeference update")
+            cancel_button.setAccessibleName("Cancel georeference update")
+            cancel_button.setAutoRaise(True)
+            cancel_button.clicked.connect(self._cancel_solver_progress)
+            self.statusBar().addPermanentWidget(cancel_button)
+            self._solver_progress_cancel_button = cancel_button
+            self.statusBar().showMessage("Updating georeferenced images for the new CRS...")
         self._solver_progress_dialog = dialog
         clock = QElapsedTimer()
         clock.start()
         last_paint = [-1000]
 
         def update(fraction: float) -> None:
-            if dialog.wasCanceled():
+            if self._solver_cancel_requested or dialog is not None and dialog.wasCanceled():
                 raise SolverCancelled()
-            dialog.setValue(min(99, int(fraction * 100)))
+            percentage = min(99, int(fraction * 100))
+            if dialog is not None:
+                dialog.setValue(percentage)
+            else:
+                self.statusBar().showMessage(f"Updating georeferenced images for the new CRS... {percentage}%")
             if clock.elapsed() - last_paint[0] >= 40:
                 last_paint[0] = clock.elapsed()
                 QApplication.processEvents()
-            if dialog.wasCanceled():
+            if self._solver_cancel_requested or dialog is not None and dialog.wasCanceled():
                 raise SolverCancelled()
 
         try:
-            dialog.show()
+            if dialog is not None:
+                dialog.show()
             update(0)
             yield update
         finally:
-            dialog.close()
+            if dialog is not None:
+                dialog.close()
+            if cancel_button is not None:
+                self.statusBar().removeWidget(cancel_button)
+                cancel_button.deleteLater()
+                self._solver_progress_cancel_button = None
+                self._solver_cancel_requested = False
+                self.statusBar().clearMessage()
             self._solver_progress_dialog = None
+
+    def _cancel_solver_progress(self) -> None:
+        self._solver_cancel_requested = True
+        if self._solver_progress_cancel_button is not None:
+            self._solver_progress_cancel_button.setEnabled(False)
+        self.statusBar().showMessage("Cancelling the CRS-triggered georeference update...")
 
     def run_alignment(self) -> bool:
         return self._run_solver_pipeline(("alignment",))
@@ -4220,7 +4425,9 @@ class MainWindow(QMainWindow):
             return
         if stage not in ("alignment", "georeference"):
             raise ValueError(f"Unknown solver stage: {stage}")
-        dialog = SolverSettingsDialog(stage, getattr(self.project, f"{stage}_settings"), self)
+        dialog = SolverSettingsDialog(
+            stage, getattr(self.project, f"{stage}_settings"), self, project_crs=self.project.crs,
+        )
         dialog.settings_applied.connect(lambda settings: self._apply_solver_settings(stage, settings))
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.run_requested:
             if stage == "alignment":
@@ -4237,11 +4444,12 @@ class MainWindow(QMainWindow):
         self._update_hints()
 
     def _compute_solver_result(
-        self, stage: str, candidate: Project, config: SolverSettings,
+        self, stage: str, candidate: Project, config: SolverSettings, *, show_progress_dialog: bool = True,
     ) -> AlignmentResult | GeoreferenceResult:
-        with self._solver_progress(stage) as progress:
+        with self._solver_progress(stage, show_dialog=show_progress_dialog) as progress:
             if stage == "alignment":
                 initial = {}
+                initial_mappings = {}
                 for image in candidate.images:
                     displayed = self.canvas.image_transform(image.id) if not self._aligned_view_active() else None
                     initial[image.id] = (
@@ -4249,9 +4457,13 @@ class MainWindow(QMainWindow):
                         displayed[1] if image.position_x is None and displayed else image.position_y,
                         image.rotation, image.scale,
                     )
+                    if config.transform_model in ("affine", "projective", "tps"):
+                        displayed_mapping = self.canvas.image_mapping(image.id) if not self._aligned_view_active() else None
+                        initial_mappings[image.id] = displayed_mapping or image.rest_mapping or MatrixTransform.from_similarity(initial[image.id])
                 return simulate_alignment(
                     candidate, tolerance=config.tolerance, max_iterations=config.max_iterations,
                     initial_transforms=initial, progress=progress, settings=config,
+                    initial_mappings=initial_mappings if config.transform_model in ("affine", "projective", "tps") else None,
                 )
             initial = {
                 image.id: (image.world_x, image.world_y, image.world_rotation, image.world_scale)
@@ -4270,15 +4482,23 @@ class MainWindow(QMainWindow):
         try:
             readiness = self._solver_readiness(stages)
             errors = [issue for issue in readiness if issue.severity == "Error" and not (
-                len(stages) > 1 and issue.stage == "georeference" and issue.code == "invalid_frame"
+                len(stages) > 1 and issue.stage == "georeference" and (
+                    issue.code == "invalid_frame" or issue.code == "unsupported_layout_mapping" and
+                    (not any(image.rest_intrinsic is not None for image in self.project.images if image.id in issue.image_ids)
+                     or "alignment" in stages and self.project.alignment_settings.transform_model == "affine")
+                )
             )]
             if errors:
-                findings = "\n\n".join(f"{issue.stage.title()}: {issue.message}\n{issue.recommendation}" for issue in errors)
-                self._show_error(f"Cannot run solver:\n\n{findings}\n\nImage > Solver diagnostics can select affected items.")
+                findings = self._readiness_error_summary(errors)
+                self._show_error(findings)
                 return False
             warnings = sum(issue.severity == "Warning" for issue in readiness)
             warning_summary = f" | {warnings} readiness warning(s); see Image > Solver diagnostics" if warnings else ""
             candidate = Project.from_dict(self.project.to_dict())
+            for image in candidate.images:
+                size = self._image_sizes.get(image.id)
+                if image.source_dimensions is None and size is not None and size.isValid():
+                    image.source_dimensions = (size.width(), size.height())
             settings = {
                 "alignment": candidate.alignment_settings,
                 "georeference": candidate.georeference_settings,
@@ -4291,8 +4511,8 @@ class MainWindow(QMainWindow):
                     })
                     errors = [issue for issue in geographic_readiness if issue.severity == "Error"]
                     if errors:
-                        findings = "\n\n".join(f"{issue.message}\n{issue.recommendation}" for issue in errors)
-                        self._show_error(f"Cannot georeference aligned candidate:\n\n{findings}")
+                        findings = self._readiness_error_summary(errors, stage="georeference")
+                        self._show_error(findings)
                         return False
                     readiness = [issue for issue in readiness if issue.stage != "georeference"] + geographic_readiness
                     warnings = sum(issue.severity == "Warning" for issue in readiness)
@@ -4310,14 +4530,21 @@ class MainWindow(QMainWindow):
                     decision = self._review_solver_result(stage, result)
                     if decision == "apply":
                         self._apply_solver_results(results, settings)
+                        self.statusBar().showMessage("Best available fit applied. Remaining errors are listed in the solver report.")
                     elif decision == "settings":
                         QTimer.singleShot(0, lambda chosen=stage: self.open_solver_settings(chosen))
-                    self.statusBar().showMessage(self._solver_summary(stage, result, "Target not reached") + warning_summary)
+                        self.statusBar().showMessage("Solver settings opened. Existing transforms were not changed.")
+                    else:
+                        self.statusBar().showMessage("Fit not applied. Existing transforms were kept unchanged.")
                     return decision == "apply" and len(stages) == 1
                 if isinstance(result, AlignmentResult):
                     for image in candidate.images:
-                        if image.id in result.transforms:
-                            image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale = result.transforms[image.id]
+                        mapping = result.mappings.get(image.id)
+                        if mapping is not None:
+                            source_size = (result.source_dimensions or {}).get(image.id)
+                            if source_size is not None:
+                                image.source_dimensions = source_size
+                            image.set_layout_mapping(mapping, aligned=True)
                     candidate.canvas_state = "aligned"
             if not all(settings[stage].auto_apply for stage in stages):
                 self.statusBar().showMessage(" | ".join(
@@ -4333,11 +4560,34 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Solver cancelled. Existing transforms were retained.")
             return False
         except (ValueError, RuntimeError, ImportError) as error:
-            self._show_error(f"Solver failed: {error}")
+            self._show_solver_failure(stages[-1], error)
             return False
         finally:
             self._solver_running = False
             self._update_hints()
+
+    @staticmethod
+    def _readiness_error_summary(issues: list[ReadinessIssue], stage: str | None = None) -> str:
+        stage_name = stage.title() if stage else "Solver"
+        lines = [f"{stage_name} cannot start yet. Fix these items first:"]
+        for issue in issues[:4]:
+            finding, next_step = readiness_copy(issue)
+            lines.extend((f"\n{issue.stage.title()}: {finding}", f"Next step: {next_step}"))
+        if len(issues) > 4:
+            lines.append(f"\nAnd {len(issues) - 4} more. Open Image > Solver diagnostics to review all affected items.")
+        return "\n".join(lines)
+
+    def _show_solver_failure(self, stage: str, error: Exception, *, context: str | None = None) -> None:
+        reason, next_step = solver_failure_copy(stage, error)
+        title = "Could not align images" if stage == "alignment" else "Could not place images on the map"
+        box = QMessageBox(QMessageBox.Icon.Warning, title, reason, parent=self)
+        if context:
+            box.setInformativeText(f"{context}\n\nNext step: {next_step}")
+        else:
+            box.setInformativeText(f"Next step: {next_step}")
+        box.setDetailedText(str(error))
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
 
     def _apply_solver_results(self, results: dict[str, AlignmentResult | GeoreferenceResult], settings: dict[str, SolverSettings]) -> None:
         combined = len(results) > 1
@@ -4358,11 +4608,33 @@ class MainWindow(QMainWindow):
     def _solver_summary(stage: str, result: AlignmentResult | GeoreferenceResult, state: str) -> str:
         residuals = result.constraint_residuals if isinstance(result, AlignmentResult) else result.observation_residuals
         rms = sqrt(sum(value ** 2 for value in residuals.values()) / len(residuals)) if residuals else 0.0
-        units = "scene units" if stage == "alignment" else "CRS units"
-        return f"{stage.title()} {state.lower()} | RMS {rms:.3f} | Max {result.maximum_residual:.3f} {units}"
+        units = "scene units" if isinstance(result, AlignmentResult) else result.residual_units
+        summary = f"{stage.title()} {state.lower()} | RMS {rms:.3f} | Max {result.maximum_residual:.3f} {units}"
+        if isinstance(result, GeoreferenceResult) and (
+            result.checkpoint_residuals or result.unmapped_checkpoints
+        ):
+            summary += (
+                f" | Independent checkpoints: {len(result.checkpoint_residuals or {})} mapped, "
+                f"{len(result.unmapped_checkpoints)} unavailable, max "
+                f"{result.maximum_checkpoint_error:.3f} {units}"
+            )
+        return summary
 
     @staticmethod
     def _solver_termination_lines(stage: str, result: AlignmentResult | GeoreferenceResult) -> list[str]:
+        config = result.settings
+        if config is not None and config.transform_model == "tps":
+            lines = [
+                "Fit method: direct regularized TPS coefficient solve; optimizer iterations do not apply.",
+                f"Transform model: tps | Smoothing: {config.warp_smoothing:g}",
+                "Support policy: convex hull of control groups and source image boundaries",
+                f"Sampled relative area limit: {config.warp_min_relative_area:g}; "
+                f"sampled relative stretch limit: {config.warp_max_relative_stretch:g}",
+                "Sampled Jacobian checks are diagnostics, not a global injectivity guarantee.",
+            ]
+            if result.optimizer_message:
+                lines.append(f"Fit details: {result.optimizer_message}")
+            return lines
         limit = f" / {result.max_iterations}" if result.max_iterations is not None else ""
         reasons = {
             -1: "Optimizer could not proceed",
@@ -4373,6 +4645,7 @@ class MainWindow(QMainWindow):
             4: "Negligible improvement and very small transform changes (ftol and xtol)",
         }
         reason = reasons.get(result.optimizer_status, "Unavailable for this result")
+        units = "scene units" if isinstance(result, AlignmentResult) else result.residual_units
         lines = [
             f"Function evaluations: {result.iterations}{limit}",
             "The Maximum iterations setting limits function evaluations, not a required iteration count.",
@@ -4380,11 +4653,10 @@ class MainWindow(QMainWindow):
         ]
         if result.optimizer_message:
             lines.append(f"Optimizer message: {result.optimizer_message}")
-        config = result.settings
         if config is not None:
             lines.extend((
                 f"Transform model: {config.transform_model} | Optimizer: {config.optimizer_method}",
-                f"Residual loss: {config.loss} | Robust loss threshold: {config.loss_scale:g}",
+                f"Residual loss: {config.loss} | Robust loss threshold: {config.loss_scale:g} {units}",
                 f"Convergence thresholds: ftol={config.ftol:g}, xtol={config.xtol:g}, gtol={config.gtol:g}",
                 f"Parameter scaling: {config.parameter_scaling}",
             ))
@@ -4392,6 +4664,25 @@ class MainWindow(QMainWindow):
                 minimum = config.scale_min if config.scale_min is not None else (0.05 if stage == "alignment" else 1e-12)
                 maximum = config.scale_max if config.scale_max is not None else (20.0 if stage == "alignment" else float("inf"))
                 lines.append(f"Optimized scale bounds: {minimum:g} to {maximum:g}")
+            elif config.transform_model == "affine":
+                lines.append(
+                    f"Affine principal stretches: {config.affine_min_stretch:g} to {config.affine_max_stretch:g}; "
+                    f"maximum condition: {config.affine_max_condition:g}; "
+                    f"reflections {'allowed' if config.affine_allow_reflection else 'rejected'}"
+                )
+            elif config.transform_model == "projective":
+                lines.append(
+                    f"Projective stretches: {config.projective_min_stretch:g} to {config.projective_max_stretch:g}; "
+                    f"maximum condition: {config.projective_max_condition:g}; "
+                    f"horizon margin: {config.projective_horizon_margin:g}; "
+                    f"reflections {'allowed' if config.projective_allow_reflection else 'rejected'}"
+                )
+            elif config.transform_model == "tps":
+                lines.append(
+                    f"TPS smoothing: {config.warp_smoothing:g}; support: control convex hull; "
+                    f"minimum sampled relative area: {config.warp_min_relative_area:g}; "
+                    f"maximum sampled relative stretch: {config.warp_max_relative_stretch:g}"
+                )
             else:
                 lines.append("Fixed parameters: rotation and scale" if config.transform_model == "translation" else "Fixed parameters: scale")
             if config.loss != "linear":
@@ -4404,7 +4695,7 @@ class MainWindow(QMainWindow):
             self._alignment_feedback.tolerance if stage == "alignment" and self._alignment_feedback is not None
             else self._georeference_result_tolerance if stage == "georeference" else None
         )
-        units = "scene units" if stage == "alignment" else "CRS units"
+        units = "scene units" if isinstance(result, AlignmentResult) else result.residual_units
         target = f" (target {tolerance:g})" if tolerance is not None else ""
         reasons = {
             -1: "Optimizer could not proceed.",
@@ -4415,6 +4706,14 @@ class MainWindow(QMainWindow):
             4: "Improvement and transform changes became too small; numerical stagnation is possible.",
         }
         lines = [f"Maximum error: {result.maximum_residual:.4g} {units}{target}."]
+        if isinstance(result, GeoreferenceResult) and (
+            result.checkpoint_residuals or result.unmapped_checkpoints
+        ):
+            lines.append(
+                f"Independent checkpoints: {len(result.checkpoint_residuals or {})} mapped, "
+                f"{len(result.unmapped_checkpoints)} unavailable; maximum checkpoint error "
+                f"{result.maximum_checkpoint_error:.4g} {units}."
+            )
         if result.converged:
             lines.append("Target reached; no solver-setting change is needed for this fit.")
             return lines
@@ -4452,7 +4751,7 @@ class MainWindow(QMainWindow):
                 if stage == "alignment" else
                 "Next: Check the highest-error controls, their pixel positions, and the project CRS."
             )
-            if config is not None and config.transform_model != "similarity":
+            if config is not None and config.transform_model in ("translation", "rigid"):
                 lines.append(
                     "Then: Switch to rigid for rotation, or similarity for rotation and scale, if needed."
                     if config.transform_model == "translation" else
@@ -4463,9 +4762,12 @@ class MainWindow(QMainWindow):
         return lines
 
     def _review_solver_result(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> str:
-        box = QMessageBox(QMessageBox.Icon.Warning, "Solver target not reached",
-                          f"{stage.title()} target not reached", parent=self)
-        box.setInformativeText("\n".join(self._solver_review_lines(stage, result)))
+        title = "Alignment result" if stage == "alignment" else "Georeferencing result"
+        box = QMessageBox(
+            QMessageBox.Icon.Warning, title,
+            "The requested accuracy was not reached.", parent=self,
+        )
+        box.setInformativeText("\n".join(self._solver_review_popup_lines(stage, result)))
         box.setDetailedText("\n".join(self._solver_termination_lines(stage, result)))
         apply_button = box.addButton("Apply best result", QMessageBox.ButtonRole.AcceptRole)
         settings_button = box.addButton("Adjust settings", QMessageBox.ButtonRole.ActionRole)
@@ -4476,6 +4778,36 @@ class MainWindow(QMainWindow):
             return "apply"
         return "settings" if box.clickedButton() is settings_button else "discard"
 
+    def _solver_review_popup_lines(self, stage: str, result: AlignmentResult | GeoreferenceResult) -> list[str]:
+        config = result.settings
+        tolerance = config.tolerance if config is not None else (
+            self._alignment_feedback.tolerance if stage == "alignment" and self._alignment_feedback is not None
+            else self._georeference_result_tolerance if stage == "georeference" else None
+        )
+        units = "canvas units" if isinstance(result, AlignmentResult) else (
+            "metres" if result.residual_units.startswith("metres") else "map units"
+        )
+        limit = f" The allowed limit is {tolerance:g} {units}." if tolerance is not None else ""
+        reasons = {
+            0: "The solver stopped after reaching its step limit.",
+            1: "The fit stopped improving.",
+            2: "The fit stopped changing enough to continue.",
+            3: "The fit stopped changing enough to continue.",
+            4: "The fit stopped changing enough to continue.",
+            -1: "The solver could not make a usable fit.",
+        }
+        lines = [f"Largest point mismatch: {result.maximum_residual:.4g} {units}.{limit}"]
+        if result.optimizer_status in reasons:
+            lines.append(reasons[result.optimizer_status])
+        if result.optimizer_status == 0:
+            lines.append("Next step: raise Maximum solver steps, then run again.")
+        elif isinstance(result, AlignmentResult):
+            lines.append("Next step: check the largest-error links and move their points onto the same image features.")
+        else:
+            lines.append("Next step: check the largest-error control points, their map locations, and the project CRS.")
+        lines.append("Detailed solver information is available under Show Details.")
+        return lines
+
     def show_solver_report(self, stage: str) -> None:
         if self._solver_running:
             return
@@ -4484,7 +4816,7 @@ class MainWindow(QMainWindow):
         result = self._alignment_result if stage == "alignment" else self._georeference_result
         if result is None:
             return
-        units = "scene units" if stage == "alignment" else "CRS units"
+        units = "scene units" if isinstance(result, AlignmentResult) else result.residual_units
         lines = [
             f"{stage.title()} report",
             f"Status: {'target reached' if result.converged else 'target not reached'}",
@@ -4516,6 +4848,45 @@ class MainWindow(QMainWindow):
                 f"CRS: {result.crs}",
                 f"Images georeferenced: {len(result.transforms)}",
             ))
+            if result.metric_frames:
+                lines.append("")
+                lines.append("Local metric frames by connected group:")
+                for group_id, frame in result.metric_frames.items():
+                    group_name = image_names.get(group_id, group_id)
+                    lines.append(
+                        f"{group_name}: AEQD centered at {frame.center_longitude:.6f}, "
+                        f"{frame.center_latitude:.6f}; maximum control radius "
+                        f"{frame.maximum_control_radius_m / 1000:.2f} km; sampled pairwise distance "
+                        f"distortion {frame.sampled_distance_distortion:.3%}."
+                    )
+                    if frame.domain_sample_count is None:
+                        lines.append("Mapped image-domain distortion was not measured for this frame.")
+                    elif frame.domain_diagnostic_error:
+                        lines.append(
+                            f"Mapped image-domain diagnostic warning after {frame.domain_sample_count} samples: "
+                            f"{frame.domain_diagnostic_error}"
+                        )
+                        if frame.maximum_domain_radius_m is not None:
+                            lines.append(
+                                f"Known mapped-domain samples: maximum domain radius "
+                                f"{frame.maximum_domain_radius_m / 1000:.2f} km; sampled pairwise distance "
+                                f"distortion {frame.sampled_domain_distance_distortion:.3%}."
+                            )
+                    elif frame.domain_sample_count == 0:
+                        lines.append("Mapped image-domain distortion was not measured because source dimensions are unavailable.")
+                    else:
+                        lines.append(
+                            f"Mapped image-domain samples: {frame.domain_sample_count}; maximum domain radius "
+                            f"{frame.maximum_domain_radius_m / 1000:.2f} km; sampled pairwise distance distortion "
+                            f"{frame.sampled_domain_distance_distortion:.3%}."
+                        )
+                    if frame.needs_extent_warning:
+                        lines.append(
+                            "Warning: local-frame extent or sampled distortion is high, or the mapped-domain "
+                            "diagnostic is unavailable; inspect the image-domain coverage and independent checkpoints."
+                        )
+                    operation = CRSMapping(frame.crs, result.crs).operation_info
+                    lines.append(operation.summary(frame.crs, result.crs))
             if self._georeference_result_tolerance is not None:
                 lines.append(f"Target tolerance: {self._georeference_result_tolerance:g} {units}")
             lines.extend(("", "Residuals by image / control point:"))
@@ -4523,6 +4894,20 @@ class MainWindow(QMainWindow):
                 image_name = image_names.get(image_id, image_id)
                 point_name = point_names.get(point_id, point_id)
                 lines.append(f"{image_name} / {point_name}: {residual:.4f} {units}")
+            checkpoint_residuals = result.checkpoint_residuals or {}
+            if checkpoint_residuals or result.unmapped_checkpoints:
+                lines.extend(("", "Independent checkpoint errors (excluded from fit):"))
+                for (image_id, point_id), residual in checkpoint_residuals.items():
+                    image_name = image_names.get(image_id, image_id)
+                    point_name = point_names.get(point_id, point_id)
+                    lines.append(f"{image_name} / {point_name}: {residual:.4f} {units}")
+                for image_id, point_id in result.unmapped_checkpoints:
+                    image_name = image_names.get(image_id, image_id)
+                    point_name = point_names.get(point_id, point_id)
+                    lines.append(
+                        f"{image_name} / {point_name}: unavailable (image group was not georeferenced "
+                        "or mapping support failed)"
+                    )
         lines.extend(("", "Technical details", *self._solver_termination_lines(stage, result)))
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Last {stage} report")
@@ -4538,12 +4923,50 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _apply_alignment_result(self, result: AlignmentResult, tolerance: float = 0.5) -> None:
+        matrices = result.mappings
+        dimensions = {}
+        for image in self.project.images:
+            matrix = matrices.get(image.id)
+            if matrix is None:
+                continue
+            result_size = (result.source_dimensions or {}).get(image.id)
+            decoded_size = self._image_sizes.get(image.id)
+            authoritative_size = (
+                (decoded_size.width(), decoded_size.height()) if decoded_size is not None and decoded_size.isValid()
+                else image.source_dimensions
+            )
+            if result_size is not None and authoritative_size is not None and result_size != authoritative_size:
+                raise ValueError("Alignment result source dimensions do not match the current image geometry.")
+            known_size = result_size or authoritative_size
+            if known_size is None:
+                size = self._image_size(image, self._image_pixmaps.get(image.id))
+                if size.isValid():
+                    known_size = (size.width(), size.height())
+            if isinstance(matrix, WarpTransform) and known_size is None:
+                raise ValueError("TPS alignment requires known source dimensions before application.")
+            if isinstance(matrix, MatrixTransform) and not matrix.is_affine and known_size is None:
+                raise ValueError("Projective alignment requires known source dimensions before application.")
+            if known_size is not None:
+                if isinstance(matrix, MatrixTransform):
+                    matrix.domain_bounds(*known_size)
+                dimensions[image.id] = known_size
+            for point in self.project.control_points:
+                observation = point.observation_for(image.id)
+                if observation is not None:
+                    matrix.map_point(observation.x, observation.y)
         before = self.project.to_dict()
         for image in self.project.images:
-            transform = result.transforms.get(image.id)
-            if transform is None:
+            matrix = matrices.get(image.id)
+            if matrix is None:
                 continue
-            image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale = transform
+            if image.id in dimensions:
+                image.source_dimensions = dimensions[image.id]
+            if isinstance(matrix, MatrixTransform) and image.id in result.transforms and matrix.model == "similarity":
+                image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale = result.transforms[image.id]
+                image.aligned_intrinsic = None
+                image.aligned_warp = None
+            else:
+                image.set_layout_mapping(matrix, aligned=True)
         self.project.canvas_state = "aligned"
         self._alignment_feedback = AlignmentFeedback.capture(self.project, result, tolerance)
         self._record_project_edit(before, "Apply simulated alignment")
@@ -4552,6 +4975,11 @@ class MainWindow(QMainWindow):
         self._update_hints()
 
     def _apply_georeference_result(self, result: GeoreferenceResult) -> None:
+        if set(result.mappings) != set(result.transforms):
+            raise ValueError("Every applied geographic transform requires a complete native mapping.")
+        mapping_records = result.mapping_records
+        if set(mapping_records) != set(result.transforms):
+            raise ValueError("Every applied geographic transform requires a complete native mapping record.")
         before = self.project.to_dict()
         if result is not self._georeference_result:
             self._georeference_result_tolerance = None
@@ -4562,15 +4990,30 @@ class MainWindow(QMainWindow):
             if transform is None:
                 continue
             image.world_x, image.world_y, image.world_rotation, image.world_scale = transform
+            dimensions = (result.source_dimensions or {}).get(image.id)
+            if dimensions is not None:
+                image.source_dimensions = dimensions
+            record = mapping_records[image.id]
+            image.native_world_mapping = ImageMapping(
+                record.mapping, record.target_frame, record.native_crs, record.source_frame,
+                image.source_dimensions or record.source_size, record.matrix_crs,
+            )
         self._record_project_edit(before, "Apply GCP georeferencing")
         self.crs_edit.setText(self.project.crs)
         self._refresh_world_map(fit=True)
+        self._refresh_details()
         self._update_hints()
 
     def _project_document_state(self) -> dict:
         state = self.project.to_dict()
         state.pop("views", None)
         state.pop("canvas_state", None)
+        for image in state["images"]:
+            image.pop("source_dimensions", None)
+            for slot in image["mappings"].values():
+                for name in ("transform", "intrinsic"):
+                    if slot[name] is not None:
+                        slot[name].pop("source_size", None)
         return state
 
     def _is_project_modified(self) -> bool:

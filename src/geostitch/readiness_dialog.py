@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
 
 from geostitch.models import Project
 from geostitch.solver_readiness import ReadinessIssue
+from geostitch.solver_messages import readiness_copy
 
 
 class ReadinessDialog(QDialog):
@@ -60,7 +61,8 @@ class ReadinessDialog(QDialog):
         self.table.blockSignals(True)
         self.table.setRowCount(len(issues))
         for row, issue in enumerate(issues):
-            for column, text in enumerate((issue.severity, issue.stage.title(), issue.message)):
+            finding, _next_step = readiness_copy(issue)
+            for column, text in enumerate((issue.severity, issue.stage.title(), finding)):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
                 item.setData(Qt.ItemDataRole.UserRole, issue)
@@ -68,7 +70,10 @@ class ReadinessDialog(QDialog):
         self.table.blockSignals(False)
         errors = sum(issue.severity == "Error" for issue in issues)
         warnings = sum(issue.severity == "Warning" for issue in issues)
-        self.summary.setText(f"{errors} blocking issue(s); {warnings} warning(s)" if issues else "No readiness issues found")
+        self.summary.setText(
+            f"{errors} blocking issue(s) need fixing; {warnings} warning(s) may affect the result"
+            if issues else "Ready to solve"
+        )
         if issues:
             self.table.selectRow(0)
         self._show_details()
@@ -83,7 +88,8 @@ class ReadinessDialog(QDialog):
         if issue is None:
             self.details.clear()
             return
-        lines = [issue.message, "", issue.recommendation]
+        _finding, next_step = readiness_copy(issue)
+        lines = [f"Next step: {next_step}"]
         for title, identifiers, names in (("Images", issue.image_ids, self._image_names),
                                           ("Points", issue.point_ids, self._point_names),
                                           ("Links", issue.constraint_ids, self._link_names)):

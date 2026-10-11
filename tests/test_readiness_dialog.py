@@ -64,3 +64,34 @@ def test_diagnostics_controls_fit_compact_and_wide_dialog(width):
     finally:
         dialog.close()
         delete(dialog)
+
+
+def test_readiness_dialog_translates_solver_terms_into_plain_guidance():
+    app = QApplication.instance() or QApplication([])
+    project = Project()
+    first, second = project.add_image("one.png"), project.add_image("two.png")
+    points = []
+    from geostitch.models import GroundControlPoint, PointConstraint, SolverSettings
+
+    project.alignment_settings = SolverSettings(transform_model="projective")
+    for image, prefix in ((first, "a"), (second, "b")):
+        for index, location in enumerate(((0, 0), (10, 10), (20, 20))):
+            point = GroundControlPoint.create(f"{prefix}-{index}")
+            point.set_observation(image.id, *location)
+            project.add_control_point(point)
+            points.append(point)
+    for source, target in zip(points[:3], points[3:]):
+        project.add_constraint(PointConstraint.create(source.id, target.id))
+    issues = check_readiness(project, ("alignment",))
+    dialog = ReadinessDialog(project, issues)
+    try:
+        visible = dialog.table.item(0, 2).text()
+        details = dialog.details.toPlainText()
+        assert "well-spread links" in visible
+        assert "homography" not in visible.lower()
+        assert "Add matching points" in details
+        assert visible not in details
+        assert "non-collinear" not in details.lower()
+    finally:
+        dialog.close()
+        delete(dialog)

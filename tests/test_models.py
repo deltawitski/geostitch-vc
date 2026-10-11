@@ -9,6 +9,7 @@ def test_image_rest_lock_round_trips_and_legacy_defaults_unlocked():
     legacy = project.to_dict()
     legacy["version"] = 12
     del legacy["images"][0]["rest_locked"]
+    legacy["images"][0].pop("native_world_mapping")
     assert not Project.from_dict(legacy).images[0].rest_locked
 
 
@@ -44,6 +45,44 @@ def test_project_round_trips_linked_points_and_coordinates():
     assert restored.control_points[0].geographic_x == 500_000.0
     assert restored.control_points[0].label == "Old harbor pier"
     assert restored.control_points[0].observations[0].image_id == image.id
+
+
+def test_geographic_checkpoint_role_round_trips_and_legacy_defaults_to_fit_control():
+    project = Project(crs="EPSG:4326")
+    image = project.add_image("checkpoint.png")
+    point = GroundControlPoint.create("check-1")
+    point.set_observation(image.id, 10, 20)
+    point.set_geographic_coordinates(12.0, 45.0, project.crs)
+    point.geographic_checkpoint = True
+    project.add_control_point(point)
+
+    saved = project.to_dict()
+    restored = Project.from_dict(saved)
+    assert saved["version"] == 26
+    assert restored.point_by_id(point.id).geographic_checkpoint
+
+    legacy = dict(saved)
+    legacy["version"] = 25
+    legacy["control_points"] = [dict(saved_point) for saved_point in saved["control_points"]]
+    legacy["control_points"][0].pop("geographic_checkpoint")
+    assert not Project.from_dict(legacy).point_by_id(point.id).geographic_checkpoint
+
+
+def test_geographic_checkpoint_role_survives_shared_point_migration():
+    project = Project(crs="EPSG:4326")
+    first, second = [project.add_image(name) for name in ("first.png", "second.png")]
+    point = GroundControlPoint.create("legacy-checkpoint")
+    point.geographic_checkpoint = True
+    point.set_geographic_coordinates(12.0, 45.0, project.crs)
+    point.set_observation(first.id, 10, 20)
+    point.set_observation(second.id, 30, 40)
+    project.control_points.append(point)
+
+    restored = Project.from_dict(project.to_dict())
+
+    assert len(restored.control_points) == 2
+    assert all(item.geographic_checkpoint for item in restored.control_points)
+    assert {item.image_id for item in restored.control_points} == {first.id, second.id}
 
 
 def test_default_control_point_names_increase_per_image():
@@ -196,7 +235,7 @@ def test_project_serialization_is_an_independent_snapshot():
     image.position_x = 55.0
     point.observations[0].x = 44.0
 
-    assert snapshot["images"][0]["position_x"] is None
+    assert snapshot["images"][0]["mappings"]["rest"]["pose"][0] is None
     assert snapshot["control_points"][0]["observations"][0]["x"] == 10.0
 
 

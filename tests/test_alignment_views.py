@@ -297,6 +297,8 @@ def test_opening_older_project_clears_previous_feedback(solved_window, tmp_path)
     data = window.project.to_dict()
     data["version"] = 13
     data.pop("alignment_feedback")
+    for image in data["images"]:
+        image.pop("native_world_mapping")
     path = tmp_path / "older-project.gsp"
     path.write_text(json.dumps(data), encoding="utf-8")
     window._open_project_path(str(path))

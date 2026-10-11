@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite, sqrt
+from math import isfinite, sqrt, isclose
 from typing import Any
 
 from geostitch.adjustment import AlignmentResult, ImageTransform
 from geostitch.models import Project, SolverSettings
+from geostitch.mapping import ImageMapping
+from geostitch.transforms import MatrixTransform, similarity_mapping
+from geostitch.warp import WarpTransform
 
 
 def residual_color(value: float, tolerance: float) -> str:
@@ -19,7 +22,8 @@ def residual_color(value: float, tolerance: float) -> str:
 def _input_signature(project: Project) -> tuple:
     return (
         tuple(sorted(
-            (image.id, image.position_x, image.position_y, image.rotation, image.scale)
+            (image.id, image.position_x, image.position_y, image.rotation, image.scale,
+             image.rest_intrinsic.coefficients if image.rest_intrinsic is not None else None)
             for image in project.images
         )),
         tuple(sorted(
@@ -83,9 +87,10 @@ class AlignmentFeedback:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "version": 2,
+            "version": 5,
             "result": {
                 "transforms": {image_id: list(transform) for image_id, transform in self.result.transforms.items()},
+                "mappings": {image_id: record.to_dict() for image_id, record in self.result.mapping_records.items()},
                 "constraint_residuals": dict(self.result.constraint_residuals),
                 "iterations": self.result.iterations,
                 "converged": self.result.converged,
@@ -108,7 +113,7 @@ class AlignmentFeedback:
 
     @classmethod
     def _from_dict(cls, data: dict[str, Any]) -> AlignmentFeedback:
-        if not isinstance(data, dict) or data.get("version") not in (1, 2):
+        if not isinstance(data, dict) or data.get("version") not in (1, 2, 3, 4, 5):
             raise ValueError("Unsupported alignment feedback version.")
         tolerance = float(data["tolerance"])
         if not isfinite(tolerance) or tolerance <= 0:
@@ -125,6 +130,49 @@ class AlignmentFeedback:
             if not all(isfinite(value) for value in transform) or transform[3] <= 0:
                 raise ValueError("An alignment transform must be finite with a positive scale.")
             transforms[str(image_id)] = transform
+        matrices = None
+        warps = None
+        source_dimensions = None
+        if data["version"] >= 3:
+            saved_mappings = saved_result.get("mappings")
+            if not isinstance(saved_mappings, dict):
+                raise ValueError("Saved alignment mappings must be an object.")
+            matrices = {}
+            warps = {}
+            dimensions = {}
+            for image_id, saved_mapping in saved_mappings.items():
+                record = ImageMapping.from_dict(saved_mapping)
+                if record.target_frame != "layout":
+                    raise ValueError("An alignment result must map into layout coordinates.")
+                if isinstance(record.mapping, WarpTransform):
+                    if data["version"] < 5:
+                        raise ValueError("Saved TPS alignment mappings require feedback version 5.")
+                    warps[str(image_id)] = record.mapping
+                else:
+                    matrices[str(image_id)] = record.mapping
+                if record.source_size is not None:
+                    dimensions[str(image_id)] = record.source_size
+            source_dimensions = dimensions or None
+            for image_id, transform in transforms.items():
+                mapping = warps.get(image_id, matrices.get(image_id))
+                if mapping is None:
+                    raise ValueError("Saved alignment mapping is missing a compatibility transform.")
+                if isinstance(mapping, WarpTransform):
+                    from geostitch.adjustment import _mapping_compatibility_transform
+
+                    expected = _mapping_compatibility_transform(mapping.base_mapping)
+                    matches = all(isclose(actual, wanted, rel_tol=1e-12, abs_tol=1e-12)
+                                  for actual, wanted in zip(transform, expected))
+                else:
+                    from geostitch.adjustment import _mapping_compatibility_transform
+
+                    expected = _mapping_compatibility_transform(mapping)
+                    matches = all(isclose(actual, wanted, rel_tol=1e-12, abs_tol=1e-12)
+                                  for actual, wanted in zip(transform, expected))
+                if not matches:
+                    raise ValueError("Saved solver matrix and compatibility transform disagree.")
+            if not warps and set(matrices) == set(transforms) and all(matrix.model == "similarity" for matrix in matrices.values()):
+                matrices = None
         iterations = saved_result["iterations"]
         if not isinstance(iterations, int) or isinstance(iterations, bool) or iterations < 0 or not isinstance(saved_result["converged"], bool):
             raise ValueError("Invalid alignment solver status.")
@@ -146,31 +194,51 @@ class AlignmentFeedback:
             or not 1 <= max_iterations <= 10000
         ):
             raise ValueError("Invalid alignment evaluation limit.")
+        settings_data = saved_result.get("settings")
+        if settings_data is not None and (
+            not isinstance(settings_data, dict) or set(settings_data) != set(vars(SolverSettings()))
+        ):
+            raise ValueError("Saved alignment solver settings are incomplete or contain unknown fields.")
         result = AlignmentResult(
             transforms, _read_residuals(saved_result["constraint_residuals"]),
             iterations, saved_result["converged"], tuple(anchors),
             optimizer_status, optimizer_message, max_iterations,
             SolverSettings.from_dict(saved_result["settings"], SolverSettings()) if saved_result.get("settings") is not None else None,
+            matrices,
+            source_dimensions,
+            warps or None,
         )
         groups = data["input_signature"]
         if not isinstance(groups, list) or len(groups) != 3:
             raise ValueError("Invalid saved alignment inputs.")
         signature = []
-        for group, size in zip(groups, (5, 4, 3)):
-            if not isinstance(group, list) or any(not isinstance(entry, list) or len(entry) != size for entry in group):
+        for group, size in zip(groups, (6, 4, 3)):
+            allowed_sizes = (5, 6) if size == 6 and data["version"] < 4 else (size,)
+            if not isinstance(group, list) or any(not isinstance(entry, list) or len(entry) not in allowed_sizes for entry in group):
                 raise ValueError("Invalid saved alignment inputs.")
-            string_count = 1 if size == 5 else 2 if size == 4 else 3
-            for entry in group:
+            string_count = 1 if size == 6 else 2 if size == 4 else 3
+            entries = []
+            for saved_entry in group:
+                entry = list(saved_entry)
+                if size == 6 and len(entry) == 5:
+                    entry.append(None)
                 if not all(isinstance(value, str) for value in entry[:string_count]):
                     raise ValueError("Invalid saved alignment input ids.")
                 for index, value in enumerate(entry[string_count:], start=string_count):
-                    if size == 5 and index == 1 and value is None:
+                    if size == 6 and index == 5:
+                        if value is not None:
+                            if not isinstance(value, (list, tuple)) or len(value) != 9:
+                                raise ValueError("Invalid saved intrinsic mapping signature.")
+                            entry[index] = MatrixTransform(tuple(value)).coefficients
+                        continue
+                    if size == 6 and index == 1 and value is None:
                         continue
                     if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value):
                         raise ValueError("Saved alignment input positions must be finite numbers.")
-                if size == 5 and entry[4] <= 0:
+                if size == 6 and entry[4] <= 0:
                     raise ValueError("Saved alignment input scale must be positive.")
-            signature.append(tuple(tuple(entry) for entry in group))
+                entries.append(tuple(entry))
+            signature.append(tuple(entries))
         input_signature = tuple(signature)
         point_residuals, image_residuals = _residual_summaries(result, input_signature)
         return cls(result, tolerance, point_residuals, image_residuals, input_signature)
@@ -180,10 +248,19 @@ class AlignmentFeedback:
 
     def matches_layout(self, project: Project, current: bool | None = None) -> bool:
         images = {image.id: image for image in project.images}
-        for image_id, transform in self.result.transforms.items():
+        for image_id, matrix in self.result.mappings.items():
             image = images.get(image_id)
             if image is None or not image.has_alignment:
                 return False
-            if (image.aligned_x, image.aligned_y, image.aligned_rotation, image.aligned_scale) != transform:
+            applied = image.aligned_mapping
+            if applied is None:
+                return False
+            if isinstance(matrix, WarpTransform):
+                if not isinstance(applied, WarpTransform) or applied.to_dict() != matrix.to_dict():
+                    return False
+            elif not isinstance(applied, MatrixTransform) or any(
+                not isclose(actual, wanted, rel_tol=1e-13, abs_tol=1e-12)
+                for actual, wanted in zip(applied.coefficients, matrix.coefficients)
+            ):
                 return False
         return self.is_current(project) if current is None else current

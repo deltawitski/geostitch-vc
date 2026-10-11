@@ -28,17 +28,34 @@ def find_replacements(
 def apply_replacements(images: Iterable[ImageRecord], replacements: dict[str, Path]) -> list[str]:
     images_by_id = {image.id: image for image in images}
     resolved = {}
+    validated_dimensions = {}
     for image_id, path in replacements.items():
         if image_id not in images_by_id:
             raise ValueError("The image is no longer in the project.")
         path = path.expanduser().resolve()
         if not path.is_file():
             raise ValueError(f"Replacement image does not exist: {path}")
+        image = images_by_id[image_id]
+        projective = any(matrix is not None and not matrix.is_affine for matrix in (image.rest_intrinsic, image.aligned_intrinsic))
+        if projective and image.path != str(path):
+            from PIL import Image
+
+            try:
+                with Image.open(path) as source:
+                    width, height = source.size
+                    if source.getexif().get(274, 1) in (5, 6, 7, 8):
+                        width, height = height, width
+            except (OSError, ValueError) as error:
+                raise ValueError(f"Cannot validate replacement image geometry: {path}") from error
+            if (width, height) != image.source_dimensions:
+                raise ValueError("Projective image replacement changes source dimensions; review the mapping geometry before replacing this file.")
+            validated_dimensions[image_id] = (width, height)
         resolved[image_id] = path
     changed = []
     for image_id, path in resolved.items():
         image = images_by_id[image_id]
         if image.path != str(path):
             image.path = str(path)
+            image.source_dimensions = validated_dimensions.get(image_id)
             changed.append(image_id)
     return changed

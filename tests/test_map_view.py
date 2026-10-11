@@ -2,7 +2,7 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtGui import QColor, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QPixmap, QTransform, QWheelEvent
 from PySide6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QSettings, QPointF, Qt
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
@@ -10,9 +10,11 @@ from pyproj import Transformer
 import pytest
 
 from geostitch.app import MainWindow
-from geostitch.georeference import GeoreferenceResult
+from geostitch.georeference import GeoreferenceResult, _world_compatibility_transform
+from geostitch.mapping import ImageMapping
 from geostitch.map_view import WorldMapView
-from geostitch.models import GroundControlPoint, VectorLayer
+from geostitch.models import GroundControlPoint, Project, VectorLayer
+from geostitch.transforms import MatrixTransform
 
 
 @pytest.mark.parametrize("direction", [1, -1])
@@ -76,7 +78,7 @@ def test_saved_map_view_clamps_extreme_finite_scales(monkeypatch, scale):
         view.restore_view_state({"center": [1e300, -1e300], "scale": scale})
         expected = minimum if scale < minimum else maximum
         assert view.transform().m11() == pytest.approx(expected)
-        assert abs(view.view_state()["center"][0]) <= view.WORLD_ORIGIN + 1 / expected
+        assert abs(view.view_state()["center"][0]) <= 3 * view.WORLD_ORIGIN + 1 / expected
         assert abs(view.view_state()["center"][1]) <= view.WORLD_ORIGIN + 1 / expected
     finally:
         view.close()
@@ -191,6 +193,38 @@ def test_osm_tiles_use_smooth_downsampling(monkeypatch):
         assert tile.transformationMode() == Qt.TransformationMode.SmoothTransformation
         assert tile.scale() == pytest.approx(2 * view.WORLD_ORIGIN / (1 << key[0]) / 256)
         assert tile.pixmap().size() == pixmap.size()
+    finally:
+        view.close()
+
+
+def test_osm_tiles_do_not_repeat_beyond_single_world_extent(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    update_tiles = WorldMapView._update_visible_tiles
+    monkeypatch.setattr(WorldMapView, "_update_visible_tiles", lambda self: None)
+    view = WorldMapView()
+    view.resize(640, 420)
+    urls = []
+    tile_keys = []
+
+    class Reply:
+        def setProperty(self, name, value):
+            if name == "tileKey":
+                tile_keys.append(value)
+
+    monkeypatch.setattr(view._manager, "get", lambda request: urls.append(request.url().toString()) or Reply())
+    try:
+        scale = 2 ** 8 / 156543.03392804097
+        view.setTransform(QTransform.fromScale(scale, scale))
+        view.centerOn(view.WORLD_ORIGIN + 1000, 0)
+        update_tiles(view)
+
+        tile_count = 1 << view._zoom
+        requested_x = [int(url.split("/")[-2]) for url in urls]
+        assert all(0 <= x < tile_count for _zoom, x, _y in tile_keys)
+        assert requested_x
+        assert all(0 <= x < tile_count for x in requested_x)
+        assert all(0 <= x < tile_count for _zoom, x, _y in view._tile_items)
+        assert abs(view.view_state()["center"][0]) <= view.WORLD_ORIGIN
     finally:
         view.close()
 
@@ -365,12 +399,130 @@ def test_app_map_dock_updates_when_georeference_result_is_applied(tmp_path):
     window._apply_georeference_result(result)
 
     map_item = window.world_map._image_items[image.id]
+    assert window.project.images[0].native_world_mapping.native_crs == "EPSG:26910"
     to_mercator = Transformer.from_crs("EPSG:26910", "EPSG:3857", always_xy=True)
     top_left = to_mercator.transform(510_000.0, 5_410_000.0)
-    assert map_item.mapToScene(QPointF(0.0, 0.0)).x() == pytest.approx(top_left[0])
-    assert map_item.mapToScene(QPointF(0.0, 0.0)).y() == pytest.approx(-top_left[1])
+    assert map_item.map_source_to_scene((0.0, 0.0)) == pytest.approx((top_left[0], -top_left[1]))
     assert window.world_map_dock.windowTitle() == "World Map · EPSG:26910"
     window.close()
+
+
+def test_app_applies_and_undoes_full_chain_georeference_result(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    image_path = tmp_path / "local-frame-world.png"
+    pixmap = QPixmap(40, 30)
+    pixmap.fill(QColor("#387765"))
+    assert pixmap.save(str(image_path))
+    window = MainWindow(QSettings(str(tmp_path / "local-frame-world.ini"), QSettings.Format.IniFormat))
+    window.project_path = tmp_path / "local-frame-world.gsp"
+    image = window.project.add_image(image_path)
+    image.source_dimensions = (40, 30)
+    point = GroundControlPoint.create("Placed control")
+    point.set_observation(image.id, 20, 15)
+    window.project.add_control_point(point)
+    matrix = MatrixTransform.from_affine((10, 0, 500000, 0, -10, 5400000))
+    record = ImageMapping(
+        matrix, "native_crs", "EPSG:4326", source_size=(40, 30), matrix_crs="EPSG:32610",
+    )
+    window._image_pixmaps[image.id] = pixmap
+    window._image_sizes[image.id] = pixmap.size()
+    result = GeoreferenceResult(
+        transforms={image.id: _world_compatibility_transform(record.mapping_chain)},
+        observation_residuals={}, iterations=1, converged=True, crs="EPSG:4326",
+        matrix_transforms={image.id: matrix}, source_dimensions={image.id: (40, 30)},
+        native_mapping_records={image.id: record},
+    )
+
+    try:
+        window._apply_georeference_result(result)
+        applied = window.project.images[0].native_world_mapping
+        assert applied == record
+        local_point = record.mapping_chain.map_point(20, 15)
+        longitude, latitude = local_point
+        expected = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform(longitude, latitude)
+        assert window.world_map._image_items[image.id].map_source_to_scene((20, 15)) == pytest.approx(
+            (expected[0], -expected[1]), abs=1e-7,
+        )
+        window.map_points_button.setChecked(True)
+        window._refresh_map_points()
+        marker = next(marker for marker in window.world_map._point_overlay_items if marker.data(0) == point.id)
+        assert (marker.scenePos().x(), marker.scenePos().y()) == pytest.approx(
+            (expected[0], -expected[1]), abs=1e-7,
+        )
+        assert window.save_current_project()
+        assert Project.from_dict(window.project.to_dict()).images[0].native_world_mapping == record
+        window.undo_stack.undo()
+        assert window.project.images[0].native_world_mapping is None
+        window.undo_stack.redo()
+        assert window.project.images[0].native_world_mapping == record
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("crs, origin, rotation, scale", [
+    ("EPSG:4326", (10.0, 60.0), 0.0, 0.001),
+    ("EPSG:26910", (500000.0, 5400000.0), 17.0, 20.0),
+    ("EPSG:3857", (-1_000_000.0, 5_000_000.0), -12.0, 100.0),
+])
+def test_application_map_chain_matches_pyproj_across_source_interior(tmp_path, crs, origin, rotation, scale):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / f"map-{crs.replace(':', '-')}.png"
+    pixmap = QPixmap(800, 600)
+    pixmap.fill(QColor("#387765"))
+    assert pixmap.save(str(path))
+    window = MainWindow(QSettings(str(tmp_path / f"settings-{crs.replace(':', '-')}.ini"), QSettings.Format.IniFormat))
+    image = window.project.add_image(path)
+    image.world_x, image.world_y = origin
+    image.world_rotation, image.world_scale = rotation, scale
+    window._image_pixmaps[image.id] = pixmap
+    window._image_sizes[image.id] = pixmap.size()
+    window.project.crs = crs
+    window._refresh_world_map()
+    item = window.world_map._image_items[image.id]
+    converter = Transformer.from_crs(crs, "EPSG:3857", always_xy=True)
+    try:
+        for column in range(0, 801, 80):
+            for row in range(0, 601, 60):
+                world_x, world_y = image.world_mapping.map_point(column, row)
+                map_x, map_y = converter.transform(world_x, world_y, errcheck=True)
+                assert item.map_source_to_scene((column, row)) == pytest.approx((map_x, -map_y), abs=1e-7)
+        assert item._scene_bounds.width() > 0 and item._scene_bounds.height() > 0
+    finally:
+        window.close()
+
+
+def test_application_map_chain_includes_native_local_matrix_crs(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "local-frame-map.png"
+    pixmap = QPixmap(800, 600)
+    pixmap.fill(QColor("#387765"))
+    assert pixmap.save(str(path))
+    window = MainWindow(QSettings(str(tmp_path / "local-frame-map.ini"), QSettings.Format.IniFormat))
+    image = window.project.add_image(path)
+    image.world_x, image.world_y = 10, 45
+    image.source_dimensions = (800, 600)
+    image.native_world_mapping = ImageMapping(
+        MatrixTransform.from_affine((20, 0, 500000, 0, -20, 5400000)),
+        "native_crs", "EPSG:4326", source_size=(800, 600), matrix_crs="EPSG:32610",
+    )
+    window.project.crs = "EPSG:4326"
+    window._image_pixmaps[image.id] = pixmap
+    window._image_sizes[image.id] = pixmap.size()
+
+    try:
+        window._refresh_world_map()
+        item = window.world_map._image_items[image.id]
+        local_x, local_y = image.native_world_mapping.mapping.map_point(400, 300)
+        longitude, latitude = Transformer.from_crs(
+            "EPSG:32610", "EPSG:4326", always_xy=True,
+        ).transform(local_x, local_y, errcheck=True)
+        expected_x, expected_y = Transformer.from_crs(
+            "EPSG:4326", "EPSG:3857", always_xy=True,
+        ).transform(longitude, latitude, errcheck=True)
+
+        assert item.map_source_to_scene((400, 300)) == pytest.approx((expected_x, -expected_y), abs=1e-7)
+    finally:
+        window.close()
 
 
 def test_map_coordinate_pick_has_visible_cancel_control(tmp_path):

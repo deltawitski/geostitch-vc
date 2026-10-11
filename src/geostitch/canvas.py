@@ -18,6 +18,10 @@ from PySide6.QtWidgets import (
 
 from geostitch.icons import KIND_COLORS
 from geostitch.image_item import SourceImageItem
+from geostitch.transforms import MatrixTransform
+from geostitch.warp import WarpTransform
+from geostitch.warped_layout_item import WarpedLayoutImageItem
+from geostitch.qt_transforms import from_qtransform, to_qtransform
 from geostitch.alignment_feedback import residual_color
 from geostitch.view_navigation import zoom_at_cursor
 from geostitch.view_controls import ActiveToolHint, overlay_toggle
@@ -103,6 +107,7 @@ class ImageCanvas(QGraphicsView):
     point_marker_toggled = Signal(str, str)
     background_clicked = Signal()
     transform_changed = Signal(str, float, float, float, float)
+    mapping_changed = Signal(str, object)
     transform_interaction_started = Signal(str)
     transform_interaction_finished = Signal(str)
 
@@ -125,6 +130,8 @@ class ImageCanvas(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setRenderHint(self.renderHints() | self.renderHints().Antialiasing)
         self._layers: dict[str, QGraphicsPixmapItem] = {}
+        self._matrix_models: dict[str, str] = {}
+        self._warp_mappings: dict[str, WarpTransform] = {}
         self._locked_images: set[str] = set()
         self._points: dict[tuple[str, str], tuple[float, float]] = {}
         self._point_items: dict[tuple[str, str], QGraphicsEllipseItem] = {}
@@ -147,6 +154,7 @@ class ImageCanvas(QGraphicsView):
         self._transform_start_scale = 1.0
         self._transform_start_rotation = 0.0
         self._transform_start_distance = 1.0
+        self._transform_start_mapping: MatrixTransform | None = None
         self._constraints: list[tuple[str, str]] = []
         self._constraint_residuals: dict[int, float] = {}
         self._residual_tolerance = 0.5
@@ -208,6 +216,24 @@ class ImageCanvas(QGraphicsView):
             self._position_view_controls()
 
     def set_layers(self, layers: list[dict], constraints: list[tuple[str, str]] | None = None) -> None:
+        for layer in layers:
+            mapping = layer.get("mapping")
+            if mapping is not None:
+                size = layer.get("source_size")
+                if size is None or not size.isValid():
+                    size = layer["pixmap"].size()
+                if isinstance(mapping, MatrixTransform) and size.isValid():
+                    mapping.domain_bounds(size.width(), size.height())
+                elif isinstance(mapping, WarpTransform):
+                    if not size.isValid() or mapping.supports((
+                        (0.0, 0.0), (float(size.width()), 0.0),
+                        (float(size.width()), float(size.height())), (0.0, float(size.height())),
+                    )) != (True, True, True, True):
+                        raise ValueError("Canvas TPS mappings must cover the complete source image domain.")
+                else:
+                    raise ValueError("Canvas mappings require a validated matrix or TPS transform.")
+                for point in layer["points"]:
+                    mapping.map_point(point[1], point[2])
         previous_selected_ids = set(self._selected_image_ids)
         self._locked_images.clear()
         self._locked_points.clear()
@@ -237,6 +263,8 @@ class ImageCanvas(QGraphicsView):
         for image_id in list(self._layers):
             if image_id not in valid_ids:
                 self._scene.removeItem(self._layers.pop(image_id))
+                self._matrix_models.pop(image_id, None)
+                self._warp_mappings.pop(image_id, None)
         if not valid_layers:
             if self._marquee_item is not None:
                 self._scene.removeItem(self._marquee_item)
@@ -256,11 +284,27 @@ class ImageCanvas(QGraphicsView):
             if layer.get("rest_locked", False):
                 self._locked_images.add(image_id)
             pixmap_item = previous_layers.get(image_id)
-            if pixmap_item is None:
-                pixmap_item = SourceImageItem(layer["pixmap"], layer.get("source_size"))
-                self._scene.addItem(pixmap_item)
+            mapping = layer.get("mapping")
+            if isinstance(mapping, WarpTransform):
+                if not isinstance(pixmap_item, WarpedLayoutImageItem):
+                    if pixmap_item is not None:
+                        self._scene.removeItem(pixmap_item)
+                    pixmap_item = WarpedLayoutImageItem(layer["pixmap"], mapping, layer.get("source_size"))
+                    self._scene.addItem(pixmap_item)
+                else:
+                    pixmap_item.set_source_image(layer["pixmap"], layer.get("source_size"))
+                    pixmap_item.set_mapping(mapping)
+                self._matrix_models[image_id] = "tps"
+                self._warp_mappings[image_id] = mapping
             else:
-                pixmap_item.set_source_image(layer["pixmap"], layer.get("source_size"))
+                if isinstance(pixmap_item, WarpedLayoutImageItem):
+                    self._scene.removeItem(pixmap_item)
+                    pixmap_item = None
+                if pixmap_item is None:
+                    pixmap_item = SourceImageItem(layer["pixmap"], layer.get("source_size"))
+                    self._scene.addItem(pixmap_item)
+                else:
+                    pixmap_item.set_source_image(layer["pixmap"], layer.get("source_size"))
             pixmap_item.setData(0, image_id)
             pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsSelectable, True)
             pixmap_item.setFlag(QGraphicsPixmapItem.GraphicsItemFlag.ItemIsMovable, not self._read_only and image_id not in self._locked_images)
@@ -268,18 +312,37 @@ class ImageCanvas(QGraphicsView):
             pixmap_item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
             pixmap_item.setZValue(index)
             pixmap_item.setVisible(layer.get("visible", True))
-            x = layer["position_x"] if layer["position_x"] is not None else layout_x
+            x = layer.get("position_x") if layer.get("position_x") is not None else layout_x
             dragging = self._dragged_image_id is not None and image_id in previous_selected_ids
+            dragging |= self._active_transform_handle is not None and image_id == self._active_image_id
             if not dragging:
-                poses_changed |= (
-                    pixmap_item.pos() != QPointF(x, layer["position_y"])
-                    or pixmap_item.rotation() != layer["rotation"]
-                    or pixmap_item.scale() != layer["scale"]
-                )
-                pixmap_item.setPos(x, layer["position_y"])
-                pixmap_item.setRotation(layer["rotation"])
-                pixmap_item.setScale(layer["scale"])
-            layout_x = x + pixmap_item.boundingRect().width() * layer["scale"] + 40.0
+                if isinstance(mapping, WarpTransform):
+                    pixmap_item.setPos(0, 0)
+                    pixmap_item.setRotation(0)
+                    pixmap_item.setScale(1)
+                elif mapping is not None:
+                    transform = to_qtransform(mapping)
+                    poses_changed |= pixmap_item.sceneTransform() != transform
+                    self._set_item_mapping(pixmap_item, mapping)
+                    self._matrix_models[image_id] = mapping.model
+                    self._warp_mappings.pop(image_id, None)
+                else:
+                    poses_changed |= (
+                        pixmap_item.pos() != QPointF(x, layer["position_y"])
+                        or pixmap_item.rotation() != layer["rotation"]
+                        or pixmap_item.scale() != layer["scale"]
+                        or not pixmap_item.transform().isIdentity()
+                    )
+                    pixmap_item.setTransform(QTransform())
+                    pixmap_item.setPos(x, layer["position_y"])
+                    pixmap_item.setRotation(layer["rotation"])
+                    pixmap_item.setScale(layer["scale"])
+                    self._matrix_models.pop(image_id, None)
+                    self._warp_mappings.pop(image_id, None)
+            layout_x = (
+                pixmap_item.sceneBoundingRect().right() + 40.0 if image_id in self._matrix_models
+                else x + pixmap_item.boundingRect().width() * layer["scale"] + 40.0
+            )
             self._layers[image_id] = pixmap_item
             for point_data in layer["points"]:
                 visible = True
@@ -296,7 +359,7 @@ class ImageCanvas(QGraphicsView):
                     self._add_point_marker(pixmap_item, point_id, pixel_x, pixel_y, locked, visible)
                 else:
                     self._points[key] = (pixel_x, pixel_y)
-                    marker.setPos(pixmap_item.mapToScene(QPointF(pixel_x, pixel_y)))
+                    marker.setPos(self._source_to_scene(image_id, QPointF(pixel_x, pixel_y)))
                     marker.setVisible(visible)
                     if locked:
                         self._locked_points.add(key)
@@ -357,10 +420,11 @@ class ImageCanvas(QGraphicsView):
         for image_id, item in self._layers.items():
             if not item.isVisible():
                 continue
-            corners = (item.mapToScene(corner) for corner in (
-                item.boundingRect().topLeft(), item.boundingRect().topRight(),
-                item.boundingRect().bottomRight(), item.boundingRect().bottomLeft(),
-            ))
+            corners = (
+                (corner if isinstance(item, WarpedLayoutImageItem) else item.mapToScene(corner))
+                for corner in (item.boundingRect().topLeft(), item.boundingRect().topRight(),
+                               item.boundingRect().bottomRight(), item.boundingRect().bottomLeft())
+            )
             if all(path.contains(corner) for corner in corners):
                 images.append(image_id)
         points = [
@@ -398,7 +462,7 @@ class ImageCanvas(QGraphicsView):
         marker = QGraphicsEllipseItem(-6, -6, 12, 12)
         marker.setVisible(visible)
         marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
-        marker.setPos(parent.mapToScene(QPointF(x, y)))
+        marker.setPos(self._source_to_scene(parent.data(0), QPointF(x, y)))
         color = QColor(KIND_COLORS["point"])
         marker.setPen(QPen(color, 2))
         color.setAlpha(90)
@@ -519,6 +583,15 @@ class ImageCanvas(QGraphicsView):
         item = self._layers.get(image_id)
         if item is None or image_id in self._locked_images or self._read_only:
             return
+        if image_id in self._matrix_models and self._matrix_models[image_id] != "similarity":
+            raise ValueError("General mappings must be edited using complete mappings or canvas handles.")
+        if image_id in self._matrix_models:
+            pose_x, pose_y, pose_rotation, pose_scale = self.image_mapping(image_id).to_similarity()
+            item.setTransform(QTransform())
+            item.setPos(pose_x, pose_y)
+            item.setRotation(pose_rotation)
+            item.setScale(pose_scale)
+            self._matrix_models.pop(image_id, None)
         if rotation is not None:
             item.setRotation(rotation)
         if scale is not None:
@@ -530,15 +603,67 @@ class ImageCanvas(QGraphicsView):
         item = self._layers.get(image_id)
         if item is None or image_id in self._locked_images or self._read_only:
             return
-        item.setPos(x, y)
+        if image_id in self._matrix_models:
+            mapping = self.image_mapping(image_id)
+            origin_x, origin_y = mapping.map_point(0, 0)
+            translation = MatrixTransform.from_similarity((x - origin_x, y - origin_y, 0, 1))
+            self._set_item_mapping(item, translation.compose(mapping))
+        else:
+            item.setPos(x, y)
         self._emit_transform(image_id)
 
     def image_transform(self, image_id: str) -> tuple[float, float, float, float] | None:
         item = self._layers.get(image_id)
         if item is None:
             return None
+        if image_id in self._matrix_models:
+            mapping = self.image_mapping(image_id)
+            if isinstance(mapping, WarpTransform):
+                base = mapping.base_mapping
+                if base.model == "similarity":
+                    return base.to_similarity()
+                origin_x, origin_y = base.map_point(0.0, 0.0)
+                a, _b, d, _e = base.jacobian(0.0, 0.0)
+                return origin_x, origin_y, degrees(atan2(d, a)), hypot(a, d)
+            return mapping.to_similarity()
         position = item.pos()
         return position.x(), position.y(), item.rotation(), item.scale()
+
+    def _source_to_scene(self, image_id: str, point: QPointF) -> QPointF:
+        mapping = self._warp_mappings.get(image_id)
+        if mapping is not None:
+            return QPointF(*mapping.map_point(point.x(), point.y()))
+        item = self._layers.get(image_id)
+        return item.mapToScene(point) if item is not None else QPointF()
+
+    def _scene_to_source(self, image_id: str, point: QPointF) -> QPointF:
+        mapping = self._warp_mappings.get(image_id)
+        if mapping is not None:
+            source_x, source_y = mapping.inverse_point(point.x(), point.y())
+            return QPointF(source_x, source_y)
+        if image_id in self._matrix_models:
+            mapping = self.image_mapping(image_id)
+            source_x, source_y = mapping.inverse().map_point(point.x(), point.y())
+            return QPointF(source_x, source_y)
+        item = self._layers.get(image_id)
+        return item.mapFromScene(point) if item is not None else QPointF()
+
+    @staticmethod
+    def _set_item_mapping(item: QGraphicsPixmapItem, mapping: MatrixTransform) -> None:
+        item.setPos(0, 0)
+        item.setRotation(0)
+        item.setScale(1)
+        item.setTransformOriginPoint(0, 0)
+        item.setTransform(to_qtransform(mapping))
+
+    def image_mapping(self, image_id: str) -> MatrixTransform | WarpTransform | None:
+        item = self._layers.get(image_id)
+        if item is None:
+            return None
+        warp = self._warp_mappings.get(image_id)
+        if warp is not None:
+            return warp
+        return from_qtransform(item.sceneTransform(), self._matrix_models.get(image_id, "similarity"))
 
     def view_state(self) -> dict:
         center = self.mapToScene(self.viewport().rect().center())
@@ -674,7 +799,7 @@ class ImageCanvas(QGraphicsView):
                 super().mousePressEvent(event)
                 return
             if self._placing_point:
-                local_position = self._layers[image_id].mapFromScene(scene_position)
+                local_position = self._scene_to_source(image_id, scene_position)
                 self.image_clicked.emit(image_id, local_position.x(), local_position.y())
                 self._placement_click = True
                 event.accept()
@@ -829,9 +954,18 @@ class ImageCanvas(QGraphicsView):
         marker = self._point_items.get(key)
         if image_item is None or marker is None or key in self._locked_points:
             return
-        local_position = image_item.mapFromScene(scene_position)
+        if image_id in self._matrix_models:
+            try:
+                source_position = self._scene_to_source(image_id, scene_position)
+            except ValueError:
+                self.setToolTip("Cannot move this point outside the valid image mapping domain.")
+                return
+            self.setToolTip("")
+            local_position = source_position
+        else:
+            local_position = self._scene_to_source(image_id, scene_position)
         self._points[key] = (local_position.x(), local_position.y())
-        marker.setPos(image_item.mapToScene(local_position))
+        marker.setPos(self._source_to_scene(image_id, local_position))
         self.point_observation_changed.emit(image_id, point_id, local_position.x(), local_position.y())
         self._redraw_constraints()
 
@@ -907,6 +1041,7 @@ class ImageCanvas(QGraphicsView):
         self._transform_center_scene = item.mapToScene(item.boundingRect().center())
         self._transform_start_scale = item.scale()
         self._transform_start_rotation = item.rotation()
+        self._transform_start_mapping = self.image_mapping(self._active_image_id)
         self._transform_start_distance = max(
             1.0,
             hypot(
@@ -921,13 +1056,19 @@ class ImageCanvas(QGraphicsView):
         item = self._layers.get(image_id) if image_id else None
         if item is None or self._active_transform_handle is None:
             return
+        matrix_edit = image_id in self._matrix_models
+        rotation_delta = 0.0
+        scale_ratio = 1.0
         if self._active_transform_handle == "rotate":
             start = self._transform_start_scene - self._transform_center_scene
             current = scene_position - self._transform_center_scene
             delta = start.x() * current.y() - start.y() * current.x()
             dot = start.x() * current.x() + start.y() * current.y()
             angle_delta = degrees(atan2(delta, dot))
-            item.setRotation(self._transform_start_rotation + angle_delta)
+            if matrix_edit:
+                rotation_delta = angle_delta
+            else:
+                item.setRotation(self._transform_start_rotation + angle_delta)
         else:
             distance = max(
                 1.0,
@@ -937,19 +1078,38 @@ class ImageCanvas(QGraphicsView):
                 ),
             )
             scale = self._transform_start_scale * distance / self._transform_start_distance
-            item.setScale(min(20.0, max(0.05, scale)))
+            bounded_scale = min(20.0, max(0.05, scale))
+            if matrix_edit:
+                scale_ratio = bounded_scale / self._transform_start_scale
+            else:
+                item.setScale(bounded_scale)
 
-        current_center = item.mapToScene(item.boundingRect().center())
-        item.setPos(item.pos() + self._transform_center_scene - current_center)
+        if matrix_edit:
+            center_x, center_y = self._transform_center_scene.x(), self._transform_center_scene.y()
+            to_center = MatrixTransform.from_similarity((center_x, center_y, 0, 1))
+            from_center = MatrixTransform.from_similarity((-center_x, -center_y, 0, 1))
+            pose = MatrixTransform.from_similarity((0, 0, rotation_delta, scale_ratio))
+            mapping = to_center.compose(pose).compose(from_center).compose(self._transform_start_mapping)
+            self._set_item_mapping(item, mapping)
+            self._matrix_models[image_id] = mapping.model
+            self.viewport().update()
+        else:
+            current_center = item.mapToScene(item.boundingRect().center())
+            item.setPos(item.pos() + self._transform_center_scene - current_center)
         self._refresh_point_overlay_positions()
         self._redraw_constraints()
         self._refresh_transform_handles()
         self._emit_transform(image_id)
 
     def _emit_transform(self, image_id: str) -> None:
-        transform = self.image_transform(image_id)
-        if transform is not None:
-            self.transform_changed.emit(image_id, *transform)
+        mapping = self.image_mapping(image_id)
+        if mapping is not None:
+            self.mapping_changed.emit(image_id, mapping)
+            transform = None
+            if self._matrix_models.get(image_id, "similarity") == "similarity":
+                transform = self.image_transform(image_id)
+            if transform is not None:
+                self.transform_changed.emit(image_id, *transform)
             self._refresh_point_overlay_positions()
             self._redraw_constraints()
             self._refresh_transform_handles()
@@ -961,7 +1121,7 @@ class ImageCanvas(QGraphicsView):
             marker = self._point_items.get(key)
             if image_item is None or marker is None:
                 continue
-            scene_position = image_item.mapToScene(QPointF(x, y))
+            scene_position = self._source_to_scene(image_id, QPointF(x, y))
             marker.setPos(scene_position)
 
     def _scene_position_for_point(self, point_id: str):
@@ -977,7 +1137,7 @@ class ImageCanvas(QGraphicsView):
             return None
         from PySide6.QtCore import QPointF
 
-        return item.mapToScene(QPointF(x, y))
+        return self._source_to_scene(image_id, QPointF(x, y))
 
     def set_selected_constraints(self, indices: set[int]) -> None:
         if indices != self._selected_constraint_indices:

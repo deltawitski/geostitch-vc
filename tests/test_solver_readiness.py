@@ -44,6 +44,191 @@ def test_explicit_translation_model_does_not_warn_about_automatic_parameter_fall
     assert not any(issue.severity == "Error" for issue in issues)
 
 
+def test_affine_alignment_readiness_requires_noncollinear_controls():
+    project = Project()
+    first, second = [project.add_image(name) for name in ("one.png", "two.png")]
+    project.alignment_settings = SolverSettings(transform_model="affine")
+    first_points = [add_point(project, first, f"a-{index}", location) for index, location in enumerate(((0, 0), (20, 20), (40, 40)))]
+    second_points = [add_point(project, second, f"b-{index}", location) for index, location in enumerate(((10, 10), (30, 30), (50, 50)))]
+    for source, target in zip(first_points, second_points):
+        project.add_constraint(PointConstraint.create(source.id, target.id))
+    issues = check_readiness(project, ("alignment",))
+    assert any(issue.stage == "alignment" and issue.code == "affine_geometry" and issue.severity == "Error" for issue in issues)
+
+
+def test_tps_alignment_readiness_requires_per_image_geometry_and_dimensions():
+    project = Project()
+    first, second = [project.add_image(name) for name in ("one.png", "two.png")]
+    project.alignment_settings = SolverSettings(transform_model="tps")
+    first_points = [add_point(project, first, f"a-{index}", location) for index, location in enumerate(((0, 0), (20, 20), (40, 40)))]
+    second_points = [add_point(project, second, f"b-{index}", location) for index, location in enumerate(((10, 10), (30, 30), (50, 50)))]
+    for source, target in zip(first_points, second_points):
+        project.add_constraint(PointConstraint.create(source.id, target.id))
+
+    issues = check_readiness(project, ("alignment",))
+
+    assert any(issue.code == "tps_alignment_geometry" and issue.severity == "Error" for issue in issues)
+    assert {image_id for issue in issues if issue.code == "tps_alignment_source_dimensions" for image_id in issue.image_ids} == {first.id, second.id}
+
+    first.source_dimensions = second.source_dimensions = (100, 100)
+    for index, point in enumerate(first_points):
+        point.observations[0].x, point.observations[0].y = ((0, 0), (20, 0), (0, 20))[index]
+    for index, point in enumerate(second_points):
+        point.observations[0].x, point.observations[0].y = ((10, 10), (30, 10), (10, 30))[index]
+    issues = check_readiness(project, ("alignment",))
+
+    assert not any(issue.severity == "Error" for issue in issues)
+
+
+def test_affine_georeference_blocks_collinear_source_controls():
+    project = Project()
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="affine")
+    for index, coordinate in enumerate((0, 20, 40, 60)):
+        add_point(project, image, f"control-{index}", (coordinate, 2 * coordinate), (500 + coordinate, 4000 + 3 * coordinate))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert any(issue.code == "affine_georeference_geometry" and issue.severity == "Error" for issue in issues)
+
+
+def test_projective_georeferencing_requires_four_controls_and_source_dimensions():
+    project = Project()
+    project.georeference_settings = SolverSettings(transform_model="projective")
+    image = project.add_image("one.png")
+    point = add_point(project, image, "control", (10, 20), (100, 200))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert any(issue.code == "projective_georeference_geometry" and issue.severity == "Error" for issue in issues)
+    assert point.geographic_x == 100
+
+
+def test_tps_georeference_readiness_requires_three_independent_groups_and_dimensions():
+    project = Project(crs="EPSG:4326")
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="tps")
+    for index, (x, y) in enumerate(((0, 0), (20, 20), (40, 40))):
+        add_point(project, image, f"control-{index}", (x, y), (10 + x * 0.001, 45 + y * 0.001))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert any(issue.code == "tps_georeference_geometry" and issue.severity == "Error" for issue in issues)
+    assert any(issue.code == "tps_georeference_source_dimensions" and issue.image_ids == (image.id,) for issue in issues)
+
+    image.source_dimensions = (100, 100)
+    for point in project.control_points:
+        observation = point.observations[0]
+        observation.x, observation.y = (
+            (0, 0), (100, 0), (0, 100),
+        )[project.control_points.index(point)]
+    issues = check_readiness(project, ("georeference",))
+    assert not any(issue.code == "tps_georeference_geometry" for issue in issues)
+    assert not any(issue.code == "tps_georeference_source_dimensions" for issue in issues)
+
+
+def test_tps_georeference_readiness_requires_geographic_project_crs():
+    project = Project(crs="EPSG:32610")
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="tps")
+    for index, location in enumerate(((0, 0), (20, 0), (0, 20))):
+        add_point(project, image, f"control-{index}", location, (500000 + location[0], 4000000 + location[1]))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert any(issue.code == "tps_georeference_crs" and issue.severity == "Error" for issue in issues)
+
+
+def test_projective_georeference_readiness_requires_source_dimensions_after_rank_passes():
+    project = Project(crs="EPSG:32610")
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="projective")
+    locations = ((0, 0), (100, 0), (0, 100), (100, 100), (40, 60))
+    for index, (x, y) in enumerate(locations):
+        add_point(project, image, f"control-{index}", (x, y), (500000 + x, 4000000 + y))
+
+    issues = check_readiness(project, ("georeference",))
+    assert any(issue.code == "projective_georeference_source_dimensions" and issue.image_ids == (image.id,) for issue in issues)
+
+    issues = check_readiness(project, ("georeference",), {image.id: (100, 100)})
+    assert not any(issue.code == "projective_georeference_source_dimensions" for issue in issues)
+
+
+def test_projective_georeference_readiness_accepts_geographic_local_metric_frame():
+    project = Project(crs="EPSG:4326")
+    image = project.add_image("one.png")
+    image.source_dimensions = (100, 100)
+    project.georeference_settings = SolverSettings(transform_model="projective")
+    for index, (x, y) in enumerate(((0, 0), (100, 0), (0, 100), (100, 100), (40, 60))):
+        add_point(project, image, f"control-{index}", (x, y), (10 + x * 0.001, 45 + y * 0.001))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert not any(issue.code == "projective_georeference_crs" for issue in issues)
+    assert not any(issue.severity == "Error" for issue in issues)
+
+
+def test_geographic_local_metric_readiness_warns_for_wide_control_extent():
+    project = Project(crs="EPSG:4326")
+    image = project.add_image("wide-controls.png")
+    project.georeference_settings = SolverSettings(transform_model="affine")
+    controls = (
+        ((0, 0), (10, 45)), ((100, 0), (12, 45)),
+        ((0, 100), (10, 47)), ((100, 100), (12, 47)),
+        ((50, 50), (11, 46)),
+    )
+    for index, (pixel, geographic) in enumerate(controls):
+        add_point(project, image, f"wide-{index}", pixel, geographic)
+
+    issues = check_readiness(project, ("georeference",))
+
+    warning = next(issue for issue in issues if issue.code == "local_metric_extent")
+    assert warning.severity == "Warning"
+    assert warning.image_ids == (image.id,)
+    assert "sampled pairwise distance distortion" in warning.message
+    assert not any(issue.severity == "Error" for issue in issues)
+
+
+def test_affine_georeference_readiness_checks_geographic_target_rank():
+    project = Project()
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="affine")
+    for index, location in enumerate(((0, 0), (20, 0), (0, 20), (20, 20))):
+        add_point(project, image, f"control-{index}", location, (500 + 2 * location[0], 4000 + 3 * location[0]))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert any(issue.code == "affine_georeference_geometry" and issue.severity == "Error" for issue in issues)
+
+
+def test_affine_georeference_readiness_accepts_geographic_local_metric_frame():
+    project = Project(crs="EPSG:4326")
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="affine")
+    for index, (pixel_x, pixel_y) in enumerate(((0, 0), (20, 0), (0, 20), (20, 20))):
+        add_point(project, image, f"control-{index}", (pixel_x, pixel_y), (10 + pixel_x * 0.001, 45 + pixel_y * 0.001))
+
+    issues = check_readiness(project, ("georeference",))
+
+    assert not any(issue.code == "affine_georeference_crs" for issue in issues)
+    assert not any(issue.severity == "Error" for issue in issues)
+
+
+def test_affine_georeference_warns_for_full_rank_nearly_collinear_controls():
+    project = Project(crs="EPSG:32610")
+    image = project.add_image("one.png")
+    project.georeference_settings = SolverSettings(transform_model="affine")
+    source = ((0, 0), (100, 0.01), (200, -0.01), (300, 0.02), (400, -0.02))
+    targets = ((500, 400), (600, 400), (500, 500), (600, 500), (540, 460))
+    for index, (pixel, geographic) in enumerate(zip(source, targets)):
+        add_point(project, image, f"control-{index}", pixel, geographic)
+
+    issues = check_readiness(project, ("georeference",))
+
+    warning = next(issue for issue in issues if issue.code == "affine_georeference_conditioning")
+    assert warning.severity == "Warning"
+    assert warning.image_ids == (image.id,)
+    assert not any(issue.severity == "Error" for issue in issues)
 def test_disconnected_and_isolated_images_are_identified():
     project = Project()
     images = [project.add_image(f"image-{index}.png") for index in range(5)]

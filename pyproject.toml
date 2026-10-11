@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 dependencies = ["PySide6>=6.7", "Pillow>=10.0", "numpy>=1.26", "scipy>=1.13", "pyproj>=3.6"]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+test = ["pytest>=8.0", "rasterio>=1.4"]
 build = ["pyinstaller>=6.0"]
 
 [project.scripts]

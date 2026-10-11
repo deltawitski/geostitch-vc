@@ -8,6 +8,7 @@ from PySide6.QtGui import QMouseEvent
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+import pytest
 
 from geostitch.canvas import ImageCanvas
 from geostitch.image_view import ImageViewer
@@ -148,7 +149,7 @@ def test_preview_arrangement_and_world_footprints_use_original_size(tmp_path):
         assert abs(bounds.left() - 1040) < 1
         assert abs(bounds.width() - 400) < 1
         map_item = window.world_map._image_items[first.id]
-        assert map_item.mapToScene(QPointF(1000, 600)) == QPointF(2100, 1000)
+        assert map_item.map_source_to_scene((1000, 600)) == pytest.approx((2100, 1000))
     finally:
         window.close()
 
