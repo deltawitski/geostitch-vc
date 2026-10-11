@@ -14,18 +14,18 @@ Status: implementation plan, not implemented functionality.
 
 ## Current Systems to Retain or Replace
 
-| System | Retain | Modify or replace |
-| --- | --- | --- |
-| Domain models | Per-image points, PointConstraint links, source-pixel observations/masks | Four-scalar transform storage and has-alignment/world presence checks |
-| Transform math | Qt-independent domain boundary | Similarity-only apply/compose/invert helpers with a typed mapping API |
-| Solvers | SciPy, robust-loss options, independent connected groups | Parameter packing, seeds, geometry checks, result contracts |
-| Canvas | Keyed item reuse, source images, screen-sized markers, selection/tools | Four-value transform signals, layer application, handles, invalidation |
-| Image View / Link Review | Source-pixel editing, preview/detail loaders, source tile cache | Explicit adapters for warped previews; do not distort normal source-review views |
-| World map | Basemap tiles, navigation, selection, stacking | Three-corner raster approximation with error-controlled reprojection |
-| CRS workflows | pyproj, explicit X/Y order, transactional undo/rollback | Single-axis world-transform approximation and silent approximate refits |
-| Export | Planning, collision protection, staging, cancellation, affine writers | Transform extraction, nonlinear raster warping, cutline mapping |
-| Settings/reports | Per-project settings, compact warnings, retained run configuration | Model-specific options, validity/coverage/checkpoint reporting |
-| Packaging | Existing Windows build workflow | Bundle and validate any additional raster backend and CRS grids |
+| System                   | Retain                                                                   | Modify or replace                                                                |
+| ------------------------ | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------- |
+| Domain models            | Per-image points, PointConstraint links, source-pixel observations/masks | Four-scalar transform storage and has-alignment/world presence checks            |
+| Transform math           | Qt-independent domain boundary                                           | Similarity-only apply/compose/invert helpers with a typed mapping API            |
+| Solvers                  | SciPy, robust-loss options, independent connected groups                 | Parameter packing, seeds, geometry checks, result contracts                      |
+| Canvas                   | Keyed item reuse, source images, screen-sized markers, selection/tools   | Four-value transform signals, layer application, handles, invalidation           |
+| Image View / Link Review | Source-pixel editing, preview/detail loaders, source tile cache          | Explicit adapters for warped previews; do not distort normal source-review views |
+| World map                | Basemap tiles, navigation, selection, stacking                           | Three-corner raster approximation with error-controlled reprojection             |
+| CRS workflows            | pyproj, explicit X/Y order, transactional undo/rollback                  | Single-axis world-transform approximation and silent approximate refits          |
+| Export                   | Planning, collision protection, staging, cancellation, affine writers    | Transform extraction, nonlinear raster warping, cutline mapping                  |
+| Settings/reports         | Per-project settings, compact warnings, retained run configuration       | Model-specific options, validity/coverage/checkpoint reporting                   |
+| Packaging                | Existing Windows build workflow                                          | Bundle and validate any additional raster backend and CRS grids                  |
 
 Primary current owners: src/geostitch/models.py, transforms.py, adjustment.py,
 georeference.py, solver_readiness.py, canvas.py, image_item.py, map_view.py,
