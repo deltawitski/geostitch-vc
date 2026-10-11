@@ -10,6 +10,7 @@ from PySide6.QtGui import QBrush, QColor, QImage, QPainterPath, QPen, QPixmap, Q
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache, QNetworkRequest
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
+    QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QStandardPaths
 from geostitch.icons import KIND_COLORS
+from geostitch.overlay_styles import POINT_MARKER_DIAMETER, constraint_marker_pens, point_marker_pen
 from geostitch.view_controls import ActiveToolHint, overlay_toggle
 
 
@@ -86,6 +88,7 @@ class WorldMapView(QGraphicsView):
         self._pick_mode = False
         self._selected_marker: QGraphicsEllipseItem | None = None
         self._point_overlay_items: list = []
+        self._constraint_overlay_items: list = []
         self._panning = False
         self._last_pan_position = None
         self._scene = QGraphicsScene(self)
@@ -107,8 +110,8 @@ class WorldMapView(QGraphicsView):
         self._attribution.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.points_toggle_button = overlay_toggle(self.viewport(), "pick_gcp",
             "Show control points\n"
-            "Point color: has map coordinates. Lighter: placed through its image's world transform. "
-            "Square: locked in its image. Circle: unlocked."
+            "Point color: control point. Dashed outline: locked in its image. "
+            "Diamond: independent geographic checkpoint."
         )
         self.active_tool_hint = ActiveToolHint(self.viewport())
         self._style_attribution()
@@ -120,26 +123,49 @@ class WorldMapView(QGraphicsView):
         self.fit_world()
         self._position_attribution()
 
-    def set_control_points(self, points: list[dict]) -> None:
-        """Draw points in their configured color; inferred coordinates are lighter and locked points are square."""
+    def set_control_points(self, points: list[dict], links: list[dict] | None = None) -> None:
+        """Draw control points and their links using screen-sized, consistent overlay styles."""
+        for item in self._constraint_overlay_items:
+            self._scene.removeItem(item)
+        self._constraint_overlay_items.clear()
         for item in self._point_overlay_items:
             self._scene.removeItem(item)
         self._point_overlay_items.clear()
+        positions = {point["id"]: QPointF(point["x"], -point["y"]) for point in points}
+        for link in links or []:
+            first = positions.get(link["first_id"])
+            second = positions.get(link["second_id"])
+            if first is None or second is None:
+                continue
+            outer_pen, inner_pen, center_pen = constraint_marker_pens(link["color"], link.get("selected", False))
+            if outer_pen is not None and inner_pen is not None:
+                for pen, z_value in ((outer_pen, 8497), (inner_pen, 8498)):
+                    line = QGraphicsLineItem(first.x(), first.y(), second.x(), second.y())
+                    line.setPen(pen)
+                    line.setZValue(z_value)
+                    line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                    self._scene.addItem(line)
+                    self._constraint_overlay_items.append(line)
+            line = QGraphicsLineItem(first.x(), first.y(), second.x(), second.y())
+            line.setPen(center_pen)
+            line.setZValue(8499 if link.get("selected", False) else 8496)
+            line.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            self._scene.addItem(line)
+            self._constraint_overlay_items.append(line)
         for point in points:
-            if point["locked"]:
-                marker = QGraphicsRectItem(-6, -6, 12, 12)
-            elif point.get("checkpoint", False):
+            half_size = POINT_MARKER_DIAMETER / 2
+            if point.get("checkpoint", False):
                 marker = QGraphicsRectItem(-5, -5, 10, 10)
                 marker.setRotation(45)
             else:
-                marker = QGraphicsEllipseItem(-7, -7, 14, 14)
+                marker = QGraphicsEllipseItem(-half_size, -half_size, POINT_MARKER_DIAMETER, POINT_MARKER_DIAMETER)
             marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
             marker.setPos(point["x"], -point["y"])
             marker.setData(0, point.get("id"))
             selected = point.get("selected", False)
-            marker.setPen(QPen(QColor("#ffffff") if selected else QColor("#14201d"), 3 if selected else 2))
+            marker.setPen(point_marker_pen(selected, point["locked"]))
             color = QColor(KIND_COLORS["point"])
-            marker.setBrush(QBrush(color if point["georeferenced"] else color.lighter(140)))
+            marker.setBrush(QBrush(color))
             marker.setZValue(8500)
             kind = "independent checkpoint" if point.get("checkpoint", False) else (
                 "georeferenced" if point["georeferenced"] else "placed by image transform"

@@ -244,10 +244,13 @@ def test_appearance_colors_update_all_views_without_changing_project_or_selectio
             item = window.image_list.topLevelItem(row)
             symbol = "geojson" if item.kind == "vector" else "image"
             assert item.icon(0).pixmap(8, 16).toImage().pixelColor(4, 8) == QColor(colors[symbol])
-        assert window.canvas._point_items[(images[0].id, points[0].id)].pen().color() == QColor(colors["point"])
+        assert window.canvas._point_items[(images[0].id, points[0].id)].pen().color() == QColor("#ffffff")
         assert window.canvas._constraint_items[0].pen().color() == QColor(colors["link"])
         assert window.canvas._selection_outlines[0].pen().color() == QColor(colors["image"])
         assert all(marker.brush().color() == QColor(colors["point"]) for marker in window.world_map._point_overlay_items)
+        assert all(marker.pen().color() == QColor("#ffffff") for marker in window.world_map._point_overlay_items)
+        assert window.world_map._constraint_overlay_items
+        assert window.world_map._constraint_overlay_items[-1].pen().color() == QColor(colors["link"])
         assert window.world_map._selected_marker is not None
         assert window.world_map._selected_marker.brush().color() == QColor(colors["point"])
         assert window.world_map._vector_items
@@ -255,6 +258,7 @@ def test_appearance_colors_update_all_views_without_changing_project_or_selectio
         window._select_point(points[0].id)
         preview_marker = next(item for item in window.image_viewer.scene().items() if item.data(0) == points[0].id)
         assert preview_marker.brush().color() == QColor(colors["point"])
+        assert preview_marker.pen().color() == QColor("#ffffff")
     finally:
         window._apply_appearance("Fusion", "dark", DEFAULT_KIND_COLORS)
         window.close()

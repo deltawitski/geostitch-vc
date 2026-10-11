@@ -33,18 +33,18 @@ def test_canvas_element_colors_match_layer_palette_and_preserve_state_cues():
         marker = canvas._point_items[("first", "point-a")]
         rect = marker.rect()
         normal_alpha = marker.brush().color().alpha()
-        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().color() == QColor("#14201d")
         assert marker.pen().style() == Qt.PenStyle.SolidLine
         canvas.set_selected_points({"point-a"})
-        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().color() == QColor("#ffffff")
         assert marker.pen().widthF() == 3
-        assert marker.brush().color().alpha() > normal_alpha
+        assert marker.brush().color().alpha() == normal_alpha == 255
         canvas.set_observation_locked("first", "point-a", True)
         assert marker.pen().style() == Qt.PenStyle.DashLine
-        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().color() == QColor("#ffffff")
         canvas.set_constraint_source("point-a")
         assert marker.pen().style() == Qt.PenStyle.DotLine
-        assert marker.pen().color() == QColor(KIND_COLORS["point"])
+        assert marker.pen().color() == QColor("#ffffff")
         assert marker.rect() == rect
         link = canvas._constraint_items[0]
         assert link.pen().color() == QColor(KIND_COLORS["link"])
@@ -52,8 +52,13 @@ def test_canvas_element_colors_match_layer_palette_and_preserve_state_cues():
         canvas.set_selected_constraints({0})
         link = canvas._constraint_items[0]
         assert link.pen().color() == QColor(KIND_COLORS["link"])
-        assert link.pen().widthF() == 4
+        assert link.pen().widthF() == 3
         assert link.pen().style() == Qt.PenStyle.SolidLine
+        outer, inner = canvas._constraint_halos[("point-a", "point-b", 0)]
+        assert outer.pen().color() == QColor("#172022")
+        assert outer.pen().widthF() == 9
+        assert inner.pen().color() == QColor("#ffffff")
+        assert inner.pen().widthF() == 6
         canvas.set_selected_images({"first"})
         assert canvas._selection_outlines[0].pen().color() == QColor(KIND_COLORS["image"])
         assert all(handle.brush().color() == QColor(KIND_COLORS["image"]) for handle in canvas._transform_handles)

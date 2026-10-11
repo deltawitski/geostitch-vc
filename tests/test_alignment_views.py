@@ -119,14 +119,14 @@ def test_alignment_errors_overlay_click_toggles_link_colors(solved_window):
     window._select_constraint(links[1].id)
     selected = window.canvas._constraint_items[1]
     assert selected.pen().color() == QColor("#d44f54")
-    assert selected.pen().widthF() == 4
+    assert selected.pen().widthF() == 3
     assert selected.pen().style() == Qt.PenStyle.SolidLine
     assert window._alignment_feedback.is_current(window.project)
     assert "Alignment residual: 1.2000 scene units (Current)" in window.constraint_info_label.text()
     assert window.canvas._point_items[(images[0].id, points[0].id)].pen().widthF() == 3
     window.alignment_errors_button.setChecked(False)
     assert window.canvas._constraint_items[1].pen().color() == QColor(KIND_COLORS["link"])
-    assert window.canvas._constraint_items[1].pen().widthF() == 4
+    assert window.canvas._constraint_items[1].pen().widthF() == 3
     window.alignment_errors_button.setChecked(True)
     assert window.canvas._constraint_items[1].pen().color() == QColor("#d44f54")
 

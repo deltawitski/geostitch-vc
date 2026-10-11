@@ -21,6 +21,7 @@ from geostitch.icons import KIND_COLORS
 from geostitch.view_navigation import zoom_at_cursor
 from geostitch.view_controls import overlay_toggle
 from geostitch.image_item import SourceImageItem
+from geostitch.overlay_styles import POINT_MARKER_DIAMETER, point_marker_pen
 
 _ACCENT = QColor("#76cbb0")
 
@@ -206,13 +207,13 @@ class ImageViewer(QGraphicsView):
 
         for point_id, _name, x, y in points:
             selected = point_id == selected_point_id
-            marker = QGraphicsEllipseItem(-6, -6, 12, 12)
+            half_size = POINT_MARKER_DIAMETER / 2
+            marker = QGraphicsEllipseItem(-half_size, -half_size, POINT_MARKER_DIAMETER, POINT_MARKER_DIAMETER)
             marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
             marker.setPos(x, y)
             color = QColor(KIND_COLORS["point"])
-            style = Qt.PenStyle.DashLine if point_id in self._locked_points else Qt.PenStyle.SolidLine
-            marker.setPen(QPen(color, 3 if selected else 2, style))
-            marker.setBrush(QBrush(color if selected else color.lighter(140)))
+            marker.setPen(point_marker_pen(selected, point_id in self._locked_points))
+            marker.setBrush(QBrush(color))
             marker.setZValue(30)
             marker.setData(0, point_id)
             self._scene.addItem(marker)

@@ -12,7 +12,7 @@ from uuid import uuid4
 from PySide6.QtGui import QActionGroup
 
 from geostitch.adjustment import AlignmentResult, simulate_alignment
-from geostitch.alignment_feedback import AlignmentFeedback
+from geostitch.alignment_feedback import AlignmentFeedback, residual_color
 from geostitch.georeference import (
     GeoreferenceResult, georeference_distance_unit, rebase_georeference_settings,
     simulate_georeference,
@@ -543,7 +543,7 @@ class MainWindow(QMainWindow):
         self.canvas_clip_button.toggled.connect(lambda _checked: self._refresh_canvas())
         canvas_layout.addWidget(self.canvas, 1)
         self.alignment_errors_button = self.canvas.alignment_errors_button
-        self.alignment_errors_button.toggled.connect(lambda _checked: self._refresh_alignment_feedback())
+        self.alignment_errors_button.toggled.connect(self._on_alignment_errors_toggled)
         self.canvas_dock = self._create_panel_dock("canvasDock", "Image Canvas", canvas_panel)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.canvas_dock)
         self.splitDockWidget(self.image_dock, self.canvas_dock, Qt.Orientation.Horizontal)
@@ -1652,8 +1652,14 @@ class MainWindow(QMainWindow):
             self.world_map.set_control_points([])
             return
         images = {image.id: image for image in self.project.images}
-        selected_id = self._selected_point_id()
+        selected_point_ids = set(self._selected_point_ids())
+        selected_constraint_ids = set(self._selected_constraint_ids())
+        selected_endpoints = {
+            point_id for constraint in self.project.constraints if constraint.id in selected_constraint_ids
+            for point_id in (constraint.first_point_id, constraint.second_point_id)
+        }
         overlay = []
+        map_positions = {}
         for point in self.project.control_points:
             observation = point.observations[0] if point.observations else None
             hidden_image = observation is not None and not images[observation.image_id].map_visible
@@ -1669,6 +1675,7 @@ class MainWindow(QMainWindow):
                 x, y = self._image_map_point(image, observation.x, observation.y)
             if not (isfinite(x) and isfinite(y)):
                 continue
+            map_positions[point.id] = (x, y)
             overlay.append({
                 "id": point.id,
                 "x": x,
@@ -1677,9 +1684,22 @@ class MainWindow(QMainWindow):
                 "georeferenced": georeferenced,
                 "checkpoint": point.geographic_checkpoint,
                 "locked": bool(observation and observation.locked),
-                "selected": point.id == selected_id,
+                "selected": point.id in selected_point_ids or point.id in selected_endpoints,
             })
-        self.world_map.set_control_points(overlay)
+        residuals = self.canvas._constraint_residuals
+        links = []
+        for index, constraint in enumerate(self.project.constraints):
+            if constraint.first_point_id not in map_positions or constraint.second_point_id not in map_positions:
+                continue
+            residual = residuals.get(index)
+            color = residual_color(residual, self.canvas._residual_tolerance) if residual is not None else KIND_COLORS["link"]
+            links.append({
+                "first_id": constraint.first_point_id,
+                "second_id": constraint.second_point_id,
+                "selected": constraint.id in selected_constraint_ids,
+                "color": color,
+            })
+        self.world_map.set_control_points(overlay, links)
 
     def _set_map_pick_mode(self, enabled: bool) -> None:
         if enabled and self._selected_point() is None:
@@ -2026,6 +2046,10 @@ class MainWindow(QMainWindow):
                 if link.id in feedback.result.constraint_residuals
             }
         self.canvas.set_constraint_residuals(residuals, feedback.tolerance if feedback else 0.5)
+
+    def _on_alignment_errors_toggled(self, _checked: bool) -> None:
+        self._refresh_alignment_feedback()
+        self._refresh_map_points()
 
     @staticmethod
     def _style_layer_item(item: LayerItem, canvas_visible: bool | None, map_visible: bool) -> None:
@@ -2874,8 +2898,8 @@ class MainWindow(QMainWindow):
             self.details_stack.setCurrentIndex(0)
             self._show_project_details()
         self._refresh_image_view()
-        self._refresh_map_points()
         self._refresh_alignment_feedback()
+        self._refresh_map_points()
         self._update_hints()
 
     def _build_image_view_panel(self) -> QWidget:

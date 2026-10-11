@@ -129,7 +129,7 @@ def test_point_and_link_items_survive_edits_and_restyle(canvas):
     line = canvas._constraint_items[0]
     canvas.set_selected_constraints({0})
     assert canvas._constraint_items[0] is line
-    assert line.pen().widthF() == 4
+    assert line.pen().widthF() == 3
     canvas.set_constraint_residuals({0: 1.5}, 0.5)
     assert canvas._constraint_items[0] is line
     assert "residual" in line.toolTip()

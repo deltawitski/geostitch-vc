@@ -23,6 +23,7 @@ from geostitch.warp import WarpTransform
 from geostitch.warped_layout_item import WarpedLayoutImageItem
 from geostitch.qt_transforms import from_qtransform, to_qtransform
 from geostitch.alignment_feedback import residual_color
+from geostitch.overlay_styles import POINT_MARKER_DIAMETER, constraint_marker_pens, point_marker_pen
 from geostitch.view_navigation import zoom_at_cursor
 from geostitch.view_controls import ActiveToolHint, overlay_toggle
 
@@ -160,6 +161,7 @@ class ImageCanvas(QGraphicsView):
         self._residual_tolerance = 0.5
         self._constraint_items: list[QGraphicsLineItem] = []
         self._constraint_lines: dict[tuple[str, str, int], QGraphicsLineItem] = {}
+        self._constraint_halos: dict[tuple[str, str, int], tuple[QGraphicsLineItem, QGraphicsLineItem]] = {}
         self._selected_constraint_indices: set[int] = set()
         self._active_image_id: str | None = None
         self._selected_image_ids: set[str] = set()
@@ -444,6 +446,7 @@ class ImageCanvas(QGraphicsView):
         return [
             *self._point_items.values(),
             *self._constraint_items,
+            *(line for halo_pair in self._constraint_halos.values() for line in halo_pair),
             *self._transform_handles,
             *self._selection_outlines,
             *([self._transform_connector] if self._transform_connector is not None else []),
@@ -459,13 +462,13 @@ class ImageCanvas(QGraphicsView):
     def _add_point_marker(
         self, parent: QGraphicsPixmapItem, point_id: str, x: float, y: float, locked: bool = False, visible: bool = True
     ) -> None:
-        marker = QGraphicsEllipseItem(-6, -6, 12, 12)
+        half_size = POINT_MARKER_DIAMETER / 2
+        marker = QGraphicsEllipseItem(-half_size, -half_size, POINT_MARKER_DIAMETER, POINT_MARKER_DIAMETER)
         marker.setVisible(visible)
         marker.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIgnoresTransformations)
         marker.setPos(self._source_to_scene(parent.data(0), QPointF(x, y)))
         color = QColor(KIND_COLORS["point"])
-        marker.setPen(QPen(color, 2))
-        color.setAlpha(90)
+        marker.setPen(point_marker_pen())
         marker.setBrush(QBrush(color))
         marker.setZValue(3000)
         marker.setData(0, point_id)
@@ -563,9 +566,7 @@ class ImageCanvas(QGraphicsView):
             is_selected = candidate_id in self._selected_point_ids or candidate_id in linked_points
             is_locked = (_image_id, candidate_id) in self._locked_points
             color = QColor(KIND_COLORS["point"])
-            style = Qt.PenStyle.DotLine if is_source else Qt.PenStyle.DashLine if is_locked else Qt.PenStyle.SolidLine
-            marker.setPen(QPen(color, 3 if is_source or is_selected else 2, style))
-            color.setAlpha(200 if is_source else 160 if is_selected else 110 if is_locked else 90)
+            marker.setPen(point_marker_pen(is_selected, is_locked, is_source))
             marker.setBrush(QBrush(color))
 
     def set_constraints(self, constraints: list[tuple[str, str]]) -> None:
@@ -1169,6 +1170,8 @@ class ImageCanvas(QGraphicsView):
     def _redraw_constraints(self) -> None:
         previous = self._constraint_lines
         self._constraint_lines = {}
+        previous_halos = self._constraint_halos
+        self._constraint_halos = {}
         self._constraint_items = []
         occurrences: dict[tuple[str, str], int] = {}
         for index, (first_id, second_id) in enumerate(self._constraints):
@@ -1183,9 +1186,21 @@ class ImageCanvas(QGraphicsView):
             selected = index in self._selected_constraint_indices
             residual = self._constraint_residuals.get(index)
             color = residual_color(residual, self._residual_tolerance) if residual is not None else KIND_COLORS["link"]
-            pen = QPen(QColor(color), 4 if selected else 2,
-                       Qt.PenStyle.SolidLine if selected else Qt.PenStyle.DashLine)
-            pen.setCosmetic(True)
+            outer_pen, inner_pen, pen = constraint_marker_pens(color, selected)
+            if selected:
+                outer, inner = previous_halos.pop(key, (None, None))
+                if outer is None:
+                    outer = QGraphicsLineItem()
+                    inner = QGraphicsLineItem()
+                    self._scene.addItem(outer)
+                    self._scene.addItem(inner)
+                outer.setLine(first.x(), first.y(), second.x(), second.y())
+                outer.setPen(outer_pen)
+                outer.setZValue(2498)
+                inner.setLine(first.x(), first.y(), second.x(), second.y())
+                inner.setPen(inner_pen)
+                inner.setZValue(2499)
+                self._constraint_halos[key] = (outer, inner)
             line = previous.pop(key, None)
             if line is None:
                 line = QGraphicsLineItem()
@@ -1201,3 +1216,6 @@ class ImageCanvas(QGraphicsView):
             self._constraint_lines[key] = line
         for line in previous.values():
             self._scene.removeItem(line)
+        for outer, inner in previous_halos.values():
+            self._scene.removeItem(outer)
+            self._scene.removeItem(inner)
