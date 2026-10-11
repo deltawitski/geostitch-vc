@@ -57,22 +57,22 @@ Exports are per image, not a merged raster. Available formats include GeoTIFF an
 <details>
 <summary>Keyboard shortcuts</summary>
 
-| Action | Shortcut |
-| --- | --- |
-| Add points | `P` |
-| Link points | `L` |
-| Pick a map coordinate | `G` |
-| Lock or unlock selected images/points | `K` |
-| Switch aligned/rest canvas layout | `A` |
-| Select all / deselect all | `Ctrl+A` / `Ctrl+D` |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` |
-| Import images | `Ctrl+I` |
-| Align | `Ctrl+Shift+M` |
-| Georeference | `Ctrl+Shift+G` |
-| Export | `Ctrl+E` |
-| Fit current view | `Ctrl+Shift+F` |
-| Arrange images | `Ctrl+Shift+A` |
-| Delete selection | `Delete` |
+| Action                                | Shortcut            |
+| ------------------------------------- | ------------------- |
+| Add points                            | `P`                 |
+| Link points                           | `L`                 |
+| Pick a map coordinate                 | `G`                 |
+| Lock or unlock selected images/points | `K`                 |
+| Switch aligned/rest canvas layout     | `A`                 |
+| Select all / deselect all             | `Ctrl+A` / `Ctrl+D` |
+| Undo / redo                           | `Ctrl+Z` / `Ctrl+Y` |
+| Import images                         | `Ctrl+I`            |
+| Align                                 | `Ctrl+Shift+M`      |
+| Georeference                          | `Ctrl+Shift+G`      |
+| Export                                | `Ctrl+E`            |
+| Fit current view                      | `Ctrl+Shift+F`      |
+| Arrange images                        | `Ctrl+Shift+A`      |
+| Delete selection                      | `Delete`            |
 
 Mouse wheel zooms; middle-drag pans. Shortcuts can be changed under **Settings > Keyboard shortcuts**.
 
